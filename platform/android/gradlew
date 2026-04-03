@@ -1,0 +1,17 @@
+#!/bin/sh
+# Gradle wrapper stub - downloads gradle on first run
+# For real projects, use: gradle wrapper
+
+APP_BASE_NAME=`basename "$0"`
+APP_HOME=`pwd -P`
+
+CLASSPATH="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+
+# Download gradle-wrapper.jar if missing
+WRAPPER_JAR="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+if [ ! -f "$WRAPPER_JAR" ]; then
+    echo "Downloading gradle-wrapper.jar..."
+    curl -sL "https://raw.githubusercontent.com/gradle/gradle/v8.11.1/gradle/wrapper/gradle-wrapper.jar" -o "$WRAPPER_JAR"
+fi
+
+exec java -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"

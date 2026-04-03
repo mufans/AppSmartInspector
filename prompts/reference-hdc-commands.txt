@@ -1,0 +1,123 @@
+# HarmonyOS Profiler CLI 命令参考
+
+## hiperf — CPU 采样分析
+
+```bash
+# 列出可用的硬件事件
+hdc shell "hiperf list hw"
+
+# 对指定进程采样 10 秒
+hdc shell "hiperf record -p <pid> -s dwarf -d 10 -o /data/local/tmp/perf.data"
+
+# 按包名采样
+hdc shell "hiperf record --app com.example.app -d 10 -s fp"
+
+# 编程控制（与 Monkey 测试同步）
+hdc shell "hiperf record --control prepare -p <pid> -s dwarf"
+hdc shell "hiperf record --control start"
+# ... 执行测试 ...
+hdc shell "hiperf record --control stop"
+
+# 生成报告（只看占比 >1% 的函数）
+hdc shell "hiperf report -i /data/local/tmp/perf.data --limit-percent 1"
+
+# 导出为 JSON
+hdc shell "hiperf report --json -i /data/local/tmp/perf.data"
+
+# 导出为 Protobuf
+hdc shell "hiperf report --proto -i /data/local/tmp/perf.data"
+
+# 拉取数据到本地
+hdc file recv /data/local/tmp/perf.data ./
+```
+
+## hitrace — 系统调用追踪
+
+```bash
+# 列出可用的 trace 标签（~70+）
+hdc shell "hitrace -l"
+
+# 采集 10 秒 app+graphic 标签的 trace
+hdc shell "hitrace -t 10 -b 204800 app graphic -o /data/local/tmp/test.ftrace"
+
+# 二进制格式采集
+hdc shell "hitrace -t 10 --raw app"
+
+# 快照模式（手动控制开始/结束）
+hdc shell "hitrace --trace_begin -b 204800 app graphic"
+hdc shell "hitrace --trace_dump -o /data/local/tmp/dump.ftrace"
+hdc shell "hitrace --trace_finish -o /data/local/tmp/final.ftrace"
+
+# 录制模式（持续写入文件）
+hdc shell "hitrace --trace_begin --record --file_size 102400 app"
+hdc shell "hitrace --trace_finish --record"
+
+# 拉取数据
+hdc file recv /data/local/tmp/test.ftrace ./
+hdc file recv /data/log/hitrace/ ./
+```
+
+## SP_daemon — 运行时指标采集
+
+```bash
+# 采集全部指标 10 轮
+hdc shell "SP_daemon -N 10 -PKG com.example.app -c -g -t -p -f -r -net -snapshot -d"
+
+# 启动/停止模式
+hdc shell "SP_daemon -start -c -g -t -r -f"
+# ... 操作应用 ...
+hdc shell "SP_daemon -stop"
+
+# 页面切换耗时测试
+hdc shell "SP_daemon -editor timeDelay"
+
+# 列表滑动性能测试
+hdc shell "SP_daemon -editor slideList"
+
+# 拉取 CSV 数据
+hdc file recv /data/local/tmp/smartperf/1/t_index_info.csv ./
+```
+
+## hidumper — 系统快照
+
+```bash
+# 查看 CPU 使用情况
+hdc shell "hidumper --cpu"
+
+# 查看内存使用情况
+hdc shell "hidumper --mem"
+
+# 查看指定进程信息
+hdc shell "hidumper -s WindowManagerService -a '-a'"
+```
+
+## 数据格式对照
+
+| 工具 | 输出格式 | 扩展名 | 说明 |
+|------|---------|--------|------|
+| hiperf record | 二进制 | perf.data | 采样原始数据 |
+| hiperf report --json | JSON | perf.json | 可直接解析 |
+| hiperf report --proto | Protobuf | perf.proto | 跨平台兼容 |
+| hitrace 文本模式 | 文本 | .ftrace | 标准 ftrace 格式 |
+| hitrace 二进制模式 | 二进制 | .sys | Perfetto 兼容 |
+| SP_daemon | CSV | .csv | 表格数据 |
+
+## Token 控制参数
+
+```bash
+# hiperf：降低采样频率（默认 4000，降到 1000）
+hdc shell "hiperf record -p <pid> -f 1000 -d 10"
+
+# hiperf：只看占比 >1% 的函数
+hdc shell "hiperf report --limit-percent 1"
+
+# hitrace：只开必要的标签（不要开全量）
+hdc shell "hitrace -t 10 app graphic"   # 好
+# 不要用 hitrace -t 10                  # 不好，开全量标签
+
+# hitrace：控制 buffer 大小
+hdc shell "hitrace -t 10 -b 204800 app graphic"  # 200KB buffer
+
+# SP_daemon：控制采集轮数
+hdc shell "SP_daemon -N 10 -f -r"  # 只采集 10 轮
+```
