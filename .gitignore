@@ -26,6 +26,9 @@ htmlcov/
 # macOS
 .DS_Store
 
+# Generated reports
+reports/
+
 # Android
 platform/android/.gradle/
 platform/android/build/

@@ -26,18 +26,18 @@ you> 搜索源码中 LazyForEach 的用法
 ## 架构概览
 
 ```
-用户自然语言 → LangGraph Orchestrator → 路由到专用 Agent → LLM 分析 → 报告输出
+用户自然语言 → LangGraph Orchestrator → 路由到专用 Agent / Pipeline → 报告输出
                     │
         ┌───────────┼───────────────┬──────────────┐
         ▼           ▼               ▼              ▼
   Android Expert  Perf Analyzer  Explorer     Full Pipeline
-  (adb+Perfetto)  (LLM解读JSON)  (grep/glob)  (采集→分析→归因→报告)
+  (adb+Perfetto)  (LLM解读JSON)  (grep/glob)  (collector→analyzer→attributor→reporter)
 ```
 
-全量分析流水线：
+全量分析流水线（LangGraph 图节点编排）：
 
 ```
-collector (设备 trace) → analyzer (LLM解读) → attributor (源码归因) → reporter (生成报告)
+collector (设备 trace 采集) → analyzer (LLM 性能解读) → attributor (源码归因) → reporter (生成 Markdown 报告)
 ```
 
 详细架构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
@@ -67,31 +67,63 @@ collector (设备 trace) → analyzer (LLM解读) → attributor (源码归因) 
 
 ```
 smartinspector/
-├── src/smartinspector/          # Python CLI + Agent
-│   ├── graph.py                #   LangGraph 编排 + CLI 主循环
-│   ├── agents/                 #   Agent 定义
-│   │   ├── android.py          #     Android Expert (trace 采集+分析)
-│   │   ├── explorer.py         #     Code Explorer (源码搜索)
-│   │   ├── perf_analyzer.py    #     Perf Analyzer (LLM 性能解读)
-│   │   └── attributor.py       #     Attributor (源码归因)
-│   ├── collector/perfetto.py   #   PerfettoCollector (adb→SQL→JSON)
-│   ├── commands/               #   Slash 命令 (15+ 命令)
-│   ├── tools/                  #   LangChain 工具 (grep/glob/read/perfetto)
-│   ├── ws/server.py            #   WebSocket Server (CLI↔App 通信)
-│   └── commands/attribution.py #   SI$ tag 解析 + 归因提取
+├── src/smartinspector/              # Python CLI + Agent
+│   ├── cli.py                      #   CLI 入口 (argparse)
+│   ├── graph/                      #   LangGraph 编排 (模块化包)
+│   │   ├── __init__.py             #     公共导出 (create_graph, run_graph, main)
+│   │   ├── builder.py              #     LangGraph 图构建 (节点+边+条件路由)
+│   │   ├── cli.py                  #     CLI REPL 主循环 (prompt_toolkit)
+│   │   ├── state.py                #     AgentState + RouteDecision + pass-through
+│   │   ├── streaming.py            #     图流式执行 (_stream_run)
+│   │   └── nodes/                  #     LangGraph 图节点
+│   │       ├── orchestrator.py     #       路由分类 + fallback
+│   │       ├── android.py          #       Android Expert (trace 采集+分析)
+│   │       ├── analyzer.py         #       性能分析 (perf_analyzer_node + analyzer_node)
+│   │       ├── explorer.py         #       源码搜索 (grep/glob/read)
+│   │       ├── collector.py        #       设备 trace 采集 (PerfettoCollector)
+│   │       ├── attributor.py       #       源码归因 (SI$ slice → 源码定位)
+│   │       └── reporter/           #       报告生成
+│   │           ├── __init__.py     #         reporter_node 入口
+│   │           ├── generator.py    #         LLM 报告生成 (流式+重试)
+│   │           ├── formatter.py    #         数据格式化 (perf+归因→Markdown)
+│   │           └── persistence.py  #         报告文件保存
+│   │
+│   ├── agents/                     #   Agent 定义 (LLM + Tools)
+│   │   ├── android.py              #     Android Expert Agent
+│   │   ├── explorer.py             #     Code Explorer Agent
+│   │   ├── perf_analyzer.py        #     Perf Analyzer (单次 LLM 调用)
+│   │   ├── attributor.py           #     源码归因 Agent (run_attribution)
+│   │   └── deterministic.py        #     确定性预计算 (减少 LLM token)
+│   │
+│   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON)
+│   ├── commands/                   #   Slash 命令 (注册表模式)
+│   │   ├── __init__.py             #     命令注册表 (handle_slash_command)
+│   │   ├── attribution.py          #     SI$ tag 解析 + 归因提取
+│   │   ├── device.py               #     设备管理 (/devices, /connect)
+│   │   ├── hook.py                 #     Hook 配置 (/config, /hooks)
+│   │   ├── orchestrate.py          #     编排命令 (/full, /report)
+│   │   ├── session.py              #     会话管理 (/help, /clear)
+│   │   └── trace.py                #     Trace 采集 (/trace, /record)
+│   │
+│   ├── tools/                      #   LangChain 工具 (grep/glob/read/perfetto)
+│   ├── ws/server.py                #   WebSocket Server (CLI↔App 通信)
+│   ├── prompts.py                  #   Prompt 文件加载器
+│   ├── config.py                   #   全局配置 (LLM 模型, source dir)
+│   ├── token_tracker.py            #   LLM Token 使用量追踪
+│   └── perfetto_compat.py          #   macOS IPv4 兼容修复
 │
-├── platform/                   # 平台 SDK
-│   └── android/tracelib/       #   Android SDK (AAR)
+├── platform/                       # 平台 SDK
+│   └── android/tracelib/           #   Android SDK (AAR)
 │       └── src/main/java/.../tracelib/
-│           ├── TraceHook.java      # Pine AOP 方法 hook 入口
-│           ├── BlockMonitor.java   # 主线程卡顿检测
-│           ├── HookConfig.java     # 配置模型 (JSON 序列化)
-│           ├── HookConfigManager.java # 配置管理 (SP 持久化)
-│           └── SIClient.java       # WebSocket 客户端
+│           ├── TraceHook.java          # Pine AOP 方法 hook 入口
+│           ├── BlockMonitor.java       # 主线程卡顿检测
+│           ├── HookConfig.java         # 配置模型 (JSON 序列化)
+│           └── HookConfigManager.java  # 配置管理 (SP 持久化)
 │
-├── prompts/                    # LLM Prompt 模板
-├── bin/                        # trace_processor_shell
-└── tests/                      # 单元测试
+├── prompts/                        # LLM Prompt 模板
+├── bin/                            # trace_processor_shell
+├── reports/                        # 生成的性能报告 (Markdown)
+└── tests/                          # 单元测试
 ```
 
 ## Hook 体系 (Android)
@@ -157,6 +189,51 @@ Orchestrator 通过 LLM 分类将用户请求路由到对应 Agent：
 - **性能解读** (`analyze`): "解读这份数据" → Perf Analyzer
 - **源码搜索** (`explorer`): "搜索 XXX 类源码" → Code Explorer
 - **通用问答** (`end`): "什么是卡顿" → Fallback 回复
+
+## 报告示例
+
+全量分析流水线（`/full` 或自然语言触发 `full_analysis`）会生成 Markdown 性能报告，保存到 `reports/` 目录。以下为实际生成的报告摘要：
+
+### 测试概要
+
+```
+| 项目 | 内容 |
+|------|------|
+| 应用 | com.smartinspector.hook |
+| 时长 | 10.0s |
+| 日期 | 2026-04-04 09:30 |
+```
+
+### 性能总览
+
+```
+| 指标       | 数值     | 评价 |
+|------------|----------|------|
+| 平均 FPS   | 27.8     | 差   |
+| 卡顿次数   | 5        |      |
+| CPU 峰值   | 50.3%    | 良   |
+| 内存峰值   | 993MB    | 差   |
+```
+
+### 问题列表（源码归因）
+
+报告会通过 SI$ tag 将性能热点归因到具体源码位置，并给出优化建议：
+
+```
+### P0 RecyclerView 布局与数据绑定严重卡顿
+
+现象：DemoAdapter.dispatchLayoutStep2 单次耗时 221.24ms，超出帧预算 15.5 倍。
+原因：onBindViewHolder 中存在 Thread.sleep、同步数据加载、主线程图片解码。
+位置：platform/android/app/.../DemoAdapter.java:40-64
+
+建议：
+1. 移除 Thread.sleep(20ms)
+2. 将 loadItemsSync 改为异步加载
+3. 使用 Glide/Coil 异步图片加载
+4. 使用 DiffUtil 增量更新
+```
+
+完整报告示例见 [reports/perf_report_20260404_093038.md](reports/perf_report_20260404_093038.md)。
 
 ## 技术栈
 

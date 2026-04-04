@@ -330,38 +330,6 @@ def _is_block_system_class(raw_name: str) -> bool:
     The standard is_system_class() fails on these because extract_fqn()
     returns truncated prefixes like 'app' or 'view'.
 
-    This function extracts the first segment between '#' and '$' or '.'
-    (the actual class short name) and checks it against _SYSTEM_CLASS_PATTERNS.
-    """
-    body = raw_name
-    if body.startswith("SI$"):
-        body = body[3:]
-    if body.startswith("block#"):
-        body = body[6:]
-    # Strip duration suffix: #NNNms
-    hash_idx = body.rfind("#")
-    if hash_idx >= 0 and body[hash_idx:].endswith("ms"):
-        body = body[:hash_idx]
-    # body is now like: app.FragmentManager$5 or view.Choreographer$FrameDisplayEventReceiver
-    # Take segment after last dot (the class+inner part)
-    if "." in body:
-        body = body.rsplit(".", 1)[-1]
-    # body is now: FragmentManager$5 or Choreographer$FrameDisplayEventReceiver
-    # Check against system patterns: FragmentManager, Choreographer, etc.
-    for pattern in _SYSTEM_CLASS_PATTERNS:
-        if body == pattern or body.startswith(pattern + "$"):
-            return True
-    return False
-
-
-def _is_block_system_class(raw_name: str) -> bool:
-    """Check if a SI$block# event refers to a system/framework class.
-
-    BlockMonitor sends shortened class names (e.g. 'app.FragmentManager$5',
-    'view.Choreographer$FrameDisplayEventReceiver') without full package paths.
-    The standard is_system_class() fails on these because extract_fqn()
-    returns truncated prefixes like 'app' or 'view'.
-
     This function extracts the actual class short name from the block tag
     and checks it against _SYSTEM_CLASS_PATTERNS.
     """

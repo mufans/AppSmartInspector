@@ -6,23 +6,44 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     CLI (main.py loop)                       │
+│                     CLI (graph/cli.py REPL)                  │
 │  you> [input] → graph.stream() → ai> [streaming output]     │
+│  + 自动启动 WS server :9876 + adb reverse                   │
 └──────────────────────────┬──────────────────────────────────┘
                            │
               ┌────────────▼────────────┐
               │     Orchestrator Node   │
               │  (LLM intent classify)  │
               │  deepseek-chat temp=0   │
-              └──┬──────┬──────┬───┬───┘
-                 │      │      │   │
-        ┌────────▼┐  ┌──▼──┐ ┌▼──┐ ┌▼───────┐
-        │ Android │  │Perf │ │Exp│ │Fallback │
-        │ Expert  │  │Anal.│ │lr │ │         │
-        └────┬────┘  └──┬──┘ └┬──┘ └─────────┘
-             │          │     │
-             ▼          ▼     ▼
-           END        END   END
+              └──┬──────┬──────┬──┬──┬──┘
+                 │      │      │  │  │
+      ┌──────────▼┐ ┌──▼──┐ ┌▼─┐│ ┌▼───────┐
+      │ collector  │ │Perf │ │Ex││ │Fallback │
+      │ (pipeline) │ │Anal.│ │pl││ │         │
+      └──────┬─────┘ └──┬──┘ └┬─┘│ └─────────┘
+             │           │     │  │
+             ▼           ▼     ▼  ▼
+      ┌──────────┐      END  END END
+      │ analyzer │
+      └────┬─────┘
+           │
+     ┌─────▼──────┐
+     │ attributor │
+     └─────┬──────┘
+           │
+     ┌─────▼──────┐
+     │  reporter  │
+     └─────┬──────┘
+           ▼
+          END
+
+  Routing decisions:
+    full_analysis → collector → analyzer → attributor → reporter
+    trace (/trace) → collector → analyzer → END
+    android       → android_expert → (analyzer | END)
+    analyze       → perf_analyzer → END
+    explorer      → explorer → END
+    end           → fallback → END
 ```
 
 ## Directory Structure
@@ -30,76 +51,131 @@
 ```
 smartinspector/
 ├── src/smartinspector/
-│   ├── graph.py              # LangGraph orchestration + CLI loop
-│   ├── cli.py                # CLI entry point
-│   ├── prompts.py            # Prompt file loader
-│   ├── perfetto_compat.py    # macOS IPv4 fix for perfetto lib
+│   ├── cli.py                   # CLI entry point (argparse)
+│   ├── main.py                  # Legacy entry (deprecated)
+│   ├── prompts.py               # Prompt file loader
+│   ├── perfetto_compat.py       # macOS IPv4 fix for perfetto lib
+│   ├── config.py                # Global config (LLM models, source dir)
+│   ├── token_tracker.py         # LLM token usage tracking
 │   │
-│   ├── agents/               # Agent definitions (LLM + tools)
-│   │   ├── android.py        # Android Expert: trace collect + analyze
-│   │   ├── explorer.py       # Code Explorer: grep/glob/read
-│   │   └── perf_analyzer.py  # Perf Analyzer: single-shot LLM interpretation
+│   ├── graph/                   # LangGraph orchestration (modular package)
+│   │   ├── __init__.py          #   Public exports (create_graph, run_graph, main)
+│   │   ├── builder.py           #   Graph construction (nodes + edges + conditional routing)
+│   │   ├── cli.py               #   CLI REPL loop (prompt_toolkit, WS auto-start)
+│   │   ├── state.py             #   AgentState, RouteDecision enum, _pass_through()
+│   │   ├── streaming.py         #   _stream_run() — streaming graph execution
+│   │   └── nodes/               #   LangGraph graph nodes
+│   │       ├── orchestrator.py  #     LLM routing + fallback node
+│   │       ├── android.py       #     Android Expert: trace collect + analyze
+│   │       ├── analyzer.py      #     perf_analyzer_node (standalone) + analyzer_node (pipeline)
+│   │       ├── explorer.py      #     Code Explorer: grep/glob/read
+│   │       ├── collector.py     #     Trace collection node (pipeline step 1)
+│   │       ├── attributor.py    #     Source attribution node (pipeline step 3)
+│   │       └── reporter/        #     Report generation (pipeline step 4)
+│   │           ├── __init__.py  #       reporter_node entry
+│   │           ├── generator.py #       LLM report generation (streaming + retry)
+│   │           ├── formatter.py #       Data formatting (perf JSON + attribution → Markdown)
+│   │           └── persistence.py #     Report file saving (./reports/)
 │   │
-│   ├── collector/            # Data collection & processing
-│   │   └── perfetto.py       # PerfettoCollector: adb collect → SQL query → JSON
+│   ├── agents/                  # Agent definitions (LLM + tools)
+│   │   ├── android.py           #   Android Expert: trace collect + analyze
+│   │   ├── explorer.py          #   Code Explorer: grep/glob/read
+│   │   ├── perf_analyzer.py     #   Perf Analyzer: single-shot LLM interpretation
+│   │   ├── attributor.py        #   Source attribution: run_attribution()
+│   │   └── deterministic.py     #   Deterministic pre-computation (reduces LLM tokens)
 │   │
-│   └── tools/                # LangChain @tool functions
-│       ├── perfetto.py       # analyze_perfetto, collect_android_trace
-│       ├── grep.py           # ripgrep content search
-│       ├── glob.py           # ripgrep file pattern search
-│       ├── read.py           # file reader with line numbers
-│       └── rg.py             # ripgrep binary finder
+│   ├── collector/               # Data collection & processing
+│   │   └── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON
+│   │
+│   ├── commands/                # Slash command implementations
+│   │   ├── __init__.py          #   Command registry (SLASH_COMMANDS dict + handle_slash_command)
+│   │   ├── attribution.py       #   SI$ tag parsing + attribution extraction
+│   │   ├── device.py            #   /devices, /connect, /status, /disconnect
+│   │   ├── hook.py              #   /config, /hooks, /hook, /debug
+│   │   ├── orchestrate.py       #   /full, /report
+│   │   ├── session.py           #   /help, /clear, /summary, /tokens
+│   │   └── trace.py             #   /trace, /record, /analyze
+│   │
+│   ├── tools/                   # LangChain @tool functions
+│   │   ├── perfetto.py          #   analyze_perfetto, collect_android_trace
+│   │   ├── grep.py              #   ripgrep content search
+│   │   ├── glob.py              #   ripgrep file pattern search
+│   │   ├── read.py              #   file reader with line numbers
+│   │   └── rg.py                #   ripgrep binary finder
+│   │
+│   └── ws/                      # WebSocket communication
+│       └── server.py            #   SIServer (CLI ↔ App real-time communication)
 │
-├── prompts/                  # System prompts (text files)
-│   ├── main.txt              # Main persona (HarmonyOS perf tool)
-│   ├── android-expert.txt    # Android agent prompt
-│   ├── perf-analyzer.txt     # Perf analysis prompt
-│   ├── code-explorer.txt     # Code search prompt
-│   ├── report-generator.txt  # Report format prompt
-│   ├── compaction.txt        # Context compression prompt
-│   ├── monkey-driver.txt     # Monkey test driver prompt
+├── prompts/                     # System prompts (text files)
+│   ├── main.txt                 #   Main persona (HarmonyOS perf tool)
+│   ├── android-expert.txt       #   Android agent prompt
+│   ├── perf-analyzer.txt        #   Perf analysis prompt
+│   ├── code-explorer.txt        #   Code search prompt
+│   ├── report-generator.txt     #   Report format prompt
+│   ├── compaction.txt           #   Context compression prompt
+│   ├── monkey-driver.txt        #   Monkey test driver prompt
 │   ├── reference-hdc-commands.txt
 │   └── reference-opencode-prompts.txt
 │
-└── platform/android/         # Android trace hook library
-    ├── app/                  # Demo app
-    │   └── .../App.java      # Application.init() → TraceHook.init()
-    └── tracelib/             # Reusable Android Library
-        ├── src/main/java/.../
-        │   ├── TraceHook.java       # Core hook logic
-        │   ├── HookConfig.java      # Config model
-        │   └── HookConfigManager.java  # Config load/apply
-        ├── src/debug/java/.../
-        │   └── HookConfigActivity.java  # Config panel (debug only)
-        └── src/release/java/.../
-            └── TraceHook.java       # No-op stubs (release)
+├── platform/android/            # Android trace hook library
+│   ├── app/                     #   Demo app
+│   └── tracelib/                #   Reusable Android Library
+│       ├── src/main/java/.../
+│       │   ├── TraceHook.java          # Core hook logic
+│       │   ├── HookConfig.java         # Config model
+│       │   └── HookConfigManager.java  # Config load/apply
+│       ├── src/debug/java/.../
+│       │   └── HookConfigActivity.java # Config panel (debug only)
+│       └── src/release/java/.../
+│           └── TraceHook.java          # No-op stubs (release)
+│
+├── reports/                     # Generated performance reports (Markdown)
+├── bin/                         # trace_processor_shell binary
+└── tests/                       # Unit tests
 ```
 
 ## State Design
 
 ```python
+class RouteDecision(str, Enum):
+    """Routing decisions returned by the orchestrator node."""
+    FULL_ANALYSIS = "full_analysis"   # full pipeline: collector → analyzer → attributor → reporter
+    ANDROID = "android"               # android expert agent
+    ANALYZE = "analyze"               # standalone perf analysis
+    EXPLORER = "explorer"             # source code search
+    END = "end"                       # general Q&A / fallback
+    TRACE = "trace"                   # /trace command: collector → analyzer
+
 class AgentState(TypedDict):
     messages: Annotated[list, operator.add]   # Accumulated conversation
-    perf_summary: str                          # JSON from android_expert
-    perf_analysis: str                         # Analysis text from perf_analyzer
-    _route: str                                # Orchestrator routing decision
+    perf_summary: str                          # JSON: PerfettoCollector summary
+    perf_analysis: str                         # Markdown: LLM performance analysis
+    attribution_data: str                      # JSON: list of attributable SI$ slices
+    attribution_result: str                    # JSON: attribution results with source snippets
+    _route: str                                # internal: RouteDecision value
+    _trace_path: str                           # internal: trace file path from collector
 ```
 
 State flows through the graph, each node returns a partial state update:
 
 ```
-orchestrator → { _route: "android", messages: [] }
+orchestrator  → { _route: "android", messages: [] }
 android_expert → { messages: [...], perf_summary: "{...json...}" }
-perf_analyzer → { messages: [AIMessage], perf_analysis: "..." }
-explorer → { messages: [...] }
-fallback → { messages: [AIMessage] }
+collector     → { messages: [...], perf_summary: "{...json...}", _trace_path: "/tmp/xxx.pb" }
+analyzer      → { messages: [AIMessage], perf_analysis: "..." }
+attributor    → { messages: [...], attribution_data: "[...]", attribution_result: "[...]" }
+reporter      → { messages: [AIMessage (full report)] }
+explorer      → { messages: [...] }
+fallback      → { messages: [AIMessage] }
 ```
 
-The CLI loop in `_stream_run()` accumulates `last_updates` from all nodes and builds the final state for the next turn.
+Pass-through fields (`perf_summary`, `perf_analysis`, `attribution_data`, `attribution_result`) are forwarded by every node via `_pass_through(state)` so they persist across graph executions until `/clear`.
+
+The CLI loop in `_stream_run()` (graph/streaming.py) accumulates `last_updates` from all nodes and builds the final state for the next turn.
 
 ## Orchestrator Node
 
-**Purpose**: Classify user intent, route to appropriate agent.
+**Purpose**: Classify user intent, route to appropriate agent or pipeline.
 
 **Model**: `deepseek-chat`, temperature=0
 
@@ -107,10 +183,24 @@ The CLI loop in `_stream_run()` accumulates `last_updates` from all nodes and bu
 
 | Route | Keywords | Target Node |
 |-------|----------|-------------|
-| `android` | trace/adb/perfetto/FPS/CPU | android_expert |
+| `full_analysis` | 全面分析/完整分析/全量分析/full/归因 | collector (pipeline entry) |
+| `android` | trace/adb/perfetto/FPS/CPU/内存指标 | android_expert |
 | `analyze` | perf_summary/深入分析/解读 | perf_analyzer |
 | `explorer` | 源码/代码/搜索/函数名/.ets/.java | explorer |
 | `end` | general Q&A, unsupported | fallback |
+| `trace` | /trace command | collector (→ analyzer → END) |
+
+**Graph routing** (graph/builder.py):
+
+```
+orchestrator → route_from_orchestrator():
+    full_analysis → collector → analyzer → attributor → reporter → END
+    trace         → collector → analyzer → END
+    android       → android_expert → (analyzer | END)
+    analyze       → perf_analyzer → END
+    explorer      → explorer → END
+    end           → fallback → END
+```
 
 ## Slash Commands
 
@@ -168,7 +258,13 @@ you> /config        → adb 打开 App 端配置面板
 ### 实现位置
 
 ```python
-# graph.py main() loop
+# commands/__init__.py — command registry pattern
+
+from smartinspector.commands.device import cmd_devices, cmd_connect, cmd_status, cmd_disconnect
+from smartinspector.commands.trace import cmd_trace, cmd_record, cmd_analyze
+from smartinspector.commands.hook import cmd_config, cmd_hooks, cmd_hook, cmd_debug
+from smartinspector.commands.session import cmd_help, cmd_clear, cmd_summary, cmd_tokens
+from smartinspector.commands.orchestrate import cmd_full, cmd_report
 
 SLASH_COMMANDS = {
     "/help": cmd_help,
@@ -181,33 +277,25 @@ SLASH_COMMANDS = {
     "/analyze": cmd_analyze,
     "/config": cmd_config,
     "/hooks": cmd_hooks,
-    "/hook": cmd_hook,          # 子路由: on/off/add/rm
+    "/hook": cmd_hook,
+    "/debug": cmd_debug,
     "/clear": cmd_clear,
     "/summary": cmd_summary,
+    "/tokens": cmd_tokens,
     "/full": cmd_full,
     "/report": cmd_report,
 }
 
-def main():
-    while True:
-        user_input = input("you> ").strip()
-        if user_input.startswith("/"):
-            cmd_name = user_input.split()[0]
-            cmd_args = user_input[len(cmd_name):].strip()
-            handler = SLASH_COMMANDS.get(cmd_name)
-            if handler:
-                handler(cmd_args)
-            else:
-                print(f"Unknown command: {cmd_name}. Type /help for available commands.")
-            continue
-        # ... normal LLM flow
+def handle_slash_command(user_input: str, state: dict) -> dict:
+    """Parse slash command, dispatch to handler, return updated state."""
+    ...
 ```
 
 ---
 
 ## Agent Nodes
 
-### 1. Android Expert (`agents/android.py`)
+### 1. Android Expert (`graph/nodes/android.py`)
 
 **Role**: Collect and analyze Perfetto traces from Android devices.
 
@@ -224,9 +312,27 @@ def main():
 
 **Streaming**: `agent.stream(stream_mode=["messages", "updates"])` for real-time output.
 
-### 2. Perf Analyzer (`agents/perf_analyzer.py`)
+**Post-routing**: If `perf_summary` is populated after this node, continues to `analyzer`; otherwise goes to `END`.
 
-**Role**: Single-shot LLM interpretation of JSON performance summary.
+### 2. Collector (`graph/nodes/collector.py`)
+
+**Role**: First step of the full analysis pipeline. Collects a Perfetto trace and generates a structured JSON summary.
+
+**Model**: None (deterministic)
+
+**Workflow**:
+1. Reads Perfetto params from WS server config cache (sent by app via `config_sync`)
+2. `PerfettoCollector.pull_trace_from_device()` → `.pb` file
+3. `PerfettoCollector.summarize()` → `PerfSummary` JSON
+4. Optionally requests block events from app via WS
+
+**Output**: `{ perf_summary: "<json>", _trace_path: "/tmp/xxx.pb" }`
+
+### 3. Analyzer (`graph/nodes/analyzer.py`)
+
+**Role**: LLM interpretation of perf JSON summary. Used in two contexts:
+- `perf_analyzer_node` — standalone analysis (orchestrator routes `analyze`)
+- `analyzer_node` — pipeline step after collector
 
 **Model**: `deepseek-chat`, temperature=0.1, no tools
 
@@ -234,7 +340,33 @@ def main():
 
 **Output**: Structured problem analysis in Chinese (P0/P1/P2 severity)
 
-### 3. Code Explorer (`agents/explorer.py`)
+**Pipeline routing**: After `analyzer_node`, routes to `attributor` (for `full_analysis`) or `END` (for `trace`).
+
+### 4. Attributor (`graph/nodes/attributor.py`)
+
+**Role**: Extract attributable SI$ slices from perf summary and search source code.
+
+**Model**: Uses `agents/attributor.run_attribution()` which delegates to LLM agent
+
+**Workflow**:
+1. `extract_attributable_slices(perf_json)` → filter SI$ slices, parse class/method names
+2. `run_attribution(attributable)` → for each slice: Glob → Grep → Read source → LLM analysis
+3. Format results as human-readable summary
+
+**Output**: `{ attribution_data: "<json>", attribution_result: "<json>" }`
+
+### 5. Reporter (`graph/nodes/reporter/`)
+
+**Role**: Generate the final Markdown performance report with LLM.
+
+**Sub-modules**:
+- `formatter.py` — builds Markdown sections from perf JSON and attribution results
+- `generator.py` — LLM report generation with streaming and retry on failure
+- `persistence.py` — saves report to `./reports/perf_report_YYYYMMDD_HHMMSS.md`
+
+**Output**: Complete Markdown report (header tables + LLM analysis + source attribution)
+
+### 6. Code Explorer (`graph/nodes/explorer.py`)
 
 **Role**: Search and read source code files.
 
@@ -243,6 +375,16 @@ def main():
 **Tools**: `grep` (regex search), `glob` (file pattern), `read` (file reader)
 
 **Output**: `[file_path]:[line_number]` + code snippet + analysis.
+
+### 7. Fallback (`graph/nodes/orchestrator.py`)
+
+**Role**: Friendly LLM reply for non-performance queries (greetings, Q&A).
+
+**Model**: `deepseek-chat`, temperature=0
+
+**Input**: Recent conversation context (last 3 turns)
+
+**Output**: Short, friendly response with natural capability hints.
 
 ## Data Collection Layer
 
@@ -509,97 +651,99 @@ release 变体不声明此 Activity — adb 启动无效果，不会报错（`am
 
 ## Data Flow: End-to-End Analysis
 
-### Phase 1: Trace Collection
+### Full Analysis Pipeline (full_analysis route)
 
 ```
-User: "采集一个trace分析列表滑动性能"
+User: "全面分析列表滑动性能"
   │
   ▼
-[orchestrator] → route: android
+[orchestrator] → route: full_analysis
   │
   ▼
-[android_expert_node]
-  ├─ 懒加载: 首次进入时启动 AndroidWSServer :9876
-  │         → adb forward tcp:9876 tcp:9876
-  │         → 等待 App WS Client 连接 (带超时)
-  │
-  ├─ Trace 采集 (双通道):
+[collector_node] ─ graph/nodes/collector.py
+  ├─ Reads Perfetto params from WS config cache
+  ├─ PerfettoCollector.pull_trace_from_device(duration_ms, buffer_size_kb, target_process)
   │   ├─ WS 已连接: 下发 start_trace → App 采集 → WS 上报 .pb
   │   └─ WS 未连接: fallback adb shell perfetto → adb pull .pb
-  │
-  ├─ analyze_perfetto(trace_path)
+  ├─ PerfettoCollector(trace_path).summarize()
   │   ├─ collect_sched()
   │   ├─ collect_cpu_hotspots()
   │   ├─ collect_frame_timeline()
   │   ├─ collect_memory()
-  │   └─ collect_view_slices()  ← SI$ prefix filtering, rv_instances grouping
-  ├─ LLM outputs interpretation
-  └─ State: perf_summary = "{...json...}"
+  │   ├─ collect_view_slices()  ← SI$ prefix filtering, rv_instances grouping
+  │   └─ collect_block_events()  ← via WS from app (structured JSON)
+  └─ State: perf_summary = "{...json...}", _trace_path = "/tmp/xxx.pb"
   │
   ▼
-END
-```
-
-### Phase 2: Performance Analysis (CLI-layer auto-triggered)
-
-```
-_stream_run() 检测到 perf_summary 非空
-  │
-  ▼
-[perf_analyzer_node]
+[analyzer_node] ─ graph/nodes/analyzer.py
   ├─ Reads perf_summary JSON
   ├─ LLM analysis with perf-analyzer prompt
   ├─ Outputs: P0/P1/P2 problems with specific SI$ slice names
   └─ State: perf_analysis = "..."
   │
   ▼
-CLI: 输出分析结果 + 追问 "是否需要源码分析归因？"
-```
-
-### Phase 3: Source Code Attribution (user confirms)
-
-```
-User: "是的"
+[attributor_node] ─ graph/nodes/attributor.py
+  ├─ extract_attributable_slices(perf_json)
+  │   ├─ 过滤: startswith("SI$") → 可归因列表
+  │   ├─ 两层过滤排除系统类: FQN包名匹配 + 短类名模式匹配
+  │   └─ 解析: class name + method name + viewId
+  ├─ run_attribution(attributable)
+  │   ├─ Glob 定位文件
+  │   ├─ Grep 定位类定义
+  │   ├─ Read 读取方法实现
+  │   └─ LLM 分析代码与性能问题的关系
+  └─ State: attribution_data = "[...]", attribution_result = "[...]"
   │
   ▼
-_stream_run() 从 perf_summary JSON 中程序化提取：
-  ├─ rv_instances + slowest_slices
-  ├─ 过滤: startswith("SI$") → 可归因列表
-  ├─ 解析: class name + method name + viewId
-  └─ 构造结构化 prompt:
-      "搜索 StockListAdapter.onBindViewHolder 源码（耗时 18.5ms）..."
+[reporter_node] ─ graph/nodes/reporter/
+  ├─ formatter.py: 构建报告 sections
+  │   ├─ compute_hints() 确定性预计算
+  │   ├─ format_perf_sections() 性能数据表格
+  │   └─ format_attribution_section() 归因结果
+  ├─ generator.py: LLM streaming 生成报告正文
+  ├─ persistence.py: 保存到 ./reports/perf_report_YYYYMMDD_HHMMSS.md
+  └─ State: messages = [AIMessage(content=complete_report)]
   │
   ▼
-[explorer_node]
-  ├─ grep 定位类定义
-  ├─ read 读取方法实现
-  ├─ LLM 分析代码与性能问题的关系
-  └─ Output: 源码片段 + 根因分析
-
-系统 slices (无 SI$ 前缀):
-  └─ 间接建议: "dispatchLayoutStep2 耗时长 → 布局层级过深"
+END (report displayed + saved to file)
 ```
 
-### Phase 4: Final Conclusion
+### Single-Step Routes
 
+**Android Expert** (`android` route):
 ```
-CLI 合并输出：
-  ├─ perf_analysis (P0/P1/P2 问题列表)
-  ├─ source_code_attribution (具体代码片段 + 根因)
-  └─ system_advice (系统方法的间接建议)
+orchestrator → android_expert → (perf_summary? → analyzer : END)
+```
+
+**Standalone Analysis** (`analyze` route):
+```
+orchestrator → perf_analyzer → END
+```
+
+**Code Explorer** (`explorer` route):
+```
+orchestrator → explorer → END
+```
+
+**Trace Only** (`/trace` command):
+```
+orchestrator → collector → analyzer → END
 ```
 
 ## Key Design Decisions
 
-1. **SI$ prefix** — TraceHook 注入的 tag 统一加 `SI$` 前缀，区分用户代码与系统代码，下游无需硬编码类名规则
-2. **Raw trace stays local** — Only ~2KB structured JSON summary is sent to LLM
-3. **Streaming first** — android_expert streams tokens + tool calls in real-time
-4. **Lazy hook** — RV Adapter/LayoutManager hooked dynamically when set; extra_hooks configured at init
-5. **CLI-layer orchestration** — Multi-turn flow managed in `main()` loop, not graph topology
-6. **Programmatic extraction** — Class/method names extracted from JSON by code, search strategy by AI
-7. **CS architecture** — Agent (WS server) ↔ App (WS client)，按需懒加载，每个平台 expert 独立管理自己的 WS server
-8. **debug/release variants** — Zero-cost abstraction: release = no-op stubs, same API surface
-9. **Single model** — All agents use `deepseek-chat`, routing by LangGraph not model selection
+1. **Graph-based pipeline** — `graph.py` refactored into `graph/` package with `builder.py` (graph construction), `cli.py` (REPL loop), `state.py` (state + routing), `streaming.py` (execution). Pipeline nodes (collector → analyzer → attributor → reporter) are first-class LangGraph nodes, not CLI-loop orchestration.
+2. **SI$ prefix** — TraceHook 注入的 tag 统一加 `SI$` 前缀，区分用户代码与系统代码，下游无需硬编码类名规则
+3. **Raw trace stays local** — Only ~2KB structured JSON summary is sent to LLM
+4. **Streaming first** — android_expert and reporter stream tokens in real-time
+5. **Lazy hook** — RV Adapter/LayoutManager hooked dynamically when set; extra_hooks configured at init
+6. **Command registry** — Slash commands refactored into `commands/` package with registry pattern (`SLASH_COMMANDS` dict + `handle_slash_command`). Each command file is self-contained.
+7. **Programmatic extraction** — Class/method names extracted from JSON by code, search strategy by AI
+8. **CS architecture** — Agent (WS server) ↔ App (WS client)，按需懒加载，每个平台 expert 独立管理自己的 WS server
+9. **debug/release variants** — Zero-cost abstraction: release = no-op stubs, same API surface
+10. **Configurable models** — `SI_MODEL` for all agents, `SI_ATTRIBUTOR_MODEL` override for attribution (code understanding)
+11. **Reporter sub-module** — Report generation split into formatter (pure), generator (LLM), persistence (IO) for testability
+12. **Pass-through state** — `_pass_through(state)` helper ensures pipeline fields survive across nodes without explicit forwarding
 
 ---
 
