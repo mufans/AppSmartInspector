@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 # Load .env file from project root
 load_dotenv()
 
+_DEFAULT_WS_PORT = 9876
+
 _source_dir: str = "."
 
 # ── LLM Model Configuration ──────────────────────────────────
@@ -86,6 +88,18 @@ def model_info() -> str:
 
 
 # ── Source directory ──────────────────────────────────────────
+
+
+def get_ws_port() -> int:
+    """Get WebSocket server port.
+
+    Priority: SI_WS_PORT env var > default (9876).
+    """
+    try:
+        return int(os.environ.get("SI_WS_PORT", _DEFAULT_WS_PORT))
+    except (ValueError, TypeError):
+        return _DEFAULT_WS_PORT
+
 
 def get_source_dir() -> str:
     """Get the current source code search directory."""

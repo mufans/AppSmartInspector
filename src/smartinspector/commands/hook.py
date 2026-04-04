@@ -4,25 +4,29 @@ Uses WS (via adb forward) for config sync with the app.
 """
 
 import json
+import re
 import subprocess
 
 from smartinspector.ws.server import SIServer
+from smartinspector.config import get_ws_port
 
-WS_PORT = 9876
+# Valid Java identifier pattern (allows dots for FQN, $ for inner classes)
+_SAFE_IDENTIFIER_RE = re.compile(r'^[A-Za-z_$][\w.$]*$')
 
 
 def _ensure_server(state: dict) -> SIServer:
     """Ensure WS server is running and adb forward is set up. Returns the server."""
-    server = SIServer.get(port=WS_PORT)
+    port = get_ws_port()
+    server = SIServer.get(port=port)
     if not server.is_running():
         server.start()
         state["_ws_server"] = server
         try:
             subprocess.run(
-                ["adb", "reverse", f"tcp:{WS_PORT}", f"tcp:{WS_PORT}"],
+                ["adb", "reverse", f"tcp:{port}", f"tcp:{port}"],
                 capture_output=True, text=True, timeout=5,
             )
-            print(f"  WS server started, adb forward tcp:{WS_PORT} → tcp:{WS_PORT}")
+            print(f"  WS server started, adb forward tcp:{port} → tcp:{port}")
         except Exception as e:
             print(f"  Warning: adb forward failed: {e}")
     return server
@@ -150,7 +154,7 @@ def cmd_hooks(args: str, state: dict) -> dict:
         ("handler_dispatch", "Handler.dispatchMessage (main thread)", False),
     ]
 
-    server = SIServer.get(port=WS_PORT)
+    server = SIServer.get(port=get_ws_port())
     app_config = None
     if server.get_config():
         try:
@@ -209,6 +213,9 @@ def cmd_hook(args: str, state: dict) -> dict:
             print(f"Usage: /hook {action} <hook_id>")
             return state
         hook_id = parts[1]
+        if not _SAFE_IDENTIFIER_RE.match(hook_id):
+            print(f"  Invalid hook_id: {hook_id}")
+            return state
         config[hook_id] = (action == "on")
         config_json = json.dumps(config, indent=2)
         print(f"Setting {hook_id} = {action == 'on'}...")
@@ -224,6 +231,12 @@ def cmd_hook(args: str, state: dict) -> dict:
             return state
         class_name = parts[1]
         method_name = parts[2]
+        if not _SAFE_IDENTIFIER_RE.match(class_name):
+            print(f"  Invalid class_name: {class_name}")
+            return state
+        if not _SAFE_IDENTIFIER_RE.match(method_name):
+            print(f"  Invalid method_name: {method_name}")
+            return state
         extra_hooks = config.get("extra_hooks", [])
         found = False
         for eh in extra_hooks:
@@ -252,6 +265,9 @@ def cmd_hook(args: str, state: dict) -> dict:
             print("Usage: /hook rm <class_name>")
             return state
         class_name = parts[1]
+        if not _SAFE_IDENTIFIER_RE.match(class_name):
+            print(f"  Invalid class_name: {class_name}")
+            return state
         extra_hooks = config.get("extra_hooks", [])
         config["extra_hooks"] = [eh for eh in extra_hooks if eh.get("class_name") != class_name]
         config_json = json.dumps(config, indent=2)

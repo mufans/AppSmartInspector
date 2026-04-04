@@ -1,6 +1,7 @@
 """Read tool: read file contents with line numbers."""
 
 import os
+from functools import lru_cache
 from langchain_core.tools import tool
 
 MAX_LINES = 2000
@@ -8,18 +9,9 @@ MAX_LINE_LENGTH = 2000
 MAX_BYTES = 50 * 1024  # 50KB
 
 
-@tool
-def read(file_path: str, offset: int = 1, limit: int = 2000) -> str:
-    """Read file contents with line numbers.
-
-    Supports reading text files with line-by-line output.
-    For large files, use offset and limit to read specific sections.
-
-    Args:
-        file_path: Absolute or relative path to the file.
-        offset: Line number to start reading from (1-indexed). Defaults to 1.
-        limit: Maximum number of lines to read. Defaults to 2000.
-    """
+@lru_cache(maxsize=64)
+def _read_file_content(file_path: str, offset: int, limit: int) -> str:
+    """Cached file reading. Separated from @tool to allow lru_cache."""
     if not os.path.exists(file_path):
         # try to suggest similar files
         parent = os.path.dirname(file_path)
@@ -86,3 +78,18 @@ def read(file_path: str, offset: int = 1, limit: int = 2000) -> str:
         output += f"\n\n(End of file - {total_lines} lines)"
 
     return output[:50000]
+
+
+@tool
+def read(file_path: str, offset: int = 1, limit: int = 2000) -> str:
+    """Read file contents with line numbers.
+
+    Supports reading text files with line-by-line output.
+    For large files, use offset and limit to read specific sections.
+
+    Args:
+        file_path: Absolute or relative path to the file.
+        offset: Line number to start reading from (1-indexed). Defaults to 1.
+        limit: Maximum number of lines to read. Defaults to 2000.
+    """
+    return _read_file_content(file_path, offset, limit)

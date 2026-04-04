@@ -425,7 +425,12 @@ def extract_attributable_slices(perf_summary_json: str, min_dur_ms: float = 1.0)
     Returns a sorted list of dicts with class_name, method_name, dur_ms, etc.
     Only includes slices with the SI$ prefix AND dur_ms >= min_dur_ms.
     """
-    data = json.loads(perf_summary_json)
+    if not perf_summary_json:
+        return []
+    try:
+        data = json.loads(perf_summary_json)
+    except (json.JSONDecodeError, TypeError):
+        return []
     view_slices = data.get("view_slices", {})
     if not view_slices:
         return []

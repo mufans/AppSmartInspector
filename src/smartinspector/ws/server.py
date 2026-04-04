@@ -29,6 +29,7 @@ class SIServer:
     """Singleton WebSocket server for SmartInspector CLI."""
 
     _instance = None
+    _lock = threading.Lock()
 
     def __init__(self, port: int = 9876):
         self.port = port
@@ -42,8 +43,9 @@ class SIServer:
 
     @classmethod
     def get(cls, port: int = 9876) -> "SIServer":
-        if cls._instance is None:
-            cls._instance = cls(port=port)
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls(port=port)
         return cls._instance
 
     def is_running(self) -> bool:
