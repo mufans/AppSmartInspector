@@ -27,6 +27,8 @@ class AgentState(TypedDict):
     perf_analysis: str           # Markdown: LLM performance analysis
     attribution_data: str        # JSON: list of attributable SI$ slices
     attribution_result: str      # JSON: list of attribution results with source snippets
+    trace_duration_ms: int       # CLI override: trace duration in ms
+    trace_target_process: str    # CLI override: target process name
     _route: str                  # internal: RouteDecision value (orchestrator routing)
     _trace_path: str             # internal: trace file path from collector
 

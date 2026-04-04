@@ -11,7 +11,7 @@ def _get_perfetto_config() -> dict:
 
     The app sends config_sync on first WS connection (SIClient.onOpen),
     so the server always has the latest config after app connects.
-    If no config cached (app never connected), returns empty dict → defaults.
+    If no config cached (app never connected), returns empty dict -> defaults.
     """
     server = SIServer.get()
     config_str = server.get_config()
@@ -29,10 +29,30 @@ def _get_perfetto_config() -> dict:
 def cmd_trace(args: str, state: dict) -> dict:
     """Collect and analyze a Perfetto trace via the graph pipeline.
 
-    Routes through collector → analyzer (TRACE path, stops before attributor).
+    Routes through collector -> analyzer (TRACE path, stops before attributor).
 
     Usage: /trace [duration_ms] [package_name]
     """
+    # Parse CLI args to override defaults
+    parts = args.split() if args else []
+    duration_ms = None
+    target_process = None
+
+    if len(parts) >= 1:
+        try:
+            duration_ms = int(parts[0])
+        except ValueError:
+            target_process = parts[0]
+
+    if len(parts) >= 2:
+        target_process = parts[1]
+
+    # Store parsed args in state for collector_node to use
+    if duration_ms is not None:
+        state["trace_duration_ms"] = duration_ms
+    if target_process:
+        state["trace_target_process"] = target_process
+
     from smartinspector.graph import create_graph, _stream_run
     from smartinspector.graph.state import RouteDecision
 

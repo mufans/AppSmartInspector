@@ -33,18 +33,18 @@ def collector_node(state: AgentState) -> dict:
     """Collect and analyze a Perfetto trace.
 
     Runs PerfettoCollector.pull_trace_from_device() + summarize().
-    Reads perfetto params from WS server config cache (sent by app via config_sync).
+    Priority: CLI args (from state) > WS server config cache > defaults.
     """
     from smartinspector.collector.perfetto import PerfettoCollector
 
     print("  [collector] Starting trace collection...", flush=True)
 
     try:
-        # Read perfetto params from WS server config cache (app sends via config_sync)
+        # Read perfetto params: CLI args override WS config
         pc = _read_perfetto_config()
-        duration_ms = int(pc.get("trace_duration_ms", 10000))
-        buffer_size_kb = int(pc.get("buffer_size_kb", 65536))
-        target_process = pc.get("target_process", "") or None
+        duration_ms = state.get("trace_duration_ms") or int(pc.get("trace_duration_ms", 10000))
+        buffer_size_kb = state.get("trace_buffer_size_kb") or int(pc.get("buffer_size_kb", 65536))
+        target_process = state.get("trace_target_process") or pc.get("target_process", "") or None
 
         print(f"  [collector] Config: duration={duration_ms}ms, buffer={buffer_size_kb}KB", flush=True)
 
