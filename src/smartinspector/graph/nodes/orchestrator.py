@@ -32,7 +32,7 @@ def _get_route_llm():
     global _route_llm
     if _route_llm is not None:
         return _route_llm
-    _route_llm = ChatOpenAI(**get_llm_kwargs(temperature=0))
+    _route_llm = ChatOpenAI(**get_llm_kwargs(temperature=0, max_tokens=5))
     return _route_llm
 
 
