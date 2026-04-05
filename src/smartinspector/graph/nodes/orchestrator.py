@@ -106,9 +106,9 @@ def fallback_node(state: AgentState) -> dict:
     """Use LLM to generate a friendly reply for non-performance queries."""
     messages = state.get("messages", [])
 
-    # Extract recent conversation for context
+    # Extract recent conversation for context (filter out ToolMessage to save tokens)
     recent = []
-    for m in messages[-6:]:  # last 3 turns
+    for m in messages:
         if isinstance(m, dict):
             role = m.get("role", "")
             content = m.get("content", "")
@@ -117,7 +117,11 @@ def fallback_node(state: AgentState) -> dict:
             elif role == "assistant":
                 recent.append(AIMessage(content=content))
         else:
-            recent.append(m)
+            msg_type = getattr(m, "type", "")
+            if msg_type in ("human", "ai"):
+                recent.append(m)
+    # Keep only the last 6 valid conversation messages
+    recent = recent[-6:]
 
     llm = _get_route_llm()
     response = llm.invoke([
