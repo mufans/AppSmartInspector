@@ -373,12 +373,12 @@ class PerfettoCollector:
             for r in rows:
                 entry = {"name": r.name, "pid": r.pid}
                 if r.max_rss_kb is not None:
-                    # Counter values are in bytes, convert to KB
-                    entry["rss_kb"] = round(r.max_rss_kb / 1024)
-                    entry["avg_rss_kb"] = round(r.avg_rss_kb / 1024)
+                    # Perfetto process_counter_track 中 mem.rss / mem.rss.anon 单位已是 KB
+                    entry["rss_kb"] = round(r.max_rss_kb)
+                    entry["avg_rss_kb"] = round(r.avg_rss_kb)
                 if r.max_anon_kb is not None:
-                    entry["rss_anon_kb"] = round(r.max_anon_kb / 1024)
-                    entry["avg_anon_kb"] = round(r.avg_anon_kb / 1024)
+                    entry["rss_anon_kb"] = round(r.max_anon_kb)
+                    entry["avg_anon_kb"] = round(r.avg_anon_kb)
                 if entry.get("rss_kb") or entry.get("rss_anon_kb"):
                     processes.append(entry)
             if processes:
