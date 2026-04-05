@@ -2,6 +2,8 @@
 
 from langchain_core.messages import AIMessage
 
+from smartinspector.config import get_report_max_tokens
+
 from smartinspector.graph.state import AgentState
 from smartinspector.graph.nodes.reporter.formatter import (
     format_perf_sections,
@@ -59,7 +61,7 @@ def reporter_node(state: AgentState) -> dict:
     user_content = "\n\n".join(user_parts)
 
     # Token estimation and truncation (CJK: 1 token ≈ 1.5 chars)
-    MAX_REPORT_INPUT_TOKENS = 4000
+    MAX_REPORT_INPUT_TOKENS = get_report_max_tokens()
     estimated_tokens = len(user_content) / 1.5
     if estimated_tokens > MAX_REPORT_INPUT_TOKENS:
         target_chars = int(MAX_REPORT_INPUT_TOKENS * 1.5)

@@ -5,7 +5,7 @@ import subprocess
 from langchain_core.tools import tool
 
 from smartinspector.tools.rg import find_rg
-from smartinspector.config import get_source_dir
+from smartinspector.config import get_source_dir, get_tool_timeout
 
 
 def _validate_search_path(path: str) -> str | None:
@@ -40,12 +40,12 @@ def glob(pattern: str, path: str = "") -> str:
 
     try:
         result = subprocess.run(
-            args, capture_output=True, text=True, timeout=30,
+            args, capture_output=True, text=True, timeout=get_tool_timeout(),
         )
     except FileNotFoundError:
         return "Error: ripgrep (rg) not found. Please install it first."
     except subprocess.TimeoutExpired:
-        return "Error: search timed out after 30s."
+        return f"Error: search timed out after {get_tool_timeout()}s."
 
     if result.returncode != 0 and not result.stdout.strip():
         return "No files found."

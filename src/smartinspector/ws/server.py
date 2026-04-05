@@ -21,6 +21,8 @@ import threading
 import uuid
 from typing import Callable
 
+from smartinspector.config import get_ws_ping_timeout
+
 _CONFIG_PATH = pathlib.Path.home() / ".smartinspector_config.json"
 
 try:
@@ -191,7 +193,7 @@ class SIServer:
                 "0.0.0.0",
                 self.port,
                 ping_interval=20,
-                ping_timeout=30,
+                ping_timeout=get_ws_ping_timeout(),
             )
             await asyncio.Future()  # run forever
 

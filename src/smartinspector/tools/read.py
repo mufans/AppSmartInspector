@@ -4,9 +4,11 @@ import os
 from functools import lru_cache
 from langchain_core.tools import tool
 
-MAX_LINES = 2000
-MAX_LINE_LENGTH = 2000
-MAX_BYTES = 50 * 1024  # 50KB
+from smartinspector.config import get_read_max_lines, get_read_max_bytes, get_read_max_line_length
+
+MAX_LINES = get_read_max_lines()
+MAX_LINE_LENGTH = get_read_max_line_length()
+MAX_BYTES = get_read_max_bytes()
 
 
 @lru_cache(maxsize=64)
