@@ -1,6 +1,24 @@
 """Streaming graph runner: _stream_run."""
 
 from smartinspector.token_tracker import get_tracker
+from smartinspector.graph.state import AgentState
+
+
+def _merge_state(base: dict, updates: dict) -> dict:
+    """Merge graph node updates into base state.
+
+    - messages: appended (operator.add semantics)
+    - other fields: last non-empty value wins
+    """
+    result = dict(base)
+    for key in AgentState.__annotations__:
+        if key not in updates or not updates[key]:
+            continue
+        if key == "messages":
+            result[key] = result.get(key, []) + updates[key]
+        else:
+            result[key] = updates[key]
+    return result
 
 
 def _stream_run(graph, state):
@@ -40,43 +58,9 @@ def _stream_run(graph, state):
 
     print("\n")
 
-    # Build updated state
-    new_messages = list(state.get("messages", []))
-    perf_summary = state.get("perf_summary", "")
-    perf_analysis = state.get("perf_analysis", "")
-    attribution_data = state.get("attribution_data", "")
-    attribution_result = state.get("attribution_result", "")
-    trace_path = state.get("_trace_path", "")
-
+    # Merge all node outputs into state
+    merged = dict(state)
     for node_name, node_state in last_updates.items():
-        node_msgs = node_state.get("messages", [])
-        new_messages.extend(node_msgs)
+        merged = _merge_state(merged, node_state)
 
-        node_ps = node_state.get("perf_summary", "")
-        if node_ps:
-            perf_summary = node_ps
-
-        node_pa = node_state.get("perf_analysis", "")
-        if node_pa:
-            perf_analysis = node_pa
-
-        node_ad = node_state.get("attribution_data", "")
-        if node_ad:
-            attribution_data = node_ad
-
-        node_ar = node_state.get("attribution_result", "")
-        if node_ar:
-            attribution_result = node_ar
-
-        node_tp = node_state.get("_trace_path", "")
-        if node_tp:
-            trace_path = node_tp
-
-    return {
-        "messages": new_messages,
-        "perf_summary": perf_summary,
-        "perf_analysis": perf_analysis,
-        "attribution_data": attribution_data,
-        "attribution_result": attribution_result,
-        "_trace_path": trace_path,
-    }
+    return merged
