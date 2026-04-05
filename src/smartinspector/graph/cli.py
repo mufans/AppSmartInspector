@@ -69,13 +69,15 @@ def main():
             print("bye!")
             break
 
-        # Slash commands bypass the LLM graph
-        if user_input.startswith("/"):
-            state = handle_slash_command(user_input, state)
-            continue
-
-        state["messages"] = state["messages"] + [
-            {"role": "user", "content": user_input}
-        ]
-
-        state = _stream_run(graph, state)
+        try:
+            # Slash commands bypass the LLM graph
+            if user_input.startswith("/"):
+                state = handle_slash_command(user_input, state)
+            else:
+                state["messages"] = state["messages"] + [
+                    {"role": "user", "content": user_input}
+                ]
+                state = _stream_run(graph, state)
+        except Exception as e:
+            print(f"\n  Error: {e}")
+            print("  Session state preserved. Continue or type /help.\n")
