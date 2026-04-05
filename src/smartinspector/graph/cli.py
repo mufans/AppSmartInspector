@@ -11,7 +11,7 @@ def main():
     import subprocess
     import pathlib
 
-    from smartinspector.config import get_source_dir, set_source_dir
+    from smartinspector.config import get_source_dir, set_source_dir, get_ws_port
     from smartinspector.ws.server import SIServer
 
     parser = argparse.ArgumentParser(description="SmartInspector CLI")
@@ -29,16 +29,17 @@ def main():
     print("Type /help for commands, 'quit' or Ctrl+C to exit\n")
 
     # Auto-start WS server + adb reverse so app can connect on launch
-    server = SIServer.get(port=9876)
+    port = get_ws_port()
+    server = SIServer.get(port=port)
     server.start()
     try:
         subprocess.run(
-            ["adb", "reverse", "tcp:9876", "tcp:9876"],
+            ["adb", "reverse", f"tcp:{port}", f"tcp:{port}"],
             capture_output=True, text=True, timeout=5,
         )
-        print("  WS server ready on :9876, adb reverse set")
+        print(f"  WS server ready on :{port}, adb reverse set")
     except Exception as e:
-        print(f"  WS server ready on :9876 (adb reverse failed: {e})")
+        print(f"  WS server ready on :{port} (adb reverse failed: {e})")
     print()
 
     graph = create_graph()
