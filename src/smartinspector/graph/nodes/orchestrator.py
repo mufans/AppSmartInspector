@@ -5,7 +5,7 @@ from langchain_openai import ChatOpenAI
 
 from smartinspector.config import get_llm_kwargs
 from smartinspector.token_tracker import get_tracker
-from smartinspector.graph.state import AgentState, RouteDecision, _pass_through
+from smartinspector.graph.state import AgentState, RouteDecision, _pass_through, node_error_handler
 
 
 _ROUTE_PROMPT = """Classify this user message. Reply with ONE word only.
@@ -44,6 +44,7 @@ def _get_route_llm():
     return _route_llm
 
 
+@node_error_handler("orchestrator")
 def orchestrator_node(state: AgentState) -> dict:
     """Pure LLM classification to decide routing."""
     messages = state.get("messages", [])

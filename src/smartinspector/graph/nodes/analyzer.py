@@ -3,9 +3,10 @@
 from langchain_core.messages import AIMessage
 
 from smartinspector.agents.perf_analyzer import analyze_perf
-from smartinspector.graph.state import AgentState
+from smartinspector.graph.state import AgentState, node_error_handler
 
 
+@node_error_handler("perf_analyzer")
 def perf_analyzer_node(state: AgentState) -> dict:
     """Run single-shot perf analysis on the JSON summary."""
     perf_json = state.get("perf_summary", "")
@@ -36,6 +37,7 @@ def perf_analyzer_node(state: AgentState) -> dict:
     }
 
 
+@node_error_handler("analyzer")
 def analyzer_node(state: AgentState) -> dict:
     """Analyze perf summary JSON with LLM."""
     perf_json = state.get("perf_summary", "")
