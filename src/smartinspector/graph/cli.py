@@ -54,8 +54,18 @@ def main():
 
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.completion import WordCompleter
 
-    session = PromptSession(history=FileHistory(str(pathlib.Path.home() / ".smartinspector_history")))
+    from smartinspector.commands import SLASH_COMMANDS
+
+    command_completer = WordCompleter(
+        list(SLASH_COMMANDS.keys()) + ["quit", "exit"],
+        ignore_case=True,
+    )
+    session = PromptSession(
+        history=FileHistory(str(pathlib.Path.home() / ".smartinspector_history")),
+        completer=command_completer,
+    )
 
     while True:
         try:
