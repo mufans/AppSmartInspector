@@ -1,6 +1,5 @@
 """Glob tool: find files by name patterns using ripgrep."""
 
-import os
 import subprocess
 from langchain_core.tools import tool
 
