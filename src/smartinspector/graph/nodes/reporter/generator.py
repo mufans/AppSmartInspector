@@ -26,6 +26,7 @@ def generate_report(report_prompt: str, user_content: str) -> str:
         for chunk in llm.stream(messages):
             token = chunk.content
             if token:
+                print(token, end="", flush=True)  # Stream token-by-token to user
                 full_content += token
             um = getattr(chunk, "usage_metadata", None)
             if um:
