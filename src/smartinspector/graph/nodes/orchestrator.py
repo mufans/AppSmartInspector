@@ -147,18 +147,23 @@ def fallback_node(state: AgentState) -> dict:
 def route_from_orchestrator(state: AgentState) -> str:
     """Map routing decision to node name."""
     decision = state.get("_route", "end")
+
+    # Mapping supports both enum values and string values
     mapping = {
         RouteDecision.FULL_ANALYSIS: "collector",
+        RouteDecision.FULL_ANALYSIS.value: "collector",
         RouteDecision.ANDROID: "android_expert",
+        RouteDecision.ANDROID.value: "android_expert",
         RouteDecision.ANALYZE: "perf_analyzer",
+        RouteDecision.ANALYZE.value: "perf_analyzer",
         RouteDecision.EXPLORER: "explorer",
+        RouteDecision.EXPLORER.value: "explorer",
         RouteDecision.END: "fallback",
+        RouteDecision.END.value: "fallback",
         RouteDecision.TRACE: "collector",
+        RouteDecision.TRACE.value: "collector",
     }
-    # Accept both enum values and raw strings for robustness
-    if decision in mapping:
-        return mapping[decision]
-    return mapping.get(RouteDecision(decision), "fallback")
+    return mapping.get(decision, "fallback")
 
 
 def route_from_android_expert(state: AgentState) -> str:
