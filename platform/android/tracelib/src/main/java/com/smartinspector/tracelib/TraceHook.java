@@ -819,7 +819,9 @@ public class TraceHook {
                 public void beforeCall(Pine.CallFrame cf) {
                     String tag = autoTag(cf, methodName);
                     Trace.beginSection(tag);
-                    Log.d(TAG, "[hook-fire] " + tag + " this=" + cf.thisObject.getClass().getName());
+                    if (BuildConfig.DEBUG) {
+                        Log.d(TAG, "[hook-fire] " + tag + " this=" + cf.thisObject.getClass().getName());
+                    }
                 }
 
                 @Override
@@ -847,7 +849,9 @@ public class TraceHook {
                     if (hookId != null && !HookConfigManager.isEnabled(hookId)) return;
                     String tag = autoTag(cf, methodName);
                     Trace.beginSection(tag);
-                    Log.d(TAG, "[hook-fire] " + tag + " this=" + cf.thisObject.getClass().getName());
+                    if (BuildConfig.DEBUG) {
+                        Log.d(TAG, "[hook-fire] " + tag + " this=" + cf.thisObject.getClass().getName());
+                    }
                 }
 
                 @Override
