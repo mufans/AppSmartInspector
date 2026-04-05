@@ -252,7 +252,8 @@ class PerfettoCollector:
                 GROUP BY display_frame_token
                 ORDER BY frame_ts ASC
             """)
-        except Exception:
+        except Exception as e:
+            logger.debug("Frame timeline query failed: %s", e)
             return {}
 
         # User-impacting jank types per Perfetto/SurfaceFlinger docs:
@@ -335,7 +336,8 @@ class PerfettoCollector:
                 break
             else:
                 return {}
-        except Exception:
+        except Exception as e:
+            logger.debug("Trace bounds query failed: %s", e)
             return {}
 
         trace_dur_ns = trace_end_ns - trace_start_ns
@@ -349,7 +351,8 @@ class PerfettoCollector:
             for cr in cpu_rows:
                 num_cpus = max(1, cr.num_cpus)
                 break
-        except Exception:
+        except Exception as e:
+            logger.debug("CPU count query failed: %s", e)
             num_cpus = 1
 
         # Per-thread CPU usage from sched table
@@ -369,7 +372,8 @@ class PerfettoCollector:
                 ORDER BY total_dur_ns DESC
                 LIMIT 20
             """)
-        except Exception:
+        except Exception as e:
+            logger.debug("CPU usage query failed: %s", e)
             return {}
 
         # Total CPU wall-time available = trace_dur * num_cpus
@@ -547,8 +551,9 @@ class PerfettoCollector:
                 ORDER BY total_bytes DESC
                 LIMIT 15
             """)
-        except Exception:
+        except Exception as e:
             # heap_graph tables may not exist if no Java heap dump
+            logger.debug("Heap graph query failed: %s", e)
             return {}
 
         allocs = []
@@ -651,7 +656,8 @@ class PerfettoCollector:
                             logger.debug("Grandparent slice query failed: %s", e)
                 except Exception as e:
                     logger.debug("Parent slice query failed: %s", e)
-        except Exception:
+        except Exception as e:
+            logger.debug("View slices query failed: %s", e)
             return {}
 
         slices = []
@@ -829,7 +835,8 @@ class PerfettoCollector:
                    OR name LIKE 'SI$img#%'
                 ORDER BY ts ASC
             """)
-        except Exception:
+        except Exception as e:
+            logger.debug("IO slices query failed: %s", e)
             return {}
 
         slices = []
@@ -888,7 +895,8 @@ class PerfettoCollector:
                 WHERE name LIKE 'SI$touch#%'
                 ORDER BY ts ASC
             """)
-        except Exception:
+        except Exception as e:
+            logger.debug("Input events query failed: %s", e)
             return []
 
         events = []
@@ -931,7 +939,8 @@ class PerfettoCollector:
                 WHERE name LIKE 'SI$block#%'
                 ORDER BY ts ASC
             """)
-        except Exception:
+        except Exception as e:
+            logger.debug("Block events query failed: %s", e)
             return []
 
         block_slices = []
@@ -1036,7 +1045,8 @@ class PerfettoCollector:
                     break
                 else:
                     result[table] = 0
-            except Exception:
+            except Exception as e:
+                logger.debug("Table %s query failed: %s", table, e)
                 result[table] = -1  # table doesn't exist
         return result
 
@@ -1050,8 +1060,8 @@ class PerfettoCollector:
             meta = tp.query("SELECT key, str_value FROM metadata")
             for r in meta:
                 summary.metadata[r.key] = r.str_value
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Metadata query failed: %s", e)
 
         # Table diagnosis — help understand why data may be missing
         try:
