@@ -382,6 +382,10 @@ public class BlockMonitor {
             Collections.addAll(frames, parts);
         }
         synchronized (BlockMonitor.class) {
+            // Prevent OOM on long-running sessions
+            if (blockEvents.size() >= 500) {
+                blockEvents.subList(0, 100).clear();
+            }
             blockEvents.add(new BlockEvent(msgClass, elapsedMs, frames));
         }
     }
