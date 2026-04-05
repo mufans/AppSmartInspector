@@ -1,5 +1,6 @@
 """PerfettoCollector: adb collect -> SQL query -> unified JSON."""
 
+import bisect
 import json
 import os
 import subprocess
@@ -52,6 +53,7 @@ class PerfSummary:
     metadata: dict = field(default_factory=dict)
     block_events: list[dict] = field(default_factory=list)
     input_events: list[dict] = field(default_factory=list)
+    sys_stats: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, ensure_ascii=False)
@@ -81,14 +83,15 @@ class PerfettoCollector:
             self._tp = None
 
     def collect_sched(self) -> dict:
-        """Analyze scheduling data: top runners, context switches."""
+        """Analyze scheduling data with end_state and blocked reasons."""
         tp = self._open()
         rows = tp.query("""
             SELECT
               thread.name AS comm,
               thread.tid AS tid,
               COUNT(*) AS switches,
-              SUM(sched.dur) AS total_dur_ns
+              SUM(sched.dur) AS total_dur_ns,
+              MODE() WITHIN GROUP (ORDER BY sched.end_state) AS dominant_state
             FROM sched
             JOIN thread ON sched.utid = thread.utid
             GROUP BY thread.name, thread.tid
@@ -97,22 +100,55 @@ class PerfettoCollector:
         """)
         hot_threads = []
         for r in rows:
-            hot_threads.append({
+            entry = {
                 "comm": r.comm,
                 "tid": r.tid,
                 "switches": r.switches,
                 "total_dur_ms": round(r.total_dur_ns / 1e6, 2),
-            })
-        return {"hot_threads": hot_threads}
+                "dominant_state": r.dominant_state,
+            }
+            hot_threads.append(entry)
+
+        # Blocked reasons from sched_blocked_reason table
+        blocked_reasons: list[dict] = []
+        try:
+            br_rows = tp.query("""
+                SELECT
+                  t.name AS comm,
+                  br.blocked_reason,
+                  br.io_wait,
+                  COUNT(*) AS occurrences
+                FROM sched_blocked_reason br
+                JOIN thread t ON br.utid = t.utid
+                GROUP BY t.name, br.blocked_reason, br.io_wait
+                ORDER BY occurrences DESC
+                LIMIT 10
+            """)
+            for r in br_rows:
+                blocked_reasons.append({
+                    "comm": r.comm,
+                    "reason": r.blocked_reason,
+                    "io_wait": bool(r.io_wait),
+                    "occurrences": r.occurrences,
+                })
+        except Exception:
+            pass
+
+        result = {"hot_threads": hot_threads}
+        if blocked_reasons:
+            result["blocked_reasons"] = blocked_reasons
+
+        return result
 
     def collect_cpu_hotspots(self) -> list[dict]:
-        """Find CPU hotspots from linux.perf callstack profiling data."""
+        """Find CPU hotspots with callchain reconstruction."""
         tp = self._open()
         try:
             rows = tp.query("""
                 SELECT
                   spf.name AS function_name,
                   t.name AS thread_name,
+                  ps.callsite_id,
                   COUNT(*) AS sample_count,
                   SUM(COUNT(*)) OVER () AS total_samples
                 FROM perf_sample ps
@@ -120,23 +156,56 @@ class PerfettoCollector:
                 JOIN stack_profile_frame spf ON spc.frame_id = spf.id
                 JOIN thread t ON ps.utid = t.utid
                 WHERE ps.callsite_id IS NOT NULL
-                GROUP BY spf.name, t.name
+                GROUP BY spf.name, t.name, ps.callsite_id
                 ORDER BY sample_count DESC
                 LIMIT 20
             """)
         except Exception:
-            # linux.perf tables may not exist if no CPU profiling data
             return []
+
+        if not rows:
+            return []
+
+        # Preload callsite -> frame mapping and parent relationships
+        callsite_map: dict[int, tuple[str, int | None]] = {}  # id -> (frame_name, parent_id)
+        try:
+            cs_rows = tp.query("""
+                SELECT spc.id, spf.name, spc.parent_id
+                FROM stack_profile_callsite spc
+                JOIN stack_profile_frame spf ON spc.frame_id = spf.id
+            """)
+            for r in cs_rows:
+                callsite_map[r.id] = (r.name, r.parent_id)
+        except Exception:
+            pass
 
         hotspots = []
         for r in rows:
             pct = round(r.sample_count / r.total_samples * 100, 1) if r.total_samples else 0
+
+            # Reconstruct callchain (leaf to root)
+            callchain = []
+            callsite_id = r.callsite_id
+            visited = set()
+            max_depth = 15
+            for _ in range(max_depth):
+                if callsite_id is None or callsite_id in visited:
+                    break
+                visited.add(callsite_id)
+                entry = callsite_map.get(callsite_id)
+                if entry is None:
+                    break
+                callchain.append(entry[0])  # frame name
+                callsite_id = entry[1]  # parent_id
+
             hotspots.append({
                 "function": r.function_name,
                 "thread": r.thread_name,
                 "samples": r.sample_count,
                 "pct": pct,
+                "callchain": callchain,  # [leaf, ..., root]
             })
+
         return hotspots
 
     def collect_frame_timeline(self) -> dict:
@@ -343,6 +412,76 @@ class PerfettoCollector:
             "top_processes": top_processes,
         }
 
+    def collect_sys_stats(self) -> dict:
+        """Collect system-level CPU stats from linux.sys_stats data source.
+
+        Queries cpu_counter_track / counter tables for system-wide CPU usage
+        and frequency data. This data is collected when linux.sys_stats is
+        configured in pull_trace_from_device (stat_period_ms, cpufreq_period_ms).
+        """
+        tp = self._open()
+
+        result: dict = {}
+
+        # 1. System CPU idle time samples
+        try:
+            cpu_rows = tp.query("""
+                SELECT
+                  c.ts,
+                  c.value AS cpu_util
+                FROM counter c
+                JOIN cpu_counter_track cct ON c.track_id = cct.id
+                WHERE cct.name = 'cpuidle_time'
+                ORDER BY c.ts ASC
+            """)
+            samples = [{"ts_ns": r.ts, "value": r.cpu_util} for r in cpu_rows]
+            if samples:
+                result["cpu_idle_samples"] = samples
+        except Exception:
+            pass
+
+        # 2. CPU frequency per core
+        try:
+            freq_rows = tp.query("""
+                SELECT
+                  cct.cpu,
+                  c.ts,
+                  c.value AS freq_khz
+                FROM counter c
+                JOIN cpu_counter_track cct ON c.track_id = cct.id
+                WHERE cct.name = 'cpufreq'
+                ORDER BY cct.cpu, c.ts ASC
+            """)
+            freq_by_core: dict[int, list] = {}
+            for r in freq_rows:
+                freq_by_core.setdefault(r.cpu, []).append({
+                    "ts_ns": r.ts,
+                    "freq_khz": r.freq_khz,
+                })
+            if freq_by_core:
+                result["cpu_freq_by_core"] = freq_by_core
+        except Exception:
+            pass
+
+        # 3. Fork rate
+        try:
+            fork_rows = tp.query("""
+                SELECT
+                  c.ts,
+                  c.value AS fork_count
+                FROM counter c
+                JOIN cpu_counter_track cct ON c.track_id = cct.id
+                WHERE cct.name = 'num_forks'
+                ORDER BY c.ts ASC
+            """)
+            forks = [{"ts_ns": r.ts, "forks": r.fork_count} for r in fork_rows]
+            if forks:
+                result["fork_rate"] = forks
+        except Exception:
+            pass
+
+        return result
+
     def collect_process_memory(self) -> dict:
         """Collect process-level memory stats from process_counter_track.
 
@@ -373,12 +512,12 @@ class PerfettoCollector:
             for r in rows:
                 entry = {"name": r.name, "pid": r.pid}
                 if r.max_rss_kb is not None:
-                    # Counter values are in bytes, convert to KB
-                    entry["rss_kb"] = round(r.max_rss_kb / 1024)
-                    entry["avg_rss_kb"] = round(r.avg_rss_kb / 1024)
+                    # Perfetto process_counter_track 中 mem.rss / mem.rss.anon 单位已是 KB
+                    entry["rss_kb"] = round(r.max_rss_kb)
+                    entry["avg_rss_kb"] = round(r.avg_rss_kb)
                 if r.max_anon_kb is not None:
-                    entry["rss_anon_kb"] = round(r.max_anon_kb / 1024)
-                    entry["avg_anon_kb"] = round(r.avg_anon_kb / 1024)
+                    entry["rss_anon_kb"] = round(r.max_anon_kb)
+                    entry["avg_anon_kb"] = round(r.avg_anon_kb)
                 if entry.get("rss_kb") or entry.get("rss_anon_kb"):
                     processes.append(entry)
             if processes:
@@ -841,23 +980,36 @@ class PerfettoCollector:
         except Exception:
             pass
 
-        # 3. Correlate slices with log entries by timestamp
+        # 3. Correlate slices with log entries by timestamp (bisect, O(n log n + m log m))
         MATCH_WINDOW_NS = 500_000_000  # 500ms
 
-        for block in block_slices:
-            block_ts = block["ts_ns"]
-            best_match = None
-            best_dist = MATCH_WINDOW_NS + 1
+        if log_entries:
+            log_ts_list = sorted(
+                [(log["ts_ns"], log) for log in log_entries],
+                key=lambda x: x[0],
+            )
+            log_timestamps = [t for t, _ in log_ts_list]
 
-            for log in log_entries:
-                dist = abs(log["ts_ns"] - block_ts)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_match = log
+            for block in block_slices:
+                block_ts = block["ts_ns"]
+                idx = bisect.bisect_left(log_timestamps, block_ts)
+                best_match = None
+                best_dist = MATCH_WINDOW_NS + 1
 
-            if best_match and best_dist <= MATCH_WINDOW_NS:
-                block["stack_trace"] = _parse_siblock_msg(best_match["msg"])
-            else:
+                # Check idx and idx-1 as candidates
+                for candidate_idx in (idx - 1, idx):
+                    if 0 <= candidate_idx < len(log_ts_list):
+                        dist = abs(log_ts_list[candidate_idx][0] - block_ts)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_match = log_ts_list[candidate_idx][1]
+
+                if best_match and best_dist <= MATCH_WINDOW_NS:
+                    block["stack_trace"] = _parse_siblock_msg(best_match["msg"])
+                else:
+                    block["stack_trace"] = []
+        else:
+            for block in block_slices:
                 block["stack_trace"] = []
 
         return block_slices
@@ -974,6 +1126,14 @@ class PerfettoCollector:
         except Exception as e:
             summary.input_events = [{"error": str(e)}]
 
+        # System-level stats (CPU idle, frequency, fork rate)
+        try:
+            sys_stats = self.collect_sys_stats()
+            if sys_stats:
+                summary.sys_stats = sys_stats
+        except Exception:
+            pass
+
         return summary
 
     @staticmethod
@@ -984,6 +1144,8 @@ class PerfettoCollector:
         target_process: str | None = None,
         buffer_size_kb: int = 65536,
         cpu_sampling_interval_ms: int = 1,
+        collect_cpu_callstacks: bool = True,
+        collect_java_heap: bool = True,
     ) -> str:
         """Pull a Perfetto trace from connected Android device via adb.
 
@@ -996,6 +1158,8 @@ class PerfettoCollector:
                             callstack profiling and Java heap profiling.
             buffer_size_kb: Main buffer size in KB.
             cpu_sampling_interval_ms: CPU sampling interval in ms (1-10).
+            collect_cpu_callstacks: Enable CPU callstack profiling (requires target_process).
+            collect_java_heap: Enable Java heap profiling (requires target_process).
 
         Returns:
             Path to the downloaded trace file.
@@ -1083,8 +1247,8 @@ class PerfettoCollector:
             "}",
         ]
 
-        # CPU callstack profiling + Java heap (requires target_process)
-        if target_process:
+        # CPU callstack profiling (requires target_process)
+        if target_process and collect_cpu_callstacks:
             cpu_freq = max(1, 1000 // cpu_sampling_interval_ms)  # ms → Hz
             config_lines += [
                 "",
@@ -1106,6 +1270,11 @@ class PerfettoCollector:
                 "    }",
                 "  }",
                 "}",
+            ]
+
+        # Java heap profiling (requires target_process)
+        if target_process and collect_java_heap:
+            config_lines += [
                 "",
                 "# Java heap profiling",
                 "data_sources: {",
