@@ -16,9 +16,12 @@ Protocol (JSON):
 
 import asyncio
 import json
+import pathlib
 import threading
 import uuid
 from typing import Callable
+
+_CONFIG_PATH = pathlib.Path.home() / ".smartinspector_config.json"
 
 try:
     import websockets
@@ -42,6 +45,7 @@ class SIServer:
         self._config_event = threading.Event()  # signals config received
         self._on_message_handler: Callable | None = None
         self._pending_acks: dict[str, threading.Event] = {}
+        self._latest_config: str = self._load_cached_config()
 
     @classmethod
     def get(cls, port: int = 9876) -> "SIServer":
@@ -112,6 +116,8 @@ class SIServer:
             future.result(timeout=3)
             # Wait for ACK from any app
             ack_event.wait(timeout=timeout)
+            if ack_event.is_set():
+                self._persist_config(config_json)
             return ack_event.is_set()
         except Exception:
             return False
@@ -153,6 +159,25 @@ class SIServer:
 
     def on_message(self, handler: Callable) -> None:
         self._on_message_handler = handler
+
+    # ── Config persistence ─────────────────────────────────────
+
+    def _persist_config(self, config_json: str) -> None:
+        """Save config to local cache file."""
+        try:
+            _CONFIG_PATH.write_text(config_json)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _load_cached_config() -> str:
+        """Load config from local cache file."""
+        try:
+            if _CONFIG_PATH.exists():
+                return _CONFIG_PATH.read_text()
+        except Exception:
+            pass
+        return ""
 
     # ── Internal async ─────────────────────────────────────────
 
@@ -209,6 +234,7 @@ class SIServer:
         if msg_type == "config_sync":
             # App pushed its current config
             self._latest_config = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+            self._persist_config(self._latest_config)
             self._config_event.set()
             # Also notify external handler if registered
             if self._on_message_handler:
