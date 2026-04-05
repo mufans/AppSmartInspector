@@ -85,6 +85,13 @@ class PerfettoCollector:
             self._tp.close()
             self._tp = None
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
     def collect_sched(self) -> dict:
         """Analyze scheduling data with end_state and blocked reasons."""
         tp = self._open()
