@@ -12,6 +12,9 @@ from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
 from smartinspector.perfetto_compat import patch
 
+import logging
+logger = logging.getLogger(__name__)
+
 # Apply macOS IPv4 fix
 patch()
 
@@ -131,8 +134,8 @@ class PerfettoCollector:
                     "io_wait": bool(r.io_wait),
                     "occurrences": r.occurrences,
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("sched_blocked_reason query failed: %s", e)
 
         result = {"hot_threads": hot_threads}
         if blocked_reasons:
@@ -160,7 +163,8 @@ class PerfettoCollector:
                 ORDER BY sample_count DESC
                 LIMIT 20
             """)
-        except Exception:
+        except Exception as e:
+            logger.debug("CPU hotspot query failed: %s", e)
             return []
 
         if not rows:
@@ -176,8 +180,8 @@ class PerfettoCollector:
             """)
             for r in cs_rows:
                 callsite_map[r.id] = (r.name, r.parent_id)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("callsite_map query failed: %s", e)
 
         hotspots = []
         for r in rows:
@@ -231,8 +235,8 @@ class PerfettoCollector:
             """)
             for r in exp_rows:
                 expected_map[r.display_frame_token] = round(r.expected_dur_ns / 1e6, 2)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Expected frame timeline query failed: %s", e)
 
         try:
             rows = tp.query("""
@@ -437,8 +441,8 @@ class PerfettoCollector:
             samples = [{"ts_ns": r.ts, "value": r.cpu_util} for r in cpu_rows]
             if samples:
                 result["cpu_idle_samples"] = samples
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("CPU idle samples query failed: %s", e)
 
         # 2. CPU frequency per core
         try:
@@ -460,8 +464,8 @@ class PerfettoCollector:
                 })
             if freq_by_core:
                 result["cpu_freq_by_core"] = freq_by_core
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("CPU frequency query failed: %s", e)
 
         # 3. Fork rate
         try:
@@ -477,8 +481,8 @@ class PerfettoCollector:
             forks = [{"ts_ns": r.ts, "forks": r.fork_count} for r in fork_rows]
             if forks:
                 result["fork_rate"] = forks
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Fork rate query failed: %s", e)
 
         return result
 
@@ -522,8 +526,8 @@ class PerfettoCollector:
                     processes.append(entry)
             if processes:
                 return {"processes": processes}
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Process memory query failed: %s", e)
 
         return {}
 
@@ -643,10 +647,10 @@ class PerfettoCollector:
                                 WHERE id IN ({id_list2})
                             """)
                             rows = list(rows) + list(gp_rows)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        except Exception as e:
+                            logger.debug("Grandparent slice query failed: %s", e)
+                except Exception as e:
+                    logger.debug("Parent slice query failed: %s", e)
         except Exception:
             return {}
 
@@ -977,8 +981,8 @@ class PerfettoCollector:
                     "ts_ns": r.ts,
                     "msg": r.msg or "",
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("SIBlock logcat query failed: %s", e)
 
         # 3. Correlate slices with log entries by timestamp (bisect, O(n log n + m log m))
         MATCH_WINDOW_NS = 500_000_000  # 500ms
@@ -1063,8 +1067,8 @@ class PerfettoCollector:
                 notes.append("Frame timeline: no data. Device may not support SurfaceFlinger jank tracking.")
             if notes:
                 summary.metadata["diagnosis"] = notes
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Table diagnosis failed: %s", e)
 
         # Scheduling
         try:
@@ -1131,8 +1135,8 @@ class PerfettoCollector:
             sys_stats = self.collect_sys_stats()
             if sys_stats:
                 summary.sys_stats = sys_stats
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("sys_stats collection failed: %s", e)
 
         return summary
 
