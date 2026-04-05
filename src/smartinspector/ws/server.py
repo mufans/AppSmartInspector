@@ -17,6 +17,7 @@ Protocol (JSON):
 import asyncio
 import json
 import threading
+import uuid
 from typing import Callable
 
 try:
@@ -40,6 +41,7 @@ class SIServer:
         self._latest_config: str = ""  # latest config from app
         self._config_event = threading.Event()  # signals config received
         self._on_message_handler: Callable | None = None
+        self._pending_acks: dict[str, threading.Event] = {}
 
     @classmethod
     def get(cls, port: int = 9876) -> "SIServer":
@@ -86,20 +88,35 @@ class SIServer:
         self._config_event.wait(timeout=timeout)
         return self._latest_config
 
-    def send_config(self, config_json: str) -> bool:
+    def send_config(self, config_json: str, timeout: float = 5.0) -> bool:
         """Send a config_update to all connected apps.
 
         Returns True if at least one app received it.
+        With ACK: waits for app confirmation within timeout.
         """
         if not self._connections:
             return False
-        msg = json.dumps({"type": "config_update", "payload": json.loads(config_json)})
+
+        msg_id = str(uuid.uuid4())
+        msg = json.dumps({
+            "type": "config_update",
+            "msg_id": msg_id,
+            "payload": json.loads(config_json),
+        })
+
+        ack_event = threading.Event()
+        self._pending_acks[msg_id] = ack_event
+
         future = asyncio.run_coroutine_threadsafe(self._broadcast(msg), self._loop)
         try:
-            future.result(timeout=5)
-            return True
+            future.result(timeout=3)
+            # Wait for ACK from any app
+            ack_event.wait(timeout=timeout)
+            return ack_event.is_set()
         except Exception:
             return False
+        finally:
+            self._pending_acks.pop(msg_id, None)
 
     def get_config(self) -> str:
         """Return the latest config received from app."""
@@ -180,6 +197,14 @@ class SIServer:
     async def _dispatch(self, ws, msg: dict) -> None:
         msg_type = msg.get("type", "")
         payload = msg.get("payload")
+
+        if msg_type == "ack":
+            # Handle ACK from app
+            msg_id = msg.get("msg_id", "")
+            event = self._pending_acks.get(msg_id)
+            if event:
+                event.set()
+            return
 
         if msg_type == "config_sync":
             # App pushed its current config
