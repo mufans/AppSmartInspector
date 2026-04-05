@@ -116,12 +116,30 @@ def collector_node(state: AgentState) -> dict:
         buffer_size_kb = state.get("trace_buffer_size_kb") or int(pc.get("buffer_size_kb", 65536))
         target_process = state.get("trace_target_process") or pc.get("target_process", "") or None
 
+        # Pass through full config from HookConfig
+        cpu_sampling_interval_ms = int(pc.get("cpu_sampling_interval_ms", 1))
+
+        categories_cfg = pc.get("categories")
+        if isinstance(categories_cfg, str) and categories_cfg:
+            categories = [c.strip() for c in categories_cfg.split(",") if c.strip()]
+        elif isinstance(categories_cfg, list) and categories_cfg:
+            categories = categories_cfg
+        else:
+            categories = None
+
+        collect_cpu_callstacks = pc.get("collectCpuCallstacks", True)
+        collect_java_heap = pc.get("collectJavaHeap", True)
+
         print(f"  [collector] Config: duration={duration_ms}ms, buffer={buffer_size_kb}KB", flush=True)
 
         trace_path = PerfettoCollector.pull_trace_from_device(
             duration_ms=duration_ms,
             target_process=target_process,
             buffer_size_kb=buffer_size_kb,
+            categories=categories,
+            cpu_sampling_interval_ms=cpu_sampling_interval_ms,
+            collect_cpu_callstacks=collect_cpu_callstacks if target_process else False,
+            collect_java_heap=collect_java_heap if target_process else False,
         )
         print(f"  [collector] Trace saved to {trace_path}", flush=True)
 

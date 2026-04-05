@@ -1144,6 +1144,8 @@ class PerfettoCollector:
         target_process: str | None = None,
         buffer_size_kb: int = 65536,
         cpu_sampling_interval_ms: int = 1,
+        collect_cpu_callstacks: bool = True,
+        collect_java_heap: bool = True,
     ) -> str:
         """Pull a Perfetto trace from connected Android device via adb.
 
@@ -1156,6 +1158,8 @@ class PerfettoCollector:
                             callstack profiling and Java heap profiling.
             buffer_size_kb: Main buffer size in KB.
             cpu_sampling_interval_ms: CPU sampling interval in ms (1-10).
+            collect_cpu_callstacks: Enable CPU callstack profiling (requires target_process).
+            collect_java_heap: Enable Java heap profiling (requires target_process).
 
         Returns:
             Path to the downloaded trace file.
@@ -1243,8 +1247,8 @@ class PerfettoCollector:
             "}",
         ]
 
-        # CPU callstack profiling + Java heap (requires target_process)
-        if target_process:
+        # CPU callstack profiling (requires target_process)
+        if target_process and collect_cpu_callstacks:
             cpu_freq = max(1, 1000 // cpu_sampling_interval_ms)  # ms → Hz
             config_lines += [
                 "",
@@ -1266,6 +1270,11 @@ class PerfettoCollector:
                 "    }",
                 "  }",
                 "}",
+            ]
+
+        # Java heap profiling (requires target_process)
+        if target_process and collect_java_heap:
+            config_lines += [
                 "",
                 "# Java heap profiling",
                 "data_sources: {",

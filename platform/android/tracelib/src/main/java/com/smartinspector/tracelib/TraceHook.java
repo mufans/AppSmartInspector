@@ -200,7 +200,7 @@ public class TraceHook {
             public void beforeCall(Pine.CallFrame cf) {
                 if (!HookConfigManager.isEnabled("activity_lifecycle")) return;
                 boolean focus = (boolean) cf.args[0];
-                Trace.beginSection(SI_PREFIX + cls(cf) + ".windowFocus(" + focus + ")");
+                beginSectionSafe(SI_PREFIX + cls(cf) + ".windowFocus(" + focus + ")");
             }
 
             @Override
@@ -499,7 +499,7 @@ public class TraceHook {
                     layoutName = "0x" + Integer.toHexString(layoutResId);
                 }
                 String parentClass = parent != null ? parent.getClass().getSimpleName() : "null";
-                Trace.beginSection(SI_PREFIX + "inflate#" + layoutName + "#" + parentClass);
+                beginSectionSafe(SI_PREFIX + "inflate#" + layoutName + "#" + parentClass);
             }
 
             @Override
@@ -541,7 +541,7 @@ public class TraceHook {
                         // Skip RecyclerView — already hooked by rv_pipeline
                         Object thiz = cf.thisObject;
                         if (thiz.getClass().getName().contains("RecyclerView")) return;
-                        Trace.beginSection(SI_PREFIX + "view#" + thiz.getClass().getName() + "." + methodName);
+                        beginSectionSafe(SI_PREFIX + "view#" + thiz.getClass().getName() + "." + methodName);
                     }
 
                     @Override
@@ -570,7 +570,7 @@ public class TraceHook {
                 if (Looper.myLooper() != Looper.getMainLooper()) return;
                 android.os.Message msg = (android.os.Message) cf.args[0];
                 String msgClass = msg.getCallback() != null ? msg.getCallback().getClass().getName() : "what=" + msg.what;
-                Trace.beginSection(SI_PREFIX + "handler#" + msgClass);
+                beginSectionSafe(SI_PREFIX + "handler#" + msgClass);
             }
 
             @Override
@@ -634,7 +634,7 @@ public class TraceHook {
                 public void beforeCall(Pine.CallFrame cf) {
                     if (!HookConfigManager.isEnabled("database_io")) return;
                     String table = (String) cf.args[1];
-                    Trace.beginSection(SI_PREFIX + "db#" + cf.thisObject.getClass().getName() + ".query#" + table);
+                    beginSectionSafe(SI_PREFIX + "db#" + cf.thisObject.getClass().getName() + ".query#" + table);
                 }
 
                 @Override
@@ -698,7 +698,7 @@ public class TraceHook {
                 Activity activity = (Activity) cf.thisObject;
                 MotionEvent event = (MotionEvent) cf.args[0];
                 String action = motionActionToString(event.getActionMask());
-                Trace.beginSection(SI_PREFIX + "touch#" + activity.getClass().getSimpleName()
+                beginSectionSafe(SI_PREFIX + "touch#" + activity.getClass().getSimpleName()
                         + "#" + action);
             }
 
@@ -774,7 +774,7 @@ public class TraceHook {
                 @Override
                 public void beforeCall(Pine.CallFrame cf) {
                     if (hookId != null && !HookConfigManager.isEnabled(hookId)) return;
-                    Trace.beginSection(SI_PREFIX + ioPrefix + "#" + cf.thisObject.getClass().getName() + "." + methodName);
+                    beginSectionSafe(SI_PREFIX + ioPrefix + "#" + cf.thisObject.getClass().getName() + "." + methodName);
                 }
 
                 @Override
@@ -799,7 +799,7 @@ public class TraceHook {
                 @Override
                 public void beforeCall(Pine.CallFrame cf) {
                     String tag = autoTag(cf, methodName);
-                    Trace.beginSection(tag);
+                    beginSectionSafe(tag);
                     Log.d(TAG, "[hook-fire] " + tag + " this=" + cf.thisObject.getClass().getName());
                 }
 
@@ -827,7 +827,7 @@ public class TraceHook {
                 public void beforeCall(Pine.CallFrame cf) {
                     if (hookId != null && !HookConfigManager.isEnabled(hookId)) return;
                     String tag = autoTag(cf, methodName);
-                    Trace.beginSection(tag);
+                    beginSectionSafe(tag);
                     Log.d(TAG, "[hook-fire] " + tag + " this=" + cf.thisObject.getClass().getName());
                 }
 
@@ -839,6 +839,43 @@ public class TraceHook {
             Log.d(TAG, "[hook-ok] " + clazz.getSimpleName() + "." + methodName);
         } catch (Exception e) {
             Log.w(TAG, "[hook-fail] " + clazz.getSimpleName() + "." + methodName + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Safely begin a trace section with atrace 127-byte limit.
+     * If tag exceeds 127 chars, truncates preserving category + method name.
+     */
+    private static void beginSectionSafe(String tag) {
+        if (tag.length() <= 127) {
+            Trace.beginSection(tag);
+            return;
+        }
+        // Truncation strategy: keep SI$<category>#<method>, shorten class name in middle
+        int firstHash = tag.indexOf('#');
+        if (firstHash < 0) {
+            Trace.beginSection(tag.substring(0, Math.min(tag.length(), 124)) + "...");
+            return;
+        }
+        String prefix = tag.substring(0, firstHash + 1);  // e.g. "SI$RV#"
+        String rest = tag.substring(firstHash + 1);
+
+        // Try to find the last dot to separate class from method
+        int lastDot = rest.lastIndexOf('.');
+        if (lastDot > 0) {
+            String className = rest.substring(0, lastDot);
+            String method = rest.substring(lastDot);
+            int budget = 120 - prefix.length() - method.length();
+            if (budget > 8 && className.length() > budget) {
+                // Shorten className: keep prefix and suffix
+                int half = (budget - 2) / 2;
+                className = className.substring(0, half) + ".."
+                        + className.substring(className.length() - half);
+            }
+            String truncated = prefix + className + method;
+            Trace.beginSection(truncated.length() <= 127 ? truncated : truncated.substring(0, 124) + "...");
+        } else {
+            Trace.beginSection(tag.substring(0, Math.min(tag.length(), 124)) + "...");
         }
     }
 
