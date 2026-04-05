@@ -6,15 +6,7 @@ from langchain_core.tools import tool
 
 from smartinspector.tools.rg import find_rg
 from smartinspector.config import get_source_dir, get_tool_timeout
-
-
-def _validate_search_path(path: str) -> str | None:
-    """Validate and resolve search path. Returns resolved path or None if invalid."""
-    # Block traversal: check raw path components before normalization
-    parts = path.replace("\\", "/").split("/")
-    if ".." in parts:
-        return None
-    return os.path.realpath(path)
+from smartinspector.tools.path_utils import validate_search_path
 
 
 @tool
@@ -30,7 +22,7 @@ def glob(pattern: str, path: str = "") -> str:
     """
     if not path:
         path = get_source_dir()
-    path = _validate_search_path(path)
+    path = validate_search_path(path)
     if path is None:
         return "Error: invalid path."
     rg = find_rg()
