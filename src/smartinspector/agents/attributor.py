@@ -10,6 +10,7 @@ Slices whose files cannot be found are marked as system classes.
 """
 
 import json
+import threading
 from collections import OrderedDict
 
 from pydantic import BaseModel
@@ -49,6 +50,7 @@ _TOOLS = {
 _llm_with_tools = None
 _system_prompt = None
 _structured_llm = None
+_llm_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -93,15 +95,17 @@ class _FileCache:
 
 
 def _get_llm():
-    """Get LLM with bound tools (singleton)."""
+    """Get LLM with bound tools (singleton, thread-safe)."""
     global _llm_with_tools, _system_prompt, _structured_llm
     if _llm_with_tools is not None:
         return _llm_with_tools, _system_prompt
-
-    llm = ChatOpenAI(**get_llm_kwargs(role="attributor", temperature=0))
-    _llm_with_tools = llm.bind_tools([grep, glob, read])
-    _structured_llm = llm.with_structured_output(AttributionResponse)
-    _system_prompt = load_prompt("attributor")
+    with _llm_lock:
+        if _llm_with_tools is not None:
+            return _llm_with_tools, _system_prompt
+        llm = ChatOpenAI(**get_llm_kwargs(role="attributor", temperature=0))
+        _llm_with_tools = llm.bind_tools([grep, glob, read])
+        _structured_llm = llm.with_structured_output(AttributionResponse)
+        _system_prompt = load_prompt("attributor")
     return _llm_with_tools, _system_prompt
 
 
