@@ -96,7 +96,13 @@ def collector_node(state: AgentState) -> dict:
             "_trace_path": trace_path,
         }
     except Exception as e:
-        error_msg = f"Trace collection failed: {e}"
+        error_msg = (
+            f"Trace collection failed: {e}\n\n"
+            "Possible fixes:\n"
+            "1. Ensure the Android device is connected via USB and adb is available\n"
+            "2. Run `/trace` with a pre-existing trace file\n"
+            "3. Use `/config` to check device connection status"
+        )
         print(f"  [collector] ERROR: {error_msg}", flush=True)
         return {
             "messages": [AIMessage(content=error_msg)],
