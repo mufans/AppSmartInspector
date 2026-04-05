@@ -61,7 +61,12 @@ class SIServer:
 
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        print(f"  WS server started on port {self.port}")
+        # Brief wait to catch startup errors (port conflict, etc.)
+        self._thread.join(timeout=0.5)
+        if self._thread.is_alive():
+            print(f"  WS server started on port {self.port}")
+        else:
+            print(f"  WS server FAILED to start on port {self.port} (check port conflict)")
 
     def stop(self) -> None:
         """Stop the WS server."""
@@ -148,8 +153,10 @@ class SIServer:
 
         try:
             self._loop.run_until_complete(_serve())
-        except Exception:
-            pass
+        except OSError as e:
+            print(f"  [ws] Failed to start: {e}")
+        except Exception as e:
+            print(f"  [ws] Unexpected error: {e}")
 
     async def _handler(self, ws) -> None:
         self._connections.add(ws)
