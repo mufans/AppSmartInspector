@@ -78,4 +78,10 @@ def main():
             {"role": "user", "content": user_input}
         ]
 
-        state = _stream_run(graph, state)
+        try:
+            state = _stream_run(graph, state)
+        except KeyboardInterrupt:
+            print("\n  [interrupted]", flush=True)
+        except Exception as e:
+            print(f"\n  [error] {e}", flush=True)
+            # Keep state unchanged, allow user to continue input
