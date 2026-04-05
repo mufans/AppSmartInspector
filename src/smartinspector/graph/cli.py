@@ -21,7 +21,13 @@ def main():
     if args.source_dir:
         set_source_dir(args.source_dir)
 
-    print("SmartInspector v0.5.0")
+    from importlib.metadata import version as pkg_version
+    try:
+        _version = pkg_version("smartinspector")
+    except Exception:
+        _version = "dev"
+
+    print(f"SmartInspector v{_version}")
     if args.source_dir:
         print(f"Source dir: {get_source_dir()}")
     else:
