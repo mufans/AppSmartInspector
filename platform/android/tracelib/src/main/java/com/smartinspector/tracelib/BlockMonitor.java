@@ -382,6 +382,10 @@ public class BlockMonitor {
             Collections.addAll(frames, parts);
         }
         synchronized (BlockMonitor.class) {
+            // Prevent OOM on long-running sessions
+            if (blockEvents.size() >= 500) {
+                blockEvents.subList(0, 100).clear();
+            }
             blockEvents.add(new BlockEvent(msgClass, elapsedMs, frames));
         }
     }
@@ -400,7 +404,7 @@ public class BlockMonitor {
      *   "what=123"  →  "what=123"  (no change, not a FQN)
      *   "Unknown"  →  "Unknown"  (no change)
      */
-    static String shortenClassName(String fqn) {
+    public static String shortenClassName(String fqn) {
         if (fqn == null || !fqn.contains(".")) return fqn;
 
         // Handle inner classes: split at $ first

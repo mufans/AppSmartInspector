@@ -42,6 +42,23 @@ public class TraceHook {
     private static final Set<Class<?>> hookedFragments = new HashSet<>();
     private static final Set<Class<?>> hookedActivities = new HashSet<>();
 
+    // Trace nesting depth protection (atrace supports max 16 nested sections)
+    private static final int MAX_TRACE_DEPTH = 10;
+    private static final ThreadLocal<Integer> traceDepth = ThreadLocal.withInitial(() -> 0);
+
+    private static boolean enterTrace() {
+        int depth = traceDepth.get();
+        if (depth >= MAX_TRACE_DEPTH) return false;
+        traceDepth.set(depth + 1);
+        return true;
+    }
+
+    private static void exitTrace() {
+        int depth = traceDepth.get();
+        if (depth > 0) traceDepth.set(depth - 1);
+        Trace.endSection();
+    }
+
     private static SIClient wsClient;
 
     /**
@@ -79,7 +96,7 @@ public class TraceHook {
     }
 
     private static void doInit() {
-        PineConfig.debug = true;
+        PineConfig.debug = BuildConfig.DEBUG;
         PineConfig.debuggable = false;
 
         if (HookConfigManager.isEnabled("activity_lifecycle")) {
@@ -200,12 +217,13 @@ public class TraceHook {
             public void beforeCall(Pine.CallFrame cf) {
                 if (!HookConfigManager.isEnabled("activity_lifecycle")) return;
                 boolean focus = (boolean) cf.args[0];
-                beginSectionSafe(SI_PREFIX + cls(cf) + ".windowFocus(" + focus + ")");
+                if (!enterTrace()) return;
+                Trace.beginSection(SI_PREFIX + cls(cf) + ".windowFocus(" + focus + ")");
             }
 
             @Override
             public void afterCall(Pine.CallFrame cf) {
-                Trace.endSection();
+                exitTrace();
             }
         });
 
@@ -326,7 +344,9 @@ public class TraceHook {
         Class<?> fmcClass = Class.forName("androidx.fragment.app.FragmentManager$FragmentLifecycleCallbacks");
 
         // Track which Activity instances have registered callbacks
-        Set<Object> registered = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+        // Use WeakHashMap keySet so GC can reclaim Activity references after destruction
+        java.util.Set<Object> registered =
+            java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
 
         Method onCreate = faClass.getDeclaredMethod("onCreate", Bundle.class);
         Pine.hook(onCreate, new MethodHook() {
@@ -499,12 +519,13 @@ public class TraceHook {
                     layoutName = "0x" + Integer.toHexString(layoutResId);
                 }
                 String parentClass = parent != null ? parent.getClass().getSimpleName() : "null";
-                beginSectionSafe(SI_PREFIX + "inflate#" + layoutName + "#" + parentClass);
+                if (!enterTrace()) return;
+                Trace.beginSection(SI_PREFIX + "inflate#" + layoutName + "#" + parentClass);
             }
 
             @Override
             public void afterCall(Pine.CallFrame cf) {
-                Trace.endSection();
+                exitTrace();
             }
         });
         Log.d(TAG, "Hooked LayoutInflate");
@@ -538,15 +559,25 @@ public class TraceHook {
                     @Override
                     public void beforeCall(Pine.CallFrame cf) {
                         if (!HookConfigManager.isEnabled("view_traverse")) return;
-                        // Skip RecyclerView — already hooked by rv_pipeline
                         Object thiz = cf.thisObject;
-                        if (thiz.getClass().getName().contains("RecyclerView")) return;
-                        beginSectionSafe(SI_PREFIX + "view#" + thiz.getClass().getName() + "." + methodName);
+                        String className = thiz.getClass().getName();
+                        // Skip RecyclerView — already hooked by rv_pipeline
+                        if (className.contains("RecyclerView")) return;
+                        // Skip system widgets — not user code, avoid noise
+                        if (className.startsWith("android.")
+                            || className.startsWith("androidx.")
+                            || className.startsWith("com.google.")) return;
+                        String viewTag = SI_PREFIX + "view#" + className + "." + methodName;
+                        if (viewTag.length() > 127) {
+                            viewTag = SI_PREFIX + "view#" + shortenFqn(className) + "." + methodName;
+                        }
+                        if (!enterTrace()) return;
+                        Trace.beginSection(viewTag);
                     }
 
                     @Override
                     public void afterCall(Pine.CallFrame cf) {
-                        Trace.endSection();
+                        exitTrace();
                     }
                 });
             } catch (Exception e) {
@@ -570,12 +601,17 @@ public class TraceHook {
                 if (Looper.myLooper() != Looper.getMainLooper()) return;
                 android.os.Message msg = (android.os.Message) cf.args[0];
                 String msgClass = msg.getCallback() != null ? msg.getCallback().getClass().getName() : "what=" + msg.what;
-                beginSectionSafe(SI_PREFIX + "handler#" + msgClass);
+                String handlerTag = SI_PREFIX + "handler#" + msgClass;
+                if (handlerTag.length() > 127) {
+                    handlerTag = SI_PREFIX + "handler#" + BlockMonitor.shortenClassName(msgClass);
+                }
+                if (!enterTrace()) return;
+                Trace.beginSection(handlerTag);
             }
 
             @Override
             public void afterCall(Pine.CallFrame cf) {
-                Trace.endSection();
+                exitTrace();
             }
         });
         Log.d(TAG, "Hooked Handler dispatch");
@@ -634,12 +670,13 @@ public class TraceHook {
                 public void beforeCall(Pine.CallFrame cf) {
                     if (!HookConfigManager.isEnabled("database_io")) return;
                     String table = (String) cf.args[1];
-                    beginSectionSafe(SI_PREFIX + "db#" + cf.thisObject.getClass().getName() + ".query#" + table);
+                    if (!enterTrace()) return;
+                    Trace.beginSection(SI_PREFIX + "db#" + cf.thisObject.getClass().getName() + ".query#" + table);
                 }
 
                 @Override
                 public void afterCall(Pine.CallFrame cf) {
-                    Trace.endSection();
+                    exitTrace();
                 }
             });
         } catch (Exception e) {
@@ -698,13 +735,14 @@ public class TraceHook {
                 Activity activity = (Activity) cf.thisObject;
                 MotionEvent event = (MotionEvent) cf.args[0];
                 String action = motionActionToString(event.getActionMask());
-                beginSectionSafe(SI_PREFIX + "touch#" + activity.getClass().getSimpleName()
+                if (!enterTrace()) return;
+                Trace.beginSection(SI_PREFIX + "touch#" + activity.getClass().getSimpleName()
                         + "#" + action);
             }
 
             @Override
             public void afterCall(Pine.CallFrame cf) {
-                Trace.endSection();
+                exitTrace();
             }
         });
         Log.d(TAG, "Hooked Activity.dispatchTouchEvent");
@@ -774,12 +812,17 @@ public class TraceHook {
                 @Override
                 public void beforeCall(Pine.CallFrame cf) {
                     if (hookId != null && !HookConfigManager.isEnabled(hookId)) return;
-                    beginSectionSafe(SI_PREFIX + ioPrefix + "#" + cf.thisObject.getClass().getName() + "." + methodName);
+                    String ioTag = SI_PREFIX + ioPrefix + "#" + cf.thisObject.getClass().getName() + "." + methodName;
+                    if (ioTag.length() > 127) {
+                        ioTag = SI_PREFIX + ioPrefix + "#" + shortenFqn(cf.thisObject.getClass().getName()) + "." + methodName;
+                    }
+                    if (!enterTrace()) return;
+                    Trace.beginSection(ioTag);
                 }
 
                 @Override
                 public void afterCall(Pine.CallFrame cf) {
-                    Trace.endSection();
+                    exitTrace();
                 }
             });
             Log.d(TAG, "[hook-ok] " + clazz.getSimpleName() + "." + methodName + " (io:" + ioPrefix + ")");
@@ -799,13 +842,16 @@ public class TraceHook {
                 @Override
                 public void beforeCall(Pine.CallFrame cf) {
                     String tag = autoTag(cf, methodName);
-                    beginSectionSafe(tag);
-                    Log.d(TAG, "[hook-fire] " + tag + " this=" + cf.thisObject.getClass().getName());
+                    if (!enterTrace()) return;
+                    Trace.beginSection(tag);
+                    if (BuildConfig.DEBUG) {
+                        Log.d(TAG, "[hook-fire] " + tag + " this=" + cf.thisObject.getClass().getName());
+                    }
                 }
 
                 @Override
                 public void afterCall(Pine.CallFrame cf) {
-                    Trace.endSection();
+                    exitTrace();
                 }
             });
             Log.d(TAG, "[hook-ok] " + clazz.getSimpleName() + "." + methodName);
@@ -827,55 +873,21 @@ public class TraceHook {
                 public void beforeCall(Pine.CallFrame cf) {
                     if (hookId != null && !HookConfigManager.isEnabled(hookId)) return;
                     String tag = autoTag(cf, methodName);
-                    beginSectionSafe(tag);
-                    Log.d(TAG, "[hook-fire] " + tag + " this=" + cf.thisObject.getClass().getName());
+                    if (!enterTrace()) return;
+                    Trace.beginSection(tag);
+                    if (BuildConfig.DEBUG) {
+                        Log.d(TAG, "[hook-fire] " + tag + " this=" + cf.thisObject.getClass().getName());
+                    }
                 }
 
                 @Override
                 public void afterCall(Pine.CallFrame cf) {
-                    Trace.endSection();
+                    exitTrace();
                 }
             });
             Log.d(TAG, "[hook-ok] " + clazz.getSimpleName() + "." + methodName);
         } catch (Exception e) {
             Log.w(TAG, "[hook-fail] " + clazz.getSimpleName() + "." + methodName + ": " + e.getMessage());
-        }
-    }
-
-    /**
-     * Safely begin a trace section with atrace 127-byte limit.
-     * If tag exceeds 127 chars, truncates preserving category + method name.
-     */
-    private static void beginSectionSafe(String tag) {
-        if (tag.length() <= 127) {
-            Trace.beginSection(tag);
-            return;
-        }
-        // Truncation strategy: keep SI$<category>#<method>, shorten class name in middle
-        int firstHash = tag.indexOf('#');
-        if (firstHash < 0) {
-            Trace.beginSection(tag.substring(0, Math.min(tag.length(), 124)) + "...");
-            return;
-        }
-        String prefix = tag.substring(0, firstHash + 1);  // e.g. "SI$RV#"
-        String rest = tag.substring(firstHash + 1);
-
-        // Try to find the last dot to separate class from method
-        int lastDot = rest.lastIndexOf('.');
-        if (lastDot > 0) {
-            String className = rest.substring(0, lastDot);
-            String method = rest.substring(lastDot);
-            int budget = 120 - prefix.length() - method.length();
-            if (budget > 8 && className.length() > budget) {
-                // Shorten className: keep prefix and suffix
-                int half = (budget - 2) / 2;
-                className = className.substring(0, half) + ".."
-                        + className.substring(className.length() - half);
-            }
-            String truncated = prefix + className + method;
-            Trace.beginSection(truncated.length() <= 127 ? truncated : truncated.substring(0, 124) + "...");
-        } else {
-            Trace.beginSection(tag.substring(0, Math.min(tag.length(), 124)) + "...");
         }
     }
 
@@ -903,7 +915,35 @@ public class TraceHook {
             tagName = "on" + method.substring(7);
         }
 
-        return SI_PREFIX + thiz.getClass().getName() + "." + tagName;
+        String tag = SI_PREFIX + thiz.getClass().getName() + "." + tagName;
+
+        // atrace section name limit: 127 bytes
+        if (tag.length() > 127) {
+            tag = SI_PREFIX + shortenFqn(thiz.getClass().getName()) + "." + tagName;
+        }
+        return tag;
+    }
+
+    /**
+     * Shorten FQN to fit atrace 127-char limit.
+     * Keeps last two package segments + class name:
+     * com.example.app.ui.main.MainActivity → ui.main.MainActivity
+     */
+    private static String shortenFqn(String fqn) {
+        if (fqn == null || fqn.length() <= 50) return fqn;
+        // Handle inner classes: com.example.Outer$Inner → keep Outer part
+        String outer = fqn;
+        String inner = "";
+        int dollar = fqn.indexOf('$');
+        if (dollar >= 0) {
+            outer = fqn.substring(0, dollar);
+            inner = fqn.substring(dollar);
+        }
+        int lastDot = outer.lastIndexOf('.');
+        if (lastDot < 0) return fqn;
+        int prevDot = outer.lastIndexOf('.', lastDot - 1);
+        if (prevDot < 0) return outer.substring(lastDot + 1) + inner;
+        return outer.substring(prevDot + 1) + inner;
     }
 
     // ═══════════════════════════════════════════════════════════
