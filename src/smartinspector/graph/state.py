@@ -2,6 +2,7 @@
 
 from enum import Enum
 from typing import Annotated, TypedDict
+import functools
 import operator
 
 
@@ -55,3 +56,28 @@ def _pass_through(state: AgentState, *, extra_keys: tuple = ()) -> dict:
     """
     keys = _PASS_THROUGH_KEYS + extra_keys
     return {k: state.get(k, "") for k in keys}
+
+
+def node_error_handler(node_name: str):
+    """Decorator for graph nodes: catch unhandled exceptions and return safe state.
+
+    Usage::
+
+        @node_error_handler("my_node")
+        def my_node(state: AgentState) -> dict:
+            ...
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(state: AgentState) -> dict:
+            try:
+                return func(state)
+            except Exception as e:
+                from langchain_core.messages import AIMessage
+                print(f"  [{node_name}] ERROR: {e}", flush=True)
+                return {
+                    "messages": [AIMessage(content=f"[{node_name}] Error: {e}")],
+                    **_pass_through(state),
+                }
+        return wrapper
+    return decorator

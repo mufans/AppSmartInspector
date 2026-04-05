@@ -57,6 +57,14 @@ def reporter_node(state: AgentState) -> dict:
         print("  [reporter] WARNING: no trace_path in state", flush=True)
 
     user_content = "\n\n".join(user_parts)
+
+    # Token estimation and truncation (CJK: 1 token ≈ 1.5 chars)
+    MAX_REPORT_INPUT_TOKENS = 4000
+    estimated_tokens = len(user_content) / 1.5
+    if estimated_tokens > MAX_REPORT_INPUT_TOKENS:
+        target_chars = int(MAX_REPORT_INPUT_TOKENS * 1.5)
+        if len(user_content) > target_chars:
+            user_content = user_content[:target_chars] + "\n\n[... 数据过长已截断 ...]"
     full_content = generate_report(report_prompt, user_content)
 
     # Combine pre-generated header with LLM analysis

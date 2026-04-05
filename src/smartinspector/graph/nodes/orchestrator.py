@@ -5,7 +5,7 @@ from langchain_openai import ChatOpenAI
 
 from smartinspector.config import get_llm_kwargs
 from smartinspector.token_tracker import get_tracker
-from smartinspector.graph.state import AgentState, RouteDecision, _pass_through
+from smartinspector.graph.state import AgentState, RouteDecision, _pass_through, node_error_handler
 
 
 _ROUTE_PROMPT = """Classify this user message. Reply with ONE word only.
@@ -23,6 +23,14 @@ CRITICAL:
 - If the user says 分析性能/帮我分析 but has NOT provided perf data → MUST be end (let LLM guide them)
 - analyze should ONLY be used when user explicitly references existing perf data already in context
 
+Examples:
+- "帮我全面分析一下这个页面的性能" → full_analysis
+- "搜索一下 LazyForEach 的实现" → explorer
+- "采集一下 trace" → android
+- "你好" → end
+- "怎么优化列表滑动" → end
+- "分析一下刚才采集的这份数据" → analyze
+
 Reply with exactly one word: full_analysis explorer android analyze end"""
 
 _route_llm = None
@@ -32,10 +40,11 @@ def _get_route_llm():
     global _route_llm
     if _route_llm is not None:
         return _route_llm
-    _route_llm = ChatOpenAI(**get_llm_kwargs(temperature=0))
+    _route_llm = ChatOpenAI(**get_llm_kwargs(temperature=0, max_tokens=5))
     return _route_llm
 
 
+@node_error_handler("orchestrator")
 def orchestrator_node(state: AgentState) -> dict:
     """Pure LLM classification to decide routing."""
     messages = state.get("messages", [])
@@ -63,9 +72,13 @@ def orchestrator_node(state: AgentState) -> dict:
     ]
 
     llm = _get_route_llm()
-    response = llm.invoke(orch_input)
-    get_tracker().record_from_message("orchestrator", response)
-    raw = response.content.strip().lower()
+    try:
+        response = llm.invoke(orch_input)
+        get_tracker().record_from_message("orchestrator", response)
+        raw = response.content.strip().lower()
+    except Exception as e:
+        print(f"  [orchestrator] LLM call failed: {e}", flush=True)
+        raw = ""
 
     # Extract valid label
     valid = {rd.value: rd for rd in RouteDecision}
@@ -102,9 +115,9 @@ def fallback_node(state: AgentState) -> dict:
     """Use LLM to generate a friendly reply for non-performance queries."""
     messages = state.get("messages", [])
 
-    # Extract recent conversation for context
+    # Extract recent conversation for context (filter out ToolMessage to save tokens)
     recent = []
-    for m in messages[-6:]:  # last 3 turns
+    for m in messages:
         if isinstance(m, dict):
             role = m.get("role", "")
             content = m.get("content", "")
@@ -113,7 +126,11 @@ def fallback_node(state: AgentState) -> dict:
             elif role == "assistant":
                 recent.append(AIMessage(content=content))
         else:
-            recent.append(m)
+            msg_type = getattr(m, "type", "")
+            if msg_type in ("human", "ai"):
+                recent.append(m)
+    # Keep only the last 6 valid conversation messages
+    recent = recent[-6:]
 
     llm = _get_route_llm()
     response = llm.invoke([
@@ -131,18 +148,23 @@ def fallback_node(state: AgentState) -> dict:
 def route_from_orchestrator(state: AgentState) -> str:
     """Map routing decision to node name."""
     decision = state.get("_route", "end")
+
+    # Mapping supports both enum values and string values
     mapping = {
         RouteDecision.FULL_ANALYSIS: "collector",
+        RouteDecision.FULL_ANALYSIS.value: "collector",
         RouteDecision.ANDROID: "android_expert",
+        RouteDecision.ANDROID.value: "android_expert",
         RouteDecision.ANALYZE: "perf_analyzer",
+        RouteDecision.ANALYZE.value: "perf_analyzer",
         RouteDecision.EXPLORER: "explorer",
+        RouteDecision.EXPLORER.value: "explorer",
         RouteDecision.END: "fallback",
+        RouteDecision.END.value: "fallback",
         RouteDecision.TRACE: "collector",
+        RouteDecision.TRACE.value: "collector",
     }
-    # Accept both enum values and raw strings for robustness
-    if decision in mapping:
-        return mapping[decision]
-    return mapping.get(RouteDecision(decision), "fallback")
+    return mapping.get(decision, "fallback")
 
 
 def route_from_android_expert(state: AgentState) -> str:
