@@ -326,7 +326,9 @@ public class TraceHook {
         Class<?> fmcClass = Class.forName("androidx.fragment.app.FragmentManager$FragmentLifecycleCallbacks");
 
         // Track which Activity instances have registered callbacks
-        Set<Object> registered = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+        // Use WeakHashMap keySet so GC can reclaim Activity references after destruction
+        java.util.Set<Object> registered =
+            java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
 
         Method onCreate = faClass.getDeclaredMethod("onCreate", Bundle.class);
         Pine.hook(onCreate, new MethodHook() {
