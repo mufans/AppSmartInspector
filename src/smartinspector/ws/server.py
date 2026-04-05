@@ -148,6 +148,8 @@ class SIServer:
                 self._handler,
                 "0.0.0.0",
                 self.port,
+                ping_interval=20,
+                ping_timeout=30,
             )
             await asyncio.Future()  # run forever
 
