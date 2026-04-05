@@ -176,6 +176,11 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
 
         max_iterations = 12  # Safety limit
         for iteration in range(max_iterations):
+            # Message window trimming: keep system(0) + human(1) + recent 4 rounds
+            # Each round = 1 AIMessage + 1 ToolMessage = 2 messages
+            if len(messages) > 10:
+                messages = [messages[0], messages[1]] + messages[-8:]
+
             response = llm.invoke(messages)
 
             # Record token usage
