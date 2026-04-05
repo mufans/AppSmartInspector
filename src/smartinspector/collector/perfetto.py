@@ -83,14 +83,15 @@ class PerfettoCollector:
             self._tp = None
 
     def collect_sched(self) -> dict:
-        """Analyze scheduling data: top runners, context switches."""
+        """Analyze scheduling data with end_state and blocked reasons."""
         tp = self._open()
         rows = tp.query("""
             SELECT
               thread.name AS comm,
               thread.tid AS tid,
               COUNT(*) AS switches,
-              SUM(sched.dur) AS total_dur_ns
+              SUM(sched.dur) AS total_dur_ns,
+              MODE() WITHIN GROUP (ORDER BY sched.end_state) AS dominant_state
             FROM sched
             JOIN thread ON sched.utid = thread.utid
             GROUP BY thread.name, thread.tid
@@ -99,22 +100,55 @@ class PerfettoCollector:
         """)
         hot_threads = []
         for r in rows:
-            hot_threads.append({
+            entry = {
                 "comm": r.comm,
                 "tid": r.tid,
                 "switches": r.switches,
                 "total_dur_ms": round(r.total_dur_ns / 1e6, 2),
-            })
-        return {"hot_threads": hot_threads}
+                "dominant_state": r.dominant_state,
+            }
+            hot_threads.append(entry)
+
+        # Blocked reasons from sched_blocked_reason table
+        blocked_reasons: list[dict] = []
+        try:
+            br_rows = tp.query("""
+                SELECT
+                  t.name AS comm,
+                  br.blocked_reason,
+                  br.io_wait,
+                  COUNT(*) AS occurrences
+                FROM sched_blocked_reason br
+                JOIN thread t ON br.utid = t.utid
+                GROUP BY t.name, br.blocked_reason, br.io_wait
+                ORDER BY occurrences DESC
+                LIMIT 10
+            """)
+            for r in br_rows:
+                blocked_reasons.append({
+                    "comm": r.comm,
+                    "reason": r.blocked_reason,
+                    "io_wait": bool(r.io_wait),
+                    "occurrences": r.occurrences,
+                })
+        except Exception:
+            pass
+
+        result = {"hot_threads": hot_threads}
+        if blocked_reasons:
+            result["blocked_reasons"] = blocked_reasons
+
+        return result
 
     def collect_cpu_hotspots(self) -> list[dict]:
-        """Find CPU hotspots from linux.perf callstack profiling data."""
+        """Find CPU hotspots with callchain reconstruction."""
         tp = self._open()
         try:
             rows = tp.query("""
                 SELECT
                   spf.name AS function_name,
                   t.name AS thread_name,
+                  ps.callsite_id,
                   COUNT(*) AS sample_count,
                   SUM(COUNT(*)) OVER () AS total_samples
                 FROM perf_sample ps
@@ -122,23 +156,56 @@ class PerfettoCollector:
                 JOIN stack_profile_frame spf ON spc.frame_id = spf.id
                 JOIN thread t ON ps.utid = t.utid
                 WHERE ps.callsite_id IS NOT NULL
-                GROUP BY spf.name, t.name
+                GROUP BY spf.name, t.name, ps.callsite_id
                 ORDER BY sample_count DESC
                 LIMIT 20
             """)
         except Exception:
-            # linux.perf tables may not exist if no CPU profiling data
             return []
+
+        if not rows:
+            return []
+
+        # Preload callsite -> frame mapping and parent relationships
+        callsite_map: dict[int, tuple[str, int | None]] = {}  # id -> (frame_name, parent_id)
+        try:
+            cs_rows = tp.query("""
+                SELECT spc.id, spf.name, spc.parent_id
+                FROM stack_profile_callsite spc
+                JOIN stack_profile_frame spf ON spc.frame_id = spf.id
+            """)
+            for r in cs_rows:
+                callsite_map[r.id] = (r.name, r.parent_id)
+        except Exception:
+            pass
 
         hotspots = []
         for r in rows:
             pct = round(r.sample_count / r.total_samples * 100, 1) if r.total_samples else 0
+
+            # Reconstruct callchain (leaf to root)
+            callchain = []
+            callsite_id = r.callsite_id
+            visited = set()
+            max_depth = 15
+            for _ in range(max_depth):
+                if callsite_id is None or callsite_id in visited:
+                    break
+                visited.add(callsite_id)
+                entry = callsite_map.get(callsite_id)
+                if entry is None:
+                    break
+                callchain.append(entry[0])  # frame name
+                callsite_id = entry[1]  # parent_id
+
             hotspots.append({
                 "function": r.function_name,
                 "thread": r.thread_name,
                 "samples": r.sample_count,
                 "pct": pct,
+                "callchain": callchain,  # [leaf, ..., root]
             })
+
         return hotspots
 
     def collect_frame_timeline(self) -> dict:
