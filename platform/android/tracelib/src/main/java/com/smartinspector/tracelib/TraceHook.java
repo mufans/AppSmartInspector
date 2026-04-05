@@ -540,10 +540,15 @@ public class TraceHook {
                     @Override
                     public void beforeCall(Pine.CallFrame cf) {
                         if (!HookConfigManager.isEnabled("view_traverse")) return;
-                        // Skip RecyclerView — already hooked by rv_pipeline
                         Object thiz = cf.thisObject;
-                        if (thiz.getClass().getName().contains("RecyclerView")) return;
-                        Trace.beginSection(SI_PREFIX + "view#" + thiz.getClass().getName() + "." + methodName);
+                        String className = thiz.getClass().getName();
+                        // Skip RecyclerView — already hooked by rv_pipeline
+                        if (className.contains("RecyclerView")) return;
+                        // Skip system widgets — not user code, avoid noise
+                        if (className.startsWith("android.")
+                            || className.startsWith("androidx.")
+                            || className.startsWith("com.google.")) return;
+                        Trace.beginSection(SI_PREFIX + "view#" + className + "." + methodName);
                     }
 
                     @Override
