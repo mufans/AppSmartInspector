@@ -16,12 +16,15 @@ Protocol (JSON):
 
 import asyncio
 import json
+import logging
 import pathlib
 import threading
 import uuid
 from typing import Callable
 
 from smartinspector.config import get_ws_ping_timeout
+
+logger = logging.getLogger(__name__)
 
 _CONFIG_PATH = pathlib.Path.home() / ".smartinspector_config.json"
 
@@ -171,8 +174,8 @@ class SIServer:
         """Save config to local cache file."""
         try:
             _CONFIG_PATH.write_text(config_json)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to persist config: %s", e)
 
     @staticmethod
     def _load_cached_config() -> str:
@@ -180,8 +183,8 @@ class SIServer:
         try:
             if _CONFIG_PATH.exists():
                 return _CONFIG_PATH.read_text()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to load cached config: %s", e)
         return ""
 
     # ── Internal async ─────────────────────────────────────────
