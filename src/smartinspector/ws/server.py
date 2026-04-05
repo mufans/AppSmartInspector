@@ -45,6 +45,7 @@ class SIServer:
         self._connections: set = set()
         self._latest_config: str = ""  # latest config from app
         self._config_event = threading.Event()  # signals config received
+        self._ready_event = threading.Event()
         self._on_message_handler: Callable | None = None
         self._pending_acks: dict[str, threading.Event] = {}
         self._latest_config: str = self._load_cached_config()
@@ -67,12 +68,14 @@ class SIServer:
             print("  websockets not installed. Run: uv add websockets")
             return
 
+        self._ready_event.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        # Brief wait to catch startup errors (port conflict, etc.)
-        self._thread.join(timeout=0.5)
-        if self._thread.is_alive():
+        # Wait for server to be ready (or thread to die)
+        if self._ready_event.wait(timeout=2.0):
             print(f"  WS server started on port {self.port}")
+        elif self._thread.is_alive():
+            print(f"  WS server starting on port {self.port} (still initializing)")
         else:
             print(f"  WS server FAILED to start on port {self.port} (check port conflict)")
 
@@ -195,6 +198,7 @@ class SIServer:
                 ping_interval=20,
                 ping_timeout=get_ws_ping_timeout(),
             )
+            self._ready_event.set()
             await asyncio.Future()  # run forever
 
         try:
