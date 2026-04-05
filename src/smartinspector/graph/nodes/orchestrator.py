@@ -63,9 +63,13 @@ def orchestrator_node(state: AgentState) -> dict:
     ]
 
     llm = _get_route_llm()
-    response = llm.invoke(orch_input)
-    get_tracker().record_from_message("orchestrator", response)
-    raw = response.content.strip().lower()
+    try:
+        response = llm.invoke(orch_input)
+        get_tracker().record_from_message("orchestrator", response)
+        raw = response.content.strip().lower()
+    except Exception as e:
+        print(f"  [orchestrator] LLM call failed: {e}", flush=True)
+        raw = ""
 
     # Extract valid label
     valid = {rd.value: rd for rd in RouteDecision}
