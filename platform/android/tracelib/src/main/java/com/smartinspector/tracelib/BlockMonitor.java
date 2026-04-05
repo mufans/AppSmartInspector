@@ -404,7 +404,7 @@ public class BlockMonitor {
      *   "what=123"  →  "what=123"  (no change, not a FQN)
      *   "Unknown"  →  "Unknown"  (no change)
      */
-    static String shortenClassName(String fqn) {
+    public static String shortenClassName(String fqn) {
         if (fqn == null || !fqn.contains(".")) return fqn;
 
         // Handle inner classes: split at $ first

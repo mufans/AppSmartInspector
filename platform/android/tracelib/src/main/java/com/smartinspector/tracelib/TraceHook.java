@@ -548,7 +548,11 @@ public class TraceHook {
                         if (className.startsWith("android.")
                             || className.startsWith("androidx.")
                             || className.startsWith("com.google.")) return;
-                        Trace.beginSection(SI_PREFIX + "view#" + className + "." + methodName);
+                        String viewTag = SI_PREFIX + "view#" + className + "." + methodName;
+                        if (viewTag.length() > 127) {
+                            viewTag = SI_PREFIX + "view#" + shortenFqn(className) + "." + methodName;
+                        }
+                        Trace.beginSection(viewTag);
                     }
 
                     @Override
@@ -577,7 +581,11 @@ public class TraceHook {
                 if (Looper.myLooper() != Looper.getMainLooper()) return;
                 android.os.Message msg = (android.os.Message) cf.args[0];
                 String msgClass = msg.getCallback() != null ? msg.getCallback().getClass().getName() : "what=" + msg.what;
-                Trace.beginSection(SI_PREFIX + "handler#" + msgClass);
+                String handlerTag = SI_PREFIX + "handler#" + msgClass;
+                if (handlerTag.length() > 127) {
+                    handlerTag = SI_PREFIX + "handler#" + BlockMonitor.shortenClassName(msgClass);
+                }
+                Trace.beginSection(handlerTag);
             }
 
             @Override
@@ -781,7 +789,11 @@ public class TraceHook {
                 @Override
                 public void beforeCall(Pine.CallFrame cf) {
                     if (hookId != null && !HookConfigManager.isEnabled(hookId)) return;
-                    Trace.beginSection(SI_PREFIX + ioPrefix + "#" + cf.thisObject.getClass().getName() + "." + methodName);
+                    String ioTag = SI_PREFIX + ioPrefix + "#" + cf.thisObject.getClass().getName() + "." + methodName;
+                    if (ioTag.length() > 127) {
+                        ioTag = SI_PREFIX + ioPrefix + "#" + shortenFqn(cf.thisObject.getClass().getName()) + "." + methodName;
+                    }
+                    Trace.beginSection(ioTag);
                 }
 
                 @Override
@@ -873,7 +885,35 @@ public class TraceHook {
             tagName = "on" + method.substring(7);
         }
 
-        return SI_PREFIX + thiz.getClass().getName() + "." + tagName;
+        String tag = SI_PREFIX + thiz.getClass().getName() + "." + tagName;
+
+        // atrace section name limit: 127 bytes
+        if (tag.length() > 127) {
+            tag = SI_PREFIX + shortenFqn(thiz.getClass().getName()) + "." + tagName;
+        }
+        return tag;
+    }
+
+    /**
+     * Shorten FQN to fit atrace 127-char limit.
+     * Keeps last two package segments + class name:
+     * com.example.app.ui.main.MainActivity → ui.main.MainActivity
+     */
+    private static String shortenFqn(String fqn) {
+        if (fqn == null || fqn.length() <= 50) return fqn;
+        // Handle inner classes: com.example.Outer$Inner → keep Outer part
+        String outer = fqn;
+        String inner = "";
+        int dollar = fqn.indexOf('$');
+        if (dollar >= 0) {
+            outer = fqn.substring(0, dollar);
+            inner = fqn.substring(dollar);
+        }
+        int lastDot = outer.lastIndexOf('.');
+        if (lastDot < 0) return fqn;
+        int prevDot = outer.lastIndexOf('.', lastDot - 1);
+        if (prevDot < 0) return outer.substring(lastDot + 1) + inner;
+        return outer.substring(prevDot + 1) + inner;
     }
 
     // ═══════════════════════════════════════════════════════════
