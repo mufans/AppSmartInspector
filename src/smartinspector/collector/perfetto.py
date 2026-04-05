@@ -53,6 +53,7 @@ class PerfSummary:
     metadata: dict = field(default_factory=dict)
     block_events: list[dict] = field(default_factory=list)
     input_events: list[dict] = field(default_factory=list)
+    sys_stats: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, ensure_ascii=False)
@@ -343,6 +344,76 @@ class PerfettoCollector:
             "trace_dur_ms": round(trace_dur_ns / 1e6, 0),
             "top_processes": top_processes,
         }
+
+    def collect_sys_stats(self) -> dict:
+        """Collect system-level CPU stats from linux.sys_stats data source.
+
+        Queries cpu_counter_track / counter tables for system-wide CPU usage
+        and frequency data. This data is collected when linux.sys_stats is
+        configured in pull_trace_from_device (stat_period_ms, cpufreq_period_ms).
+        """
+        tp = self._open()
+
+        result: dict = {}
+
+        # 1. System CPU idle time samples
+        try:
+            cpu_rows = tp.query("""
+                SELECT
+                  c.ts,
+                  c.value AS cpu_util
+                FROM counter c
+                JOIN cpu_counter_track cct ON c.track_id = cct.id
+                WHERE cct.name = 'cpuidle_time'
+                ORDER BY c.ts ASC
+            """)
+            samples = [{"ts_ns": r.ts, "value": r.cpu_util} for r in cpu_rows]
+            if samples:
+                result["cpu_idle_samples"] = samples
+        except Exception:
+            pass
+
+        # 2. CPU frequency per core
+        try:
+            freq_rows = tp.query("""
+                SELECT
+                  cct.cpu,
+                  c.ts,
+                  c.value AS freq_khz
+                FROM counter c
+                JOIN cpu_counter_track cct ON c.track_id = cct.id
+                WHERE cct.name = 'cpufreq'
+                ORDER BY cct.cpu, c.ts ASC
+            """)
+            freq_by_core: dict[int, list] = {}
+            for r in freq_rows:
+                freq_by_core.setdefault(r.cpu, []).append({
+                    "ts_ns": r.ts,
+                    "freq_khz": r.freq_khz,
+                })
+            if freq_by_core:
+                result["cpu_freq_by_core"] = freq_by_core
+        except Exception:
+            pass
+
+        # 3. Fork rate
+        try:
+            fork_rows = tp.query("""
+                SELECT
+                  c.ts,
+                  c.value AS fork_count
+                FROM counter c
+                JOIN cpu_counter_track cct ON c.track_id = cct.id
+                WHERE cct.name = 'num_forks'
+                ORDER BY c.ts ASC
+            """)
+            forks = [{"ts_ns": r.ts, "forks": r.fork_count} for r in fork_rows]
+            if forks:
+                result["fork_rate"] = forks
+        except Exception:
+            pass
+
+        return result
 
     def collect_process_memory(self) -> dict:
         """Collect process-level memory stats from process_counter_track.
@@ -987,6 +1058,14 @@ class PerfettoCollector:
             summary.input_events = self.collect_input_events()
         except Exception as e:
             summary.input_events = [{"error": str(e)}]
+
+        # System-level stats (CPU idle, frequency, fork rate)
+        try:
+            sys_stats = self.collect_sys_stats()
+            if sys_stats:
+                summary.sys_stats = sys_stats
+        except Exception:
+            pass
 
         return summary
 
