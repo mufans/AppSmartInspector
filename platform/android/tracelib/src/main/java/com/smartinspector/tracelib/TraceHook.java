@@ -79,7 +79,7 @@ public class TraceHook {
     }
 
     private static void doInit() {
-        PineConfig.debug = true;
+        PineConfig.debug = BuildConfig.DEBUG;
         PineConfig.debuggable = false;
 
         if (HookConfigManager.isEnabled("activity_lifecycle")) {
