@@ -11,7 +11,7 @@ def main():
     import subprocess
     import pathlib
 
-    from smartinspector.config import get_source_dir, set_source_dir, get_ws_port
+    from smartinspector.config import get_source_dir, set_source_dir, get_ws_port, get_api_key
     from smartinspector.ws.server import SIServer
 
     parser = argparse.ArgumentParser(description="SmartInspector CLI")
@@ -33,6 +33,22 @@ def main():
     else:
         print(f"Source dir: {get_source_dir()} (use --source-dir or /config source_dir <path> to change)")
     print("Type /help for commands, 'quit' or Ctrl+C to exit\n")
+
+    # Check prerequisites
+    issues = []
+    try:
+        subprocess.run(
+            ["adb", "version"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except FileNotFoundError:
+        issues.append("adb not found in PATH. Install Android Platform Tools.")
+    except subprocess.TimeoutExpired:
+        issues.append("adb version check timed out.")
+    if not get_api_key():
+        issues.append("No API key configured. Set SI_API_KEY or OPENAI_API_KEY.")
+    for issue in issues:
+        print(f"  Warning: {issue}")
 
     # Auto-start WS server + adb reverse so app can connect on launch
     port = get_ws_port()
