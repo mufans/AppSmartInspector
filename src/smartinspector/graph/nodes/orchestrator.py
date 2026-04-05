@@ -23,6 +23,14 @@ CRITICAL:
 - If the user says 分析性能/帮我分析 but has NOT provided perf data → MUST be end (let LLM guide them)
 - analyze should ONLY be used when user explicitly references existing perf data already in context
 
+Examples:
+- "帮我全面分析一下这个页面的性能" → full_analysis
+- "搜索一下 LazyForEach 的实现" → explorer
+- "采集一下 trace" → android
+- "你好" → end
+- "怎么优化列表滑动" → end
+- "分析一下刚才采集的这份数据" → analyze
+
 Reply with exactly one word: full_analysis explorer android analyze end"""
 
 _route_llm = None
