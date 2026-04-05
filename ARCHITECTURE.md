@@ -9,7 +9,7 @@
 │                  CLI (graph/cli.py REPL)                     │
 │  you> [input] → graph.stream() → ai> [streaming output]     │
 │  + 启动前置检查 (adb + API key)                              │
-│  + 自动启动 WS server (动态端口) + adb reverse                │
+│  + 自动启动 WS server (动态端口 + ready event) + adb reverse    │
 │  + Tab 补全 + 全局异常保护                                    │
 └──────────────────────────┬──────────────────────────────────┘
                            │
@@ -53,7 +53,7 @@ smartinspector/
 │   ├── main.py                  # Legacy entry (deprecated)
 │   ├── prompts.py               # Prompt file loader
 │   ├── perfetto_compat.py       # macOS IPv4 fix for perfetto lib
-│   ├── config.py                # Global config (LLM models, source dir, hook config persistence)
+│   ├── config.py                # Global config (LLM models, source dir, hook config persistence, env var overrides)
 │   ├── token_tracker.py         # LLM token usage tracking
 │   │
 │   ├── graph/                   # LangGraph orchestration (modular package)
@@ -83,7 +83,7 @@ smartinspector/
 │   │   └── deterministic.py     #   Deterministic pre-computation (reduces LLM tokens)
 │   │
 │   ├── collector/               # Data collection & processing
-│   │   └── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON (CPU调用链, 系统级CPU, WS+SQL合并)
+│   │   └── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON (CPU调用链, 系统级CPU, WS+SQL合并, context manager)
 │   │
 │   ├── commands/                # Slash command implementations
 │   │   ├── __init__.py          #   Command registry (SLASH_COMMANDS dict + handle_slash_command)
@@ -99,10 +99,11 @@ smartinspector/
 │   │   ├── grep.py              #   ripgrep content search
 │   │   ├── glob.py              #   ripgrep file pattern search
 │   │   ├── read.py              #   file reader with line numbers
-│   │   └── rg.py                #   ripgrep binary finder
+│   │   ├── rg.py                #   ripgrep binary finder
+│   │   └── path_utils.py        #   shared path validation (prevent traversal)
 │   │
 │   └── ws/                      # WebSocket communication
-│       └── server.py            #   SIServer (心跳检测, 启动异常上报, 动态端口, msg_id+ACK)
+│       └── server.py            #   SIServer (心跳检测, ready event, 动态端口, msg_id+ACK)
 │
 ├── prompts/                     # System prompts (text files)
 │   ├── main.txt                 #   Main persona (HarmonyOS perf tool)
@@ -391,6 +392,10 @@ def handle_slash_command(user_input: str, state: dict) -> dict:
 ## Data Collection Layer
 
 ### PerfettoCollector (`collector/perfetto.py`)
+
+**Protocols**: Supports `with` statement (context manager) for automatic trace file cleanup.
+
+**Memory units**: Perfetto `process_counter_track` stores `mem.rss` / `mem.rss.anon` in **bytes**; collector converts to KB via `/1024` before storing as `rss_kb` fields. Display layer (`orchestrate.py`) converts KB → MB via `/1024`.
 
 **PerfSummary structure**:
 ```
@@ -749,7 +754,10 @@ orchestrator → collector → analyzer → END
 12. **MemorySaver state** — `graph.get_state(config)` replaces manual state merging; `node_error_handler` decorator for unified error handling
 13. **Token efficiency** — Route LLM uses max_tokens=5; message window trimming for attributor; reporter input token estimation and truncation; fallback filters Human/AI only
 14. **SDK safety** — Trace nesting depth protection; Tag truncation at 127 bytes; BlockMonitor capacity limit; system widget filtering; BuildConfig.DEBUG guards
-15. **WS reliability** — Ping/pong heartbeat; startup exception propagation; dynamic port via get_ws_port(); config msg_id + ACK; hook config persistence to local file
+15. **WS reliability** — Ping/pong heartbeat; startup exception propagation; dynamic port via get_ws_port(); config msg_id + ACK; hook config persistence to local file; ready event to prevent startup race condition
+16. **Configurable limits** — Hardcoded values (tool timeout, read limits, report tokens, WS ping timeout) centralized in `config.py` with `SI_*` environment variable overrides
+17. **Thread-safe singletons** — LLM client singletons in agents use double-checked locking pattern (`threading.Lock`) for thread-safe lazy initialization
+18. **Shared path validation** — Tools share `path_utils.validate_search_path()` to prevent directory traversal attacks
 
 ---
 

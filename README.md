@@ -80,6 +80,7 @@ REPL 主循环 ─── 全局 try/except，异常后保留 state 继续输入
 - 通信：WebSocket (adb reverse)，CLI ↔ App 实时配置同步 + 数据传输
   - Ping/Pong 心跳检测僵尸连接
   - 配置下发带 msg_id + ACK 确认
+  - WS server ready event 防止启动竞态条件
   - WS server 启动异常不再静默吞掉
 - Release 变体：纯 no-op stubs，编译器内联后零运行时开销
 - Hook 安全：嵌套深度保护防 atrace 溢出，Tag 超 127 字节自动截断
@@ -122,7 +123,7 @@ smartinspector/
 │   │   ├── attributor.py           #     源码归因 Agent (run_attribution)
 │   │   └── deterministic.py        #     确定性预计算 (减少 LLM token)
 │   │
-│   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU)
+│   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU, context manager)
 │   ├── commands/                   #   Slash 命令 (注册表模式)
 │   │   ├── __init__.py             #     命令注册表 (handle_slash_command)
 │   │   ├── attribution.py          #     SI$ tag 解析 + 归因提取
@@ -133,9 +134,10 @@ smartinspector/
 │   │   └── trace.py                #     Trace 采集 (/trace, /record)
 │   │
 │   ├── tools/                      #   LangChain 工具 (grep/glob/read/perfetto)
-│   ├── ws/server.py                #   WebSocket Server (心跳检测, 启动异常上报, 动态端口)
+│   │   └── path_utils.py           #     共享路径校验 (防目录遍历)
+│   ├── ws/server.py                #   WebSocket Server (心跳检测, ready event, 动态端口)
 │   ├── prompts.py                  #   Prompt 文件加载器
-│   ├── config.py                   #   全局配置 (LLM 模型, source dir, hook config 持久化)
+│   ├── config.py                   #   全局配置 (LLM 模型, source dir, hook config 持久化, 环境变量覆盖)
 │   ├── token_tracker.py            #   LLM Token 使用量追踪
 │   └── perfetto_compat.py          #   macOS IPv4 兼容修复
 │
@@ -292,6 +294,12 @@ cp .env.example .env
 | `SI_BASE_URL` | API Base URL (OpenAI 兼容) | `https://api.deepseek.com` |
 | `SI_API_KEY` | API Key (回退到 `OPENAI_API_KEY`) | — |
 | `SI_ATTRIBUTOR_MODEL` | 归因 Agent 模型覆盖 (代码理解) | 同 `SI_MODEL` |
+| `SI_TOOL_TIMEOUT` | 工具子进程超时 (grep/glob) | `30` |
+| `SI_READ_MAX_LINES` | Read 工具最大返回行数 | `2000` |
+| `SI_READ_MAX_BYTES` | Read 工具最大返回字节数 | `51200` |
+| `SI_READ_MAX_LINE_LENGTH` | Read 工具单行最大字符数 | `2000` |
+| `SI_REPORT_MAX_TOKENS` | 报告生成最大输入 token | `4000` |
+| `SI_WS_PING_TIMEOUT` | WebSocket ping 超时 (秒) | `30` |
 
 **切换到 Claude 示例：**
 ```bash
@@ -356,6 +364,7 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 - [x] sched 添加阻塞原因分析
 - [x] 新增系统级 CPU 指标采集
 - [x] HookConfig 透传 + Tag 截断保护
+- [x] PerfettoCollector 支持 context manager 协议
 
 **Agents 编排层**
 - [x] Orchestrator LLM 调用异常处理
@@ -372,6 +381,7 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 - [x] 用 get_state()+MemorySaver 替代手动 state 重建
 - [x] Attributor 结构化输出 + 文本解析 fallback
 - [x] 清理无引用的 prompts/main.txt
+- [x] Agent LLM 单例双重检查锁线程安全
 
 **SDK 层**
 - [x] Release 变体替换为纯 no-op stubs
@@ -387,6 +397,7 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 - [x] REPL 全局异常保护
 - [x] WS server 启动异常不再静默吞掉
 - [x] WebSocket ping/pong 心跳检测
+- [x] WS server ready event 防止启动竞态
 - [x] streaming graph 迭代错误处理
 - [x] state 合并重构为 AgentState 驱动
 - [x] 硬编码端口 9876 替换为 get_ws_port()
@@ -398,3 +409,7 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 - [x] /report 支持文件输出
 - [x] Hook config 持久化到本地文件
 - [x] send_config msg_id + ACK 机制
+- [x] 硬编码配置值集中到 config.py，支持环境变量覆盖
+- [x] 工具共享路径校验提取到 path_utils 模块
+- [x] Collector 全链路异常日志补全
+- [x] WS 异常日志替换静默吞掉
