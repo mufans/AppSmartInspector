@@ -6,15 +6,18 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     CLI (graph/cli.py REPL)                  │
+│                  CLI (graph/cli.py REPL)                     │
 │  you> [input] → graph.stream() → ai> [streaming output]     │
-│  + 自动启动 WS server :9876 + adb reverse                   │
+│  + 启动前置检查 (adb + API key)                              │
+│  + 自动启动 WS server (动态端口) + adb reverse                │
+│  + Tab 补全 + 全局异常保护                                    │
 └──────────────────────────┬──────────────────────────────────┘
                            │
               ┌────────────▼────────────┐
               │     Orchestrator Node   │
               │  (LLM intent classify)  │
-              │  deepseek-chat temp=0   │
+              │  few-shot + max_tokens=5│
+              │  try/except → fallback  │
               └──┬──────┬──────┬──┬──┬──┘
                  │      │      │  │  │
       ┌──────────▼┐ ┌──▼──┐ ┌▼─┐│ ┌▼───────┐
@@ -37,14 +40,9 @@
            ▼
           END
 
-  Routing decisions:
-    full_analysis → collector → analyzer → attributor → reporter
-    trace (/trace) → collector → analyzer → END
-    android       → android_expert → (analyzer | END)
-    analyze       → perf_analyzer → END
-    explorer      → explorer → END
-    end           → fallback → END
-```
+  State: MemorySaver checkpointer (get_state() 替代手动合并)
+  Streaming: reporter 真正流式输出，其他节点静默处理
+  Error: node_error_handler 装饰器统一捕获 + graph.stream try/except
 
 ## Directory Structure
 
@@ -55,25 +53,25 @@ smartinspector/
 │   ├── main.py                  # Legacy entry (deprecated)
 │   ├── prompts.py               # Prompt file loader
 │   ├── perfetto_compat.py       # macOS IPv4 fix for perfetto lib
-│   ├── config.py                # Global config (LLM models, source dir)
+│   ├── config.py                # Global config (LLM models, source dir, hook config persistence)
 │   ├── token_tracker.py         # LLM token usage tracking
 │   │
 │   ├── graph/                   # LangGraph orchestration (modular package)
 │   │   ├── __init__.py          #   Public exports (create_graph, run_graph, main)
 │   │   ├── builder.py           #   Graph construction (nodes + edges + conditional routing)
-│   │   ├── cli.py               #   CLI REPL loop (prompt_toolkit, WS auto-start)
+│   │   ├── cli.py               #   CLI REPL loop (prompt_toolkit, Tab补全, WS auto-start, 全局异常保护)
 │   │   ├── state.py             #   AgentState, RouteDecision enum, _pass_through()
-│   │   ├── streaming.py         #   _stream_run() — streaming graph execution
+│   │   ├── streaming.py         #   _stream_run() — streaming graph execution, MemorySaver, error handling
 │   │   └── nodes/               #   LangGraph graph nodes
-│   │       ├── orchestrator.py  #     LLM routing + fallback node
+│   │       ├── orchestrator.py  #     LLM routing + fallback node (few-shot, error handling)
 │   │       ├── android.py       #     Android Expert: trace collect + analyze
 │   │       ├── analyzer.py      #     perf_analyzer_node (standalone) + analyzer_node (pipeline)
 │   │       ├── explorer.py      #     Code Explorer: grep/glob/read
-│   │       ├── collector.py     #     Trace collection node (pipeline step 1)
-│   │       ├── attributor.py    #     Source attribution node (pipeline step 3)
+│   │       ├── collector.py     #     Trace collection node (pipeline step 1, WS+SQL block events merge)
+│   │       ├── attributor.py    #     Source attribution node (pipeline step 3, structured output)
 │   │       └── reporter/        #     Report generation (pipeline step 4)
-│   │           ├── __init__.py  #       reporter_node entry
-│   │           ├── generator.py #       LLM report generation (streaming + retry)
+│   │           ├── __init__.py  #       reporter_node entry (streaming output)
+│   │           ├── generator.py #       LLM report generation (streaming + retry + token estimation)
 │   │           ├── formatter.py #       Data formatting (perf JSON + attribution → Markdown)
 │   │           └── persistence.py #     Report file saving (./reports/)
 │   │
@@ -85,15 +83,15 @@ smartinspector/
 │   │   └── deterministic.py     #   Deterministic pre-computation (reduces LLM tokens)
 │   │
 │   ├── collector/               # Data collection & processing
-│   │   └── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON
+│   │   └── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON (CPU调用链, 系统级CPU, WS+SQL合并)
 │   │
 │   ├── commands/                # Slash command implementations
 │   │   ├── __init__.py          #   Command registry (SLASH_COMMANDS dict + handle_slash_command)
 │   │   ├── attribution.py       #   SI$ tag parsing + attribution extraction
 │   │   ├── device.py            #   /devices, /connect, /status, /disconnect
 │   │   ├── hook.py              #   /config, /hooks, /hook, /debug
-│   │   ├── orchestrate.py       #   /full, /report
-│   │   ├── session.py           #   /help, /clear, /summary, /tokens
+│   │   ├── orchestrate.py       #   /full, /report (文件输出)
+│   │   ├── session.py           #   /help, /clear (全字段清理), /summary, /tokens
 │   │   └── trace.py             #   /trace, /record, /analyze
 │   │
 │   ├── tools/                   # LangChain @tool functions
@@ -104,7 +102,7 @@ smartinspector/
 │   │   └── rg.py                #   ripgrep binary finder
 │   │
 │   └── ws/                      # WebSocket communication
-│       └── server.py            #   SIServer (CLI ↔ App real-time communication)
+│       └── server.py            #   SIServer (心跳检测, 启动异常上报, 动态端口, msg_id+ACK)
 │
 ├── prompts/                     # System prompts (text files)
 │   ├── main.txt                 #   Main persona (HarmonyOS perf tool)
@@ -171,7 +169,11 @@ fallback      → { messages: [AIMessage] }
 
 Pass-through fields (`perf_summary`, `perf_analysis`, `attribution_data`, `attribution_result`) are forwarded by every node via `_pass_through(state)` so they persist across graph executions until `/clear`.
 
-The CLI loop in `_stream_run()` (graph/streaming.py) accumulates `last_updates` from all nodes and builds the final state for the next turn.
+The CLI loop in `_stream_run()` (graph/streaming.py) uses `graph.get_state(config)` with MemorySaver checkpointer to retrieve the final state after graph execution, instead of manual state merging.
+
+### Error Handling
+
+All graph nodes are protected by a `node_error_handler` decorator that catches exceptions, logs the error, and returns a fallback state to prevent graph crashes. The orchestrator LLM call itself is wrapped in try/except. The REPL main loop and `_stream_run()` have global exception protection to ensure a single node failure never kills the session.
 
 ## Orchestrator Node
 
@@ -416,6 +418,7 @@ PerfSummary
 | `collect_memory()` | `heap_graph_object` + `heap_graph_class` | Java heap allocation |
 | `collect_view_slices()` | `slice` | Custom TraceHook tags + system atrace |
 | `collect_threads()` | `thread` | Thread listing |
+| `collect_sys_stats()` | `sys_stats` | System-level CPU metrics |
 
 **Perfetto config**:
 - Default categories: sched, freq, idle, power, memreclaim, gfx, view, input, dalvik, am, wm
@@ -500,8 +503,8 @@ TraceHook tag → Perfetto slice name
 
 | 变体 | 内容 | 用途 |
 |------|------|------|
-| **debug** | 完整 hook + 配置面板 + BroadcastReceiver | 开发/测试 |
-| **release** | 所有 public API 为空实现 (no-op) | 生产环境，零开销 |
+| **debug** | 完整 hook + 配置面板 + BroadcastReceiver + WS 客户端 | 开发/测试 |
+| **release** | 所有 public API 为空实现 (no-op)，无 WS 依赖，无 Pine 依赖 | 生产环境，零开销 |
 
 目标 app 接入代码无需判断：
 
@@ -671,7 +674,7 @@ User: "全面分析列表滑动性能"
   │   ├─ collect_frame_timeline()
   │   ├─ collect_memory()
   │   ├─ collect_view_slices()  ← SI$ prefix filtering, rv_instances grouping
-  │   └─ collect_block_events()  ← via WS from app (structured JSON)
+  │   └─ collect_block_events()  ← WS 结构化 JSON + SQL atrace 合并（非覆盖）
   └─ State: perf_summary = "{...json...}", _trace_path = "/tmp/xxx.pb"
   │
   ▼
@@ -735,15 +738,18 @@ orchestrator → collector → analyzer → END
 1. **Graph-based pipeline** — `graph.py` refactored into `graph/` package with `builder.py` (graph construction), `cli.py` (REPL loop), `state.py` (state + routing), `streaming.py` (execution). Pipeline nodes (collector → analyzer → attributor → reporter) are first-class LangGraph nodes, not CLI-loop orchestration.
 2. **SI$ prefix** — TraceHook 注入的 tag 统一加 `SI$` 前缀，区分用户代码与系统代码，下游无需硬编码类名规则
 3. **Raw trace stays local** — Only ~2KB structured JSON summary is sent to LLM
-4. **Streaming first** — android_expert and reporter stream tokens in real-time
+4. **Streaming first** — reporter streams tokens in real-time; other nodes process silently
 5. **Lazy hook** — RV Adapter/LayoutManager hooked dynamically when set; extra_hooks configured at init
 6. **Command registry** — Slash commands refactored into `commands/` package with registry pattern (`SLASH_COMMANDS` dict + `handle_slash_command`). Each command file is self-contained.
 7. **Programmatic extraction** — Class/method names extracted from JSON by code, search strategy by AI
 8. **CS architecture** — Agent (WS server) ↔ App (WS client)，按需懒加载，每个平台 expert 独立管理自己的 WS server
-9. **debug/release variants** — Zero-cost abstraction: release = no-op stubs, same API surface
+9. **debug/release variants** — Zero-cost abstraction: release = pure no-op stubs (no WS, no hooks), same API surface
 10. **Configurable models** — `SI_MODEL` for all agents, `SI_ATTRIBUTOR_MODEL` override for attribution (code understanding)
 11. **Reporter sub-module** — Report generation split into formatter (pure), generator (LLM), persistence (IO) for testability
-12. **Pass-through state** — `_pass_through(state)` helper ensures pipeline fields survive across nodes without explicit forwarding
+12. **MemorySaver state** — `graph.get_state(config)` replaces manual state merging; `node_error_handler` decorator for unified error handling
+13. **Token efficiency** — Route LLM uses max_tokens=5; message window trimming for attributor; reporter input token estimation and truncation; fallback filters Human/AI only
+14. **SDK safety** — Trace nesting depth protection; Tag truncation at 127 bytes; BlockMonitor capacity limit; system widget filtering; BuildConfig.DEBUG guards
+15. **WS reliability** — Ping/pong heartbeat; startup exception propagation; dynamic port via get_ws_port(); config msg_id + ACK; hook config persistence to local file
 
 ---
 

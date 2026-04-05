@@ -4,6 +4,17 @@ AI 驱动的跨平台移动端性能分析 CLI 工具。通过自然语言交互
 
 当前已实现 **Android** 平台完整支持，**HarmonyOS** 和 **iOS** 平台支持规划中。
 
+## 特性
+
+- 🧠 **自然语言交互** — 用中文描述性能问题，AI 自动路由到对应分析流程
+- 📊 **全量分析流水线** — 自动采集 → 分析 → 源码归因 → 报告生成
+- 🔍 **SI$ 源码归因** — 通过 TraceHook tag 将性能热点精确归因到源码位置
+- 🛡️ **健壮性保障** — 全链路异常处理，Agent 崩溃不丢会话状态
+- ⚡ **Token 效率优化** — 消息窗口裁剪、路由 token 限制、流式输出
+- 🔒 **Release 零开销** — Release 变体为纯 no-op stubs，编译器内联后零运行时开销
+- 💬 **实时通信** — WebSocket CLI↔App 双向通信，支持心跳检测和断线重连
+- ⌨️ **交互增强** — Tab 补全、全局异常保护、启动前置条件检查
+
 ## 快速开始
 
 ```bash
@@ -14,10 +25,10 @@ uv sync
 cp .env.example .env
 # 编辑 .env: SI_API_KEY=your-api-key
 
-# 启动 CLI（自动启动 WS server + adb reverse）
+# 启动 CLI（自动检查 adb/API key，启动 WS server + adb reverse）
 uv run smartinspector --source-dir /path/to/your/app/source
 
-# 交互式使用
+# 交互式使用（支持 Tab 补全 slash 命令）
 you> 全面分析列表滑动性能
 you> 采集一个 10s trace 分析卡顿
 you> 搜索源码中 LazyForEach 的用法
@@ -40,6 +51,17 @@ you> 搜索源码中 LazyForEach 的用法
 collector (设备 trace 采集) → analyzer (LLM 性能解读) → attributor (源码归因) → reporter (生成 Markdown 报告)
 ```
 
+### 健壮性设计
+
+全链路异常处理，确保单节点失败不影响整体会话：
+
+```
+REPL 主循环 ─── 全局 try/except，异常后保留 state 继续输入
+  └── graph.stream() ─── try/except，异常后打印 [error] 不崩溃
+       └── orchestrator LLM ─── try/except，失败走 fallback
+            └── 各节点 ─── node_error_handler 装饰器统一捕获
+```
+
 详细架构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 平台支持
@@ -52,10 +74,15 @@ collector (设备 trace 采集) → analyzer (LLM 性能解读) → attributor (
 
 ### Android
 
-- Trace 采集：Perfetto (ftrace + atrace + CPU callstack + Java heap)
+- Trace 采集：Perfetto (ftrace + atrace + CPU callstack + Java heap + 系统级 CPU)
 - 方法 Hook：Pine AOP 框架，运行时 hook Activity/Fragment/RecyclerView 等框架方法
-- 卡顿检测：BlockMonitor (BlockCanary-style)，监测主线程每条 Message 耗时
+- 卡顿检测：BlockMonitor (BlockCanary-style)，监测主线程每条 Message 耗时，容量限制防 OOM
 - 通信：WebSocket (adb reverse)，CLI ↔ App 实时配置同步 + 数据传输
+  - Ping/Pong 心跳检测僵尸连接
+  - 配置下发带 msg_id + ACK 确认
+  - WS server 启动异常不再静默吞掉
+- Release 变体：纯 no-op stubs，编译器内联后零运行时开销
+- Hook 安全：嵌套深度保护防 atrace 溢出，Tag 超 127 字节自动截断
 
 ### HarmonyOS (规划)
 
@@ -72,18 +99,18 @@ smartinspector/
 │   ├── graph/                      #   LangGraph 编排 (模块化包)
 │   │   ├── __init__.py             #     公共导出 (create_graph, run_graph, main)
 │   │   ├── builder.py              #     LangGraph 图构建 (节点+边+条件路由)
-│   │   ├── cli.py                  #     CLI REPL 主循环 (prompt_toolkit)
+│   │   ├── cli.py                  #     CLI REPL 主循环 (prompt_toolkit, Tab补全, 全局异常保护)
 │   │   ├── state.py                #     AgentState + RouteDecision + pass-through
-│   │   ├── streaming.py            #     图流式执行 (_stream_run)
+│   │   ├── streaming.py            #     图流式执行 (_stream_run, MemorySaver, 错误处理)
 │   │   └── nodes/                  #     LangGraph 图节点
-│   │       ├── orchestrator.py     #       路由分类 + fallback
+│   │       ├── orchestrator.py     #       路由分类 + fallback (few-shot, 异常处理)
 │   │       ├── android.py          #       Android Expert (trace 采集+分析)
 │   │       ├── analyzer.py         #       性能分析 (perf_analyzer_node + analyzer_node)
 │   │       ├── explorer.py         #       源码搜索 (grep/glob/read)
-│   │       ├── collector.py        #       设备 trace 采集 (PerfettoCollector)
-│   │       ├── attributor.py       #       源码归因 (SI$ slice → 源码定位)
+│   │       ├── collector.py        #       设备 trace 采集 (PerfettoCollector, WS+SQL block events 合并)
+│   │       ├── attributor.py       #       源码归因 (SI$ slice → 源码定位, 结构化输出)
 │   │       └── reporter/           #       报告生成
-│   │           ├── __init__.py     #         reporter_node 入口
+│   │           ├── __init__.py     #         reporter_node 入口 (流式输出)
 │   │           ├── generator.py    #         LLM 报告生成 (流式+重试)
 │   │           ├── formatter.py    #         数据格式化 (perf+归因→Markdown)
 │   │           └── persistence.py  #         报告文件保存
@@ -95,7 +122,7 @@ smartinspector/
 │   │   ├── attributor.py           #     源码归因 Agent (run_attribution)
 │   │   └── deterministic.py        #     确定性预计算 (减少 LLM token)
 │   │
-│   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON)
+│   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU)
 │   ├── commands/                   #   Slash 命令 (注册表模式)
 │   │   ├── __init__.py             #     命令注册表 (handle_slash_command)
 │   │   ├── attribution.py          #     SI$ tag 解析 + 归因提取
@@ -106,18 +133,19 @@ smartinspector/
 │   │   └── trace.py                #     Trace 采集 (/trace, /record)
 │   │
 │   ├── tools/                      #   LangChain 工具 (grep/glob/read/perfetto)
-│   ├── ws/server.py                #   WebSocket Server (CLI↔App 通信)
+│   ├── ws/server.py                #   WebSocket Server (心跳检测, 启动异常上报, 动态端口)
 │   ├── prompts.py                  #   Prompt 文件加载器
-│   ├── config.py                   #   全局配置 (LLM 模型, source dir)
+│   ├── config.py                   #   全局配置 (LLM 模型, source dir, hook config 持久化)
 │   ├── token_tracker.py            #   LLM Token 使用量追踪
 │   └── perfetto_compat.py          #   macOS IPv4 兼容修复
 │
 ├── platform/                       # 平台 SDK
 │   └── android/tracelib/           #   Android SDK (AAR)
 │       └── src/main/java/.../tracelib/
-│           ├── TraceHook.java          # Pine AOP 方法 hook 入口
-│           ├── BlockMonitor.java       # 主线程卡顿检测
-│           ├── HookConfig.java         # 配置模型 (JSON 序列化)
+│           ├── TraceHook.java          # Pine AOP 方法 hook (深度保护, Tag截断, 系统widget过滤)
+│           ├── BlockMonitor.java       # 主线程卡顿检测 (容量限制防OOM, Fragment泄漏修复)
+│           ├── SIClient.java           # WebSocket 客户端
+│           ├── HookConfig.java         # 配置模型 (JSON 序列化, BuildConfig.DEBUG守卫)
 │           └── HookConfigManager.java  # 配置管理 (SP 持久化)
 │
 ├── prompts/                        # LLM Prompt 模板
@@ -167,9 +195,9 @@ Trace → SI$ slices → 过滤系统类 → 提取 class+method → Glob→Grep
 | `/full` | 全量分析流水线 (采集→分析→归因→报告) |
 | `/trace [duration]` | 采集 Perfetto trace |
 | `/analyze` | 分析已有 perf_summary |
-| `/report` | 生成性能报告 |
+| `/report [path]` | 生成性能报告（可选输出到文件） |
 | `/config [key] [value]` | 查看或修改配置 |
-| `/config source_dir <path>` | 设置源码目录 |
+| `/config source_dir <path>` | 设置源码目录（自动持久化） |
 | `/hooks` | 查看 hook 配置 |
 | `/hook add <class> <method>` | 添加自定义 hook |
 | `/devices` | 列出已连接设备 |
@@ -177,8 +205,9 @@ Trace → SI$ slices → 过滤系统类 → 提取 class+method → Glob→Grep
 | `/status` | 查看 WS 状态 |
 | `/summary` | 查看 perf_summary 摘要 |
 | `/tokens` | 查看 token 使用量 |
-| `/clear` | 清除会话状态 |
-| `/help` | 帮助信息 |
+| `/clear` | 清除所有分析状态 |
+| `/debug` | 调试命令 |
+| `/help` | 帮助信息（支持 Tab 补全） |
 
 ### 自然语言路由
 
@@ -241,12 +270,13 @@ Orchestrator 通过 LLM 分类将用户请求路由到对应 Agent：
 |------|------|
 | Agent 编排 | LangGraph + LangChain |
 | LLM | DeepSeek / Claude / OpenAI (通过 SI_MODEL 配置) |
-| Android Trace | Perfetto + atrace |
+| Android Trace | Perfetto + atrace (ftrace + CPU callstack + Java heap) |
 | HarmonyOS Trace | hiperf + hitrace (规划) |
 | 方法 Hook (Android) | Pine AOP Framework |
-| CLI 交互 | prompt_toolkit |
-| 通信 | WebSocket (CLI ↔ App) |
+| CLI 交互 | prompt_toolkit (Tab 补全, REPL) |
+| 通信 | WebSocket (CLI ↔ App, 心跳检测, 动态端口) |
 | Trace 分析 | trace_processor_shell (SQL) |
+| 状态管理 | LangGraph MemorySaver (get_state) |
 
 ## LLM 配置
 
@@ -290,8 +320,6 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 
 ### 高优先级
 
-- [ ] `collect_view_slices` 调用链限制从 10 提升到 20
-- [ ] `collect_block_events` 处理 atrace 截断的 block name fallback
 - [ ] 帧严重度阈值区分刷新率 (120Hz 设备帧预算 8.33ms)
 - [ ] 输入事件关联 (touch event → frame jank 因果)
 - [ ] 系统类模式补充: `WindowCallback`, `IdleHandler`, Jetpack Compose 类
@@ -318,3 +346,55 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 - [ ] 工具结果截断 (10K 字符上限)
 - [ ] 更多复杂 trace 测试 (Kotlin、多文件)
 - [ ] CI/CD 集成
+
+### ✅ 已完成 (2026-04-05 重构)
+
+**Collector 采集层**
+- [x] 修复内存数值单位错误（/1024 转换问题）
+- [x] 修复 Block Events 数据覆盖（WS+SQL 合并）
+- [x] CPU 热点添加调用链重建
+- [x] sched 添加阻塞原因分析
+- [x] 新增系统级 CPU 指标采集
+- [x] HookConfig 透传 + Tag 截断保护
+
+**Agents 编排层**
+- [x] Orchestrator LLM 调用异常处理
+- [x] REPL 主循环全局异常保护
+- [x] graph.stream 循环防崩溃
+- [x] node_error_handler 统一节点错误处理
+- [x] 路由支持 enum 和 string 双模式
+- [x] 路由 prompt few-shot 提升准确率
+- [x] 路由 LLM max_tokens=5 减少 token 浪费
+- [x] Reporter 输入 token 估算和截断
+- [x] Attributor 消息窗口裁剪防 O(n²) 增长
+- [x] Fallback 消息窗口过滤仅 Human/AI
+- [x] Reporter 真正流式输出防重复打印
+- [x] 用 get_state()+MemorySaver 替代手动 state 重建
+- [x] Attributor 结构化输出 + 文本解析 fallback
+- [x] 清理无引用的 prompts/main.txt
+
+**SDK 层**
+- [x] Release 变体替换为纯 no-op stubs
+- [x] PineConfig.debug=true 替换为 BuildConfig.DEBUG
+- [x] FragmentLifecycleCallbacks registered 集合内存泄漏修复
+- [x] BlockMonitor.blockEvents 容量限制防 OOM
+- [x] view_traverse 过滤系统 widget
+- [x] SI$ Tag 超 127 字节自动截断
+- [x] 高频 hook Log.d BuildConfig.DEBUG 守卫
+- [x] Trace 嵌套深度保护防 atrace 溢出
+
+**基础设施层**
+- [x] REPL 全局异常保护
+- [x] WS server 启动异常不再静默吞掉
+- [x] WebSocket ping/pong 心跳检测
+- [x] streaming graph 迭代错误处理
+- [x] state 合并重构为 AgentState 驱动
+- [x] 硬编码端口 9876 替换为 get_ws_port()
+- [x] Slash 命令 Tab 自动补全
+- [x] 版本号从 package metadata 读取
+- [x] /clear 清理所有分析状态字段
+- [x] 启动前置条件检查 (adb + API key)
+- [x] 所有依赖添加版本上限
+- [x] /report 支持文件输出
+- [x] Hook config 持久化到本地文件
+- [x] send_config msg_id + ACK 机制
