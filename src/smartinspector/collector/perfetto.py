@@ -1,5 +1,6 @@
 """PerfettoCollector: adb collect -> SQL query -> unified JSON."""
 
+import bisect
 import json
 import os
 import subprocess
@@ -841,23 +842,36 @@ class PerfettoCollector:
         except Exception:
             pass
 
-        # 3. Correlate slices with log entries by timestamp
+        # 3. Correlate slices with log entries by timestamp (bisect, O(n log n + m log m))
         MATCH_WINDOW_NS = 500_000_000  # 500ms
 
-        for block in block_slices:
-            block_ts = block["ts_ns"]
-            best_match = None
-            best_dist = MATCH_WINDOW_NS + 1
+        if log_entries:
+            log_ts_list = sorted(
+                [(log["ts_ns"], log) for log in log_entries],
+                key=lambda x: x[0],
+            )
+            log_timestamps = [t for t, _ in log_ts_list]
 
-            for log in log_entries:
-                dist = abs(log["ts_ns"] - block_ts)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_match = log
+            for block in block_slices:
+                block_ts = block["ts_ns"]
+                idx = bisect.bisect_left(log_timestamps, block_ts)
+                best_match = None
+                best_dist = MATCH_WINDOW_NS + 1
 
-            if best_match and best_dist <= MATCH_WINDOW_NS:
-                block["stack_trace"] = _parse_siblock_msg(best_match["msg"])
-            else:
+                # Check idx and idx-1 as candidates
+                for candidate_idx in (idx - 1, idx):
+                    if 0 <= candidate_idx < len(log_ts_list):
+                        dist = abs(log_ts_list[candidate_idx][0] - block_ts)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_match = log_ts_list[candidate_idx][1]
+
+                if best_match and best_dist <= MATCH_WINDOW_NS:
+                    block["stack_trace"] = _parse_siblock_msg(best_match["msg"])
+                else:
+                    block["stack_trace"] = []
+        else:
+            for block in block_slices:
                 block["stack_trace"] = []
 
         return block_slices
