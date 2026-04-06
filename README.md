@@ -194,36 +194,43 @@ Trace → SI$ slices → 过滤系统类 → 提取 class+method → Glob→Grep
 
 | 命令 | 说明 |
 |------|------|
-| `/full` | 全量分析流水线 (采集→分析→归因→报告) |
-| `/trace [duration]` | 采集 Perfetto trace |
-| `/analyze` | 分析已有 perf_summary |
+| `/full [--no-wait]` | 全量分析流水线 (采集→分析→归因→报告)。`--no-wait` 跳过等待 App 连接，适用于冷启动耗时分析 |
+| `/trace [duration_ms] [pkg]` | 采集 + 自动分析 Perfetto trace |
+| `/record [duration_ms] [pkg]` | 只采集不分析，返回 .pb 文件路径 |
+| `/analyze [path]` | 分析 trace 文件（无参数时分析上次采集结果） |
 | `/report [path]` | 生成性能报告（可选输出到文件） |
-| `/config [key] [value]` | 查看或修改配置 |
+| `/config` | 查看当前 hook 配置（通过 WS 从 App 获取） |
+| `/config <json>` | 推送 JSON 配置到 App（如 `{"rv_adapter": false}`） |
+| `/config reset` | 恢复 hook 默认配置 |
 | `/config source_dir <path>` | 设置源码目录（自动持久化） |
-| `/hooks` | 查看 hook 配置 |
-| `/hook add <class> <method>` | 添加自定义 hook |
-| `/devices` | 列出已连接设备 |
-| `/connect` | 连接 WS 服务 |
-| `/status` | 查看 WS 状态 |
+| `/hooks` | 查看所有 hook 点开关状态 |
+| `/hook on <hook_id>` | 开启指定内置 hook 点（如 `layout_inflate`） |
+| `/hook off <hook_id>` | 关闭指定内置 hook 点 |
+| `/hook add <class> <method>` | 添加自定义 hook 点 |
+| `/hook rm <class>` | 删除自定义 hook 点 |
+| `/devices` | 列出已连接 adb 设备 |
+| `/connect <host:port>` | 通过 adb TCP 连接设备 |
+| `/disconnect` | 断开 TCP 设备连接 |
+| `/status` | 查看当前会话状态（WS 连接、perf 数据等） |
 | `/summary` | 查看 perf_summary 摘要 |
 | `/tokens` | 查看 token 使用量 |
-| `/clear` | 清除所有分析状态 |
-| `/debug` | 调试命令 |
+| `/clear` | 清除所有分析状态和对话 |
+| `/debug` | 打开设备端 Hook 调试配置面板 |
 | `/help` | 帮助信息（支持 Tab 补全） |
 
 ### 自然语言路由
 
 Orchestrator 通过 LLM 分类将用户请求路由到对应 Agent：
 
-- **全面分析** (`full_analysis`): "全面分析列表滑动性能" → collector → analyzer → attributor → reporter
-- **平台采集** (`android`): "采集 trace 分析 FPS" → Platform Expert Agent
-- **性能解读** (`analyze`): "解读这份数据" → Perf Analyzer
-- **源码搜索** (`explorer`): "搜索 XXX 类源码" → Code Explorer
-- **通用问答** (`end`): "什么是卡顿" → Fallback 回复
+- **全面分析** (`full_analysis`): "全面分析列表滑动性能" / "分析冷启动耗时" / "测一下应用启动时间" / "冷启动性能怎么样" → collector → analyzer → attributor → reporter
+- **平台采集** (`android`): "采集 trace 分析 FPS" / "采集一下 trace" / "帮我看看 CPU 和内存指标" → Platform Expert Agent
+- **性能解读** (`analyze`): "解读这份数据" / "分析一下刚才采集的数据" / "解读一下这个 perf_summary" → Perf Analyzer
+- **源码搜索** (`explorer`): "搜索 XXX 类源码" / "查看 LazyForEach 的实现" / "定位 DataManager.loadData 方法" → Code Explorer
+- **通用问答** (`end`): "什么是卡顿" / "怎么优化列表滑动" / "你好" → Fallback 回复
 
 ## 报告示例
 
-全量分析流水线（`/full` 或自然语言触发 `full_analysis`）会生成 Markdown 性能报告，保存到 `reports/` 目录。以下为实际生成的报告摘要：
+全量分析流水线（`/full`、`/full --no-wait` 或自然语言触发 `full_analysis`）会生成 Markdown 性能报告，保存到 `reports/` 目录。以下为实际生成的报告摘要：
 
 ### 测试概要
 
