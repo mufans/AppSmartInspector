@@ -120,9 +120,22 @@ def cmd_full(args: str, state: dict) -> dict:
     Reuses the LangGraph pipeline (collector → analyzer → attributor → reporter)
     by injecting a synthetic message that routes to the collector node.
 
-    Usage: /full [duration_ms] [package_name]
+    Usage: /full [--no-wait] [duration_ms] [package_name]
+
+    Options:
+        --no-wait   Skip waiting for app connection; start trace immediately.
+                    Useful for profiling app cold start time.
     """
     from smartinspector.graph import create_graph, _stream_run
+
+    # Parse --no-wait flag
+    tokens = args.split() if args else []
+    skip_wait = "--no-wait" in tokens
+    if skip_wait:
+        tokens.remove("--no-wait")
+
+    if skip_wait:
+        state["skip_wait"] = True
 
     # Always create a fresh graph — avoids module-level state issues
     # when running as `python graph.py` (__main__ vs smartinspector.graph)

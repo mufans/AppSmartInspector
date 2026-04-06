@@ -91,4 +91,7 @@ def create_graph():
     builder.add_edge("attributor", "reporter")
     builder.add_edge("reporter", END)
 
-    return builder.compile(checkpointer=MemorySaver())
+    serde = MemorySaver().serde.with_msgpack_allowlist(
+        [("smartinspector.graph.state", "RouteDecision")],
+    )
+    return builder.compile(checkpointer=MemorySaver(serde=serde))

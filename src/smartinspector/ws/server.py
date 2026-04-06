@@ -195,6 +195,25 @@ class SIServer:
     def has_connections(self) -> bool:
         return len(self._connections) > 0
 
+    def wait_for_connection(self, timeout: float = 30.0) -> bool:
+        """Block until an app connects and config_sync arrives, or timeout.
+
+        The app sends config_sync in onOpen(), so we also wait for
+        _config_event to ensure config is available before returning.
+
+        Returns True if a connection was established, False on timeout.
+        """
+        if self.has_connections():
+            return True
+        self._connection_event.clear()
+        connected = self._connection_event.wait(timeout=timeout)
+        if not connected:
+            return False
+        # Wait for config_sync from app (sent in onOpen)
+        self._config_event.clear()
+        self._config_event.wait(timeout=5.0)
+        return True
+
     def on_message(self, handler: Callable) -> None:
         self._on_message_handler = handler
 
@@ -272,7 +291,8 @@ class SIServer:
             return
 
         if msg_type == "config_sync":
-            # App pushed its current config            self._latest_config = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+            # App pushed its current config
+            self._latest_config = json.dumps(payload) if isinstance(payload, dict) else str(payload)
             self._persist_config(self._latest_config)
             self._config_event.set()
             # Also notify external handler if registered

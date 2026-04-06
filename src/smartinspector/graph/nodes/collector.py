@@ -107,38 +107,39 @@ def collector_node(state: AgentState) -> dict:
     """
     from smartinspector.collector.perfetto import PerfettoCollector
 
+    skip_wait = state.get("skip_wait", False)
     print("  [collector] Starting trace collection...", flush=True)
 
     # Notify app to ensure hooks are ready before collecting
-    try:
-        from smartinspector.ws.server import SIServer
-        server = SIServer.get()
-        if server.has_connections():
-            print("  [collector] Sending start_trace, waiting for hook ACK...", flush=True)
-            ack_ok = server.send_start_trace(timeout=5.0)
-            if ack_ok:
-                print("  [collector] Hook ACK received, hooks ready", flush=True)
-            else:
-                print("  [collector] Hook ACK timeout, proceeding anyway", flush=True)
-        elif server.is_running():
-            print("  [collector] No app connected, waiting for app to connect...", flush=True)
-            connected = server.wait_for_connection(timeout=30.0)
-            if connected:
-            print("  [collector] No app connected, waiting for app to connect...", flush=True)
-            connected = server.wait_for_connection(timeout=30.0)
-            if connected:
-                print("  [collector] App connected, sending start_trace...", flush=True)
+    if skip_wait:
+        print("  [collector] --no-wait: skipping app connection wait, starting trace immediately", flush=True)
+    else:
+        try:
+            from smartinspector.ws.server import SIServer
+            server = SIServer.get()
+            if server.has_connections():
+                print("  [collector] Sending start_trace, waiting for hook ACK...", flush=True)
                 ack_ok = server.send_start_trace(timeout=5.0)
                 if ack_ok:
                     print("  [collector] Hook ACK received, hooks ready", flush=True)
                 else:
                     print("  [collector] Hook ACK timeout, proceeding anyway", flush=True)
+            elif server.is_running():
+                print("  [collector] No app connected, waiting for app to connect...", flush=True)
+                connected = server.wait_for_connection(timeout=30.0)
+                if connected:
+                    print("  [collector] App connected, sending start_trace...", flush=True)
+                    ack_ok = server.send_start_trace(timeout=5.0)
+                    if ack_ok:
+                        print("  [collector] Hook ACK received, hooks ready", flush=True)
+                    else:
+                        print("  [collector] Hook ACK timeout, proceeding anyway", flush=True)
+                else:
+                    print("  [collector] App connection timeout, proceeding without hook readiness check", flush=True)
             else:
-                print("  [collector] App connection timeout, proceeding without hook readiness check", flush=True)
-        else:
-            print("  [collector] WS server not running, proceeding without hook readiness check", flush=True)
-    except Exception as e:
-        print(f"  [collector] start_trace ACK failed: {e}", flush=True)
+                print("  [collector] WS server not running, proceeding without hook readiness check", flush=True)
+        except Exception as e:
+            print(f"  [collector] start_trace ACK failed: {e}", flush=True)
 
     try:
         # Read perfetto params: CLI args override WS config
