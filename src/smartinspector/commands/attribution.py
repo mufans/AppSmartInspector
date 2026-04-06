@@ -179,7 +179,17 @@ _SYSTEM_CLASS_PATTERNS = (
     "MessageQueue",           # android.os.MessageQueue
     "HandlerThread",          # android.os.HandlerThread
     "FragmentActivity",       # androidx.fragment.app.FragmentActivity
+    "AppCompatActivity",      # androidx.appcompat.app.AppCompatActivity
     "AppCompatDelegateImpl",  # androidx.appcompat.app.AppCompatDelegateImpl
+    "ComponentActivity",      # androidx.activity.ComponentActivity
+    "AppCompatViewInflater",  # androidx.appcompat.app.AppCompatViewInflater
+    "ActionBarActivity",      # androidx.appcompat.app.ActionBarActivity
+    "ActionBarImpl",          # androidx.appcompat.app.ActionBarImpl
+    "KeyEvent",               # android.view.KeyEvent
+    "MotionEvent",            # android.view.MotionEvent
+    "View",                   # android.view.View (short match)
+    "ViewGroup",              # android.view.ViewGroup
+    "RecyclerView",           # androidx.recyclerview.widget.RecyclerView
 )
 
 # RV pipeline method names — these belong to RecyclerView/LayoutManager, not user code
@@ -444,7 +454,7 @@ def extract_attributable_slices(perf_summary_json: str, min_dur_ms: float = 1.0)
             continue
 
         # Skip system/framework classes and RV pipeline methods
-        if is_system_class(name):
+        if classify_search_type(name) == "system":
             continue
         if is_system_method(name):
             continue
@@ -477,7 +487,7 @@ def extract_attributable_slices(perf_summary_json: str, min_dur_ms: float = 1.0)
         name = s.get("name", "")
         if not name.startswith("SI$") or name in seen_names:
             continue
-        if is_system_class(name) or is_system_method(name):
+        if classify_search_type(name) == "system" or is_system_method(name):
             continue
         # Block tags have shortened class names — use pattern-based check
         if name.startswith("SI$block#") and _is_block_system_class(name):

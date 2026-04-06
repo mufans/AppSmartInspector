@@ -637,9 +637,10 @@ class PerfettoCollector:
                         FROM slice
                         WHERE id IN ({id_list})
                     """)
-                    # Merge into main results
-                    rows = list(rows) + list(parent_rows)
-                    for r in parent_rows:
+                    # Merge into main results, but exclude touch# slices that leak via parent fetch
+                    filtered_parents = [r for r in parent_rows if not r.name.startswith("SI$touch#")]
+                    rows = list(rows) + filtered_parents
+                    for r in filtered_parents:
                         slice_ids_in_set.add(r.id)
                         # Check if these parents also have missing parents (go up one more level)
                         if r.parent_id and r.parent_id not in slice_ids_in_set:
@@ -658,7 +659,7 @@ class PerfettoCollector:
                                 FROM slice
                                 WHERE id IN ({id_list2})
                             """)
-                            rows = list(rows) + list(gp_rows)
+                            rows = list(rows) + [r for r in gp_rows if not r.name.startswith("SI$touch#")]
                         except Exception as e:
                             logger.debug("Grandparent slice query failed: %s", e)
                 except Exception as e:
