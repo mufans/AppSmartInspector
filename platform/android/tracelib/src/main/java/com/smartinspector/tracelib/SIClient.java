@@ -167,8 +167,14 @@ public class SIClient extends WebSocketListener {
                     Log.i(TAG, "WS applied config_response from server");
                 }
             } else if ("start_trace".equals(type)) {
-                // Future: trigger trace from CLI
-                Log.i(TAG, "WS received start_trace command");
+                // CLI requests trace start — check hook readiness and reply ACK
+                String msgId = msg.optString("msg_id", "");
+                boolean ready = TraceHook.isInitialized();
+                Log.i(TAG, "WS received start_trace command, hooks ready: " + ready);
+                JSONObject ack = new JSONObject();
+                ack.put("type", "ack");
+                ack.put("msg_id", msgId);
+                webSocket.send(ack.toString());
             } else if ("get_block_events".equals(type)) {
                 // Server requests cached block events
                 String eventsJson = BlockMonitor.getAndClearEventsJson();
