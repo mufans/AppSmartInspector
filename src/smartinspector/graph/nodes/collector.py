@@ -124,6 +124,9 @@ def collector_node(state: AgentState) -> dict:
             print("  [collector] No app connected, waiting for app to connect...", flush=True)
             connected = server.wait_for_connection(timeout=30.0)
             if connected:
+            print("  [collector] No app connected, waiting for app to connect...", flush=True)
+            connected = server.wait_for_connection(timeout=30.0)
+            if connected:
                 print("  [collector] App connected, sending start_trace...", flush=True)
                 ack_ok = server.send_start_trace(timeout=5.0)
                 if ack_ok:
