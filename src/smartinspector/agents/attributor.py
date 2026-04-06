@@ -365,7 +365,7 @@ def _build_group_prompt(group: list[dict]) -> str:
             line += f", 堆栈:{issue['stack_trace'][0]}"
         # Hint for XML layout files — search .xml directly, not .java/.kt
         if search_type == "xml":
-            line += f", xml布局:Glob **/{cn}.xml → Read完整文件"
+            line += f", xml布局:Glob **/{cn}.xml → Read完整文件, RESULT行请用: {cn}.{issue['method_name']}"
         line += ")"
         lines.append(line)
 
