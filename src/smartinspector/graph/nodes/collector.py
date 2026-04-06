@@ -120,6 +120,20 @@ def collector_node(state: AgentState) -> dict:
                 print("  [collector] Hook ACK received, hooks ready", flush=True)
             else:
                 print("  [collector] Hook ACK timeout, proceeding anyway", flush=True)
+        elif server.is_running():
+            print("  [collector] No app connected, waiting for app to connect...", flush=True)
+            connected = server.wait_for_connection(timeout=30.0)
+            if connected:
+                print("  [collector] App connected, sending start_trace...", flush=True)
+                ack_ok = server.send_start_trace(timeout=5.0)
+                if ack_ok:
+                    print("  [collector] Hook ACK received, hooks ready", flush=True)
+                else:
+                    print("  [collector] Hook ACK timeout, proceeding anyway", flush=True)
+            else:
+                print("  [collector] App connection timeout, proceeding without hook readiness check", flush=True)
+        else:
+            print("  [collector] WS server not running, proceeding without hook readiness check", flush=True)
     except Exception as e:
         print(f"  [collector] start_trace ACK failed: {e}", flush=True)
 

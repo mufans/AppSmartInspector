@@ -48,6 +48,7 @@ class SIServer:
         self._connections: set = set()
         self._latest_config: str = ""  # latest config from app
         self._config_event = threading.Event()  # signals config received
+        self._connection_event = threading.Event()  # signals app connection
         self._ready_event = threading.Event()
         self._on_message_handler: Callable | None = None
         self._pending_acks: dict[str, threading.Event] = {}
@@ -242,6 +243,7 @@ class SIServer:
 
     async def _handler(self, ws) -> None:
         self._connections.add(ws)
+        self._connection_event.set()  # signal app connection
         remote = ws.remote_address if hasattr(ws, "remote_address") else "?"
         print(f"  [ws] App connected: {remote}")
         try:
@@ -270,8 +272,7 @@ class SIServer:
             return
 
         if msg_type == "config_sync":
-            # App pushed its current config
-            self._latest_config = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+            # App pushed its current config            self._latest_config = json.dumps(payload) if isinstance(payload, dict) else str(payload)
             self._persist_config(self._latest_config)
             self._config_event.set()
             # Also notify external handler if registered
