@@ -109,6 +109,20 @@ def collector_node(state: AgentState) -> dict:
 
     print("  [collector] Starting trace collection...", flush=True)
 
+    # Notify app to ensure hooks are ready before collecting
+    try:
+        from smartinspector.ws.server import SIServer
+        server = SIServer.get()
+        if server.has_connections():
+            print("  [collector] Sending start_trace, waiting for hook ACK...", flush=True)
+            ack_ok = server.send_start_trace(timeout=5.0)
+            if ack_ok:
+                print("  [collector] Hook ACK received, hooks ready", flush=True)
+            else:
+                print("  [collector] Hook ACK timeout, proceeding anyway", flush=True)
+    except Exception as e:
+        print(f"  [collector] start_trace ACK failed: {e}", flush=True)
+
     try:
         # Read perfetto params: CLI args override WS config
         pc = _read_perfetto_config()
