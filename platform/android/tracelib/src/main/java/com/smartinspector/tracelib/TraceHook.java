@@ -89,6 +89,13 @@ public class TraceHook {
     }
 
     /**
+     * Check whether TraceHook has been initialized and hooks are installed.
+     */
+    public static boolean isInitialized() {
+        return initialized;
+    }
+
+    /**
      * Get the WS client instance (for HookConfigActivity reconnect button).
      */
     public static SIClient getWsClient() {
