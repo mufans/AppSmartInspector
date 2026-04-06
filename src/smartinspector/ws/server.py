@@ -23,6 +23,7 @@ import uuid
 from typing import Callable
 
 from smartinspector.config import get_ws_ping_timeout
+from smartinspector.debug_log import debug_log
 
 logger = logging.getLogger(__name__)
 
@@ -265,8 +266,10 @@ class SIServer:
         self._connection_event.set()  # signal app connection
         remote = ws.remote_address if hasattr(ws, "remote_address") else "?"
         print(f"  [ws] App connected: {remote}")
+        debug_log("ws", f"App connected: {remote}")
         try:
             async for raw in ws:
+                debug_log("ws", f"Recv: {raw[:500]}")
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
@@ -277,6 +280,7 @@ class SIServer:
         finally:
             self._connections.discard(ws)
             print(f"  [ws] App disconnected: {remote}")
+            debug_log("ws", f"App disconnected: {remote}")
 
     async def _dispatch(self, ws, msg: dict) -> None:
         msg_type = msg.get("type", "")
@@ -321,6 +325,7 @@ class SIServer:
                 self._block_events_event.set()
 
     async def _broadcast(self, msg: str) -> None:
+        debug_log("ws", f"Send: {msg[:500]}")
         dead = set()
         for ws in self._connections:
             try:

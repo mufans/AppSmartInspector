@@ -12,9 +12,22 @@ def _split_fqn_method(body: str) -> tuple[str, str]:
 
     The last dot-separated segment is the method name, everything before it
     is the fully-qualified class name.
+
+    Handles edge cases where there is no separate method segment and the
+    entire string is a class FQN (e.g. block tags whose msgClass is the
+    full FQN like ``com.smartinspector.hook.worker.CpuBurnWorker$startMainThreadWork$1``).
+    Java method names always start with a lowercase letter by convention,
+    so if the last segment starts with an uppercase letter or contains '$'
+    it is part of the class name, not a method.
     """
     if "." in body:
         fqn, method = body.rsplit(".", 1)
+        # Java methods start with lowercase.  If the last segment looks
+        # like a class (starts uppercase or contains '$' for inner
+        # classes / lambdas), the whole body is the FQN — there is no
+        # separate method name.
+        if method[:1].isupper() or "$" in method:
+            return body, ""
         return fqn, method
     return "", body
 

@@ -2,6 +2,7 @@
 
 import json
 import datetime
+import os
 
 
 def _build_report_header(perf_json: str, trace_path: str = "") -> str:
@@ -144,19 +145,27 @@ def cmd_full(args: str, state: dict) -> dict:
     Reuses the LangGraph pipeline (collector → analyzer → attributor → reporter)
     by injecting a synthetic message that routes to the collector node.
 
-    Usage: /full [--no-wait] [duration_ms] [package_name]
+    Usage: /full [--no-wait] [--debug] [duration_ms] [package_name]
 
     Options:
         --no-wait   Skip waiting for app connection; start trace immediately.
                     Useful for profiling app cold start time.
+        --debug     Enable debug logging to reports/debug_*.log.
     """
     from smartinspector.graph import create_graph, _stream_run
 
-    # Parse --no-wait flag
+    # Parse flags
     tokens = args.split() if args else []
     skip_wait = "--no-wait" in tokens
     if skip_wait:
         tokens.remove("--no-wait")
+
+    debug_flag = "--debug" in tokens
+    if debug_flag:
+        tokens.remove("--debug")
+        os.environ["SI_DEBUG"] = "1"
+        from smartinspector.debug_log import debug_log
+        debug_log("full", "Debug logging enabled via /full --debug")
 
     if skip_wait:
         state["skip_wait"] = True

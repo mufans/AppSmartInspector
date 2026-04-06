@@ -3,6 +3,7 @@
 from langchain_core.messages import AIMessage
 
 from smartinspector.config import get_report_max_tokens
+from smartinspector.debug_log import debug_log
 
 from smartinspector.graph.state import AgentState
 from smartinspector.graph.nodes.reporter.formatter import (
@@ -68,6 +69,8 @@ def reporter_node(state: AgentState) -> dict:
         if len(user_content) > target_chars:
             user_content = user_content[:target_chars] + "\n\n[... 数据过长已截断 ...]"
     full_content = generate_report(report_prompt, user_content)
+    debug_log("reporter", f"LLM output ({len(full_content)} chars): {full_content[:2000]}")
+    debug_log("reporter", f"attribution_result JSON: {attribution_result}")
 
     # Prepend pre-generated header (LLM does not output header per prompt instructions)
     complete_report = header_md + "\n" + full_content if perf_json else full_content
