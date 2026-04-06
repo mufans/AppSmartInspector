@@ -27,14 +27,38 @@ def _build_report_header(perf_json: str, trace_path: str = "") -> str:
         sched = perf_data.get("scheduling", {})
         pkg = sched.get("package", "")
 
+    # Fallback: use highest-CPU process as target app
+    top_procs = cpu_usage.get("top_processes", [])
+    target_process_name = ""
+    if not pkg and top_procs:
+        target_process_name = top_procs[0].get("process", "")
+        pkg = target_process_name
+    elif top_procs:
+        target_process_name = top_procs[0].get("process", "")
+
     # ── CPU ──
     cpu_peak = cpu_usage.get("cpu_usage_pct", 0)
 
-    # ── Memory ──
+    # ── Memory: find the target app's own memory, not system_server's ──
     mem_processes = proc_mem.get("processes", [])
     target_mem_mb = 0.0
+    _system_procs = {"system_server", "com.android.systemui"}
     if mem_processes:
-        target = mem_processes[0]
+        target = None
+        if target_process_name:
+            # Try to match target process in memory data
+            for p in mem_processes:
+                if p.get("name") == target_process_name:
+                    target = p
+                    break
+        if not target:
+            # Fallback: highest RSS process that isn't a system process
+            for p in mem_processes:
+                if p.get("name", "") not in _system_procs:
+                    target = p
+                    break
+        if not target:
+            target = mem_processes[0]
         target_mem_mb = target.get("rss_kb", 0) / 1024
 
     # ── FPS ──

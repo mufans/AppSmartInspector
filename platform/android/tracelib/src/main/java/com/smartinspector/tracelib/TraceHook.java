@@ -741,7 +741,7 @@ public class TraceHook {
                 if (!HookConfigManager.isEnabled("input_event")) return;
                 Activity activity = (Activity) cf.thisObject;
                 MotionEvent event = (MotionEvent) cf.args[0];
-                String action = motionActionToString(event.getActionMask());
+                String action = motionActionToString(event.getActionMasked());
                 if (!enterTrace()) return;
                 Trace.beginSection(SI_PREFIX + "touch#" + activity.getClass().getSimpleName()
                         + "#" + action);

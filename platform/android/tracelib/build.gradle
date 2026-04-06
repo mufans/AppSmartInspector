@@ -11,6 +11,10 @@ android {
         consumerProguardFiles 'consumer-rules.pro'
     }
 
+    buildFeatures {
+        buildConfig true
+    }
+
     publishNonDefault true
 
     compileOptions {

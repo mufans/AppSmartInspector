@@ -69,7 +69,7 @@ def reporter_node(state: AgentState) -> dict:
             user_content = user_content[:target_chars] + "\n\n[... 数据过长已截断 ...]"
     full_content = generate_report(report_prompt, user_content)
 
-    # Combine pre-generated header with LLM analysis
+    # Prepend pre-generated header (LLM does not output header per prompt instructions)
     complete_report = header_md + "\n" + full_content if perf_json else full_content
 
     # Save report to file
