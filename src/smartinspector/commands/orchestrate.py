@@ -120,9 +120,22 @@ def cmd_full(args: str, state: dict) -> dict:
     Reuses the LangGraph pipeline (collector → analyzer → attributor → reporter)
     by injecting a synthetic message that routes to the collector node.
 
-    Usage: /full [duration_ms] [package_name]
+    Usage: /full [--no-wait] [duration_ms] [package_name]
+
+    Options:
+        --no-wait   Skip waiting for app connection; start trace immediately.
+                    Useful for profiling app cold start time.
     """
     from smartinspector.graph import create_graph, _stream_run
+
+    # Parse --no-wait flag
+    tokens = args.split() if args else []
+    skip_wait = "--no-wait" in tokens
+    if skip_wait:
+        tokens.remove("--no-wait")
+
+    if skip_wait:
+        state["skip_wait"] = True
 
     # Always create a fresh graph — avoids module-level state issues
     # when running as `python graph.py` (__main__ vs smartinspector.graph)
@@ -139,41 +152,55 @@ def cmd_full(args: str, state: dict) -> dict:
 def cmd_report(args: str, state: dict) -> dict:
     """Generate a performance report from collected data.
 
-    Usage: /report
+    Usage: /report [output_path]
     """
     perf_json = state.get("perf_summary", "")
     analysis = state.get("perf_analysis", "")
     attribution_result = state.get("attribution_result", "")
+    trace_path = state.get("_trace_path", "")
 
     if not perf_json and not analysis:
         print("No data available. Use /trace or /full first.")
         return state
 
-    print("=== SmartInspector Performance Report ===\n")
+    # Build full report markdown
+    report_parts = []
 
+    # Header with metrics table
     if perf_json:
-        try:
-            data = json.loads(perf_json)
-            meta = data.get("metadata", {})
-            if meta:
-                print(f"Device: {meta.get('device_name', 'unknown')}")
-                print(f"OS: {meta.get('android_version', 'unknown')}")
-        except Exception:
-            pass
+        header = _build_report_header(perf_json, trace_path)
+        if header:
+            report_parts.append(header)
 
+    # Analysis section
     if analysis:
-        print(f"\n--- Analysis ---\n{analysis}")
+        report_parts.append(f"## Analysis\n\n{analysis}")
 
+    # Attribution section
     if attribution_result:
         try:
             results = json.loads(attribution_result)
             found = [r for r in results if r.get("attributable")]
             if found:
-                print(f"\n--- Source Attribution ---")
+                attr_section = "## Source Attribution\n\n"
                 for r in found:
-                    print(f"  {r['class_name']}.{r['method_name']} ({r['dur_ms']:.2f}ms)")
-                    print(f"    {r.get('file_path', '?')}:{r.get('line_start', '?')}-{r.get('line_end', '?')}")
+                    attr_section += f"- `{r['class_name']}.{r['method_name']}` ({r['dur_ms']:.2f}ms)\n"
+                    attr_section += f"  {r.get('file_path', '?')}:{r.get('line_start', '?')}-{r.get('line_end', '?')}\n"
+                report_parts.append(attr_section)
         except Exception:
             pass
+
+    report_md = "\n\n".join(report_parts)
+
+    # Output: file or terminal
+    output_path = args.strip()
+    if output_path:
+        import pathlib
+        path = pathlib.Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(report_md)
+        print(f"Report saved to: {path}")
+    else:
+        print(report_md)
 
     return state

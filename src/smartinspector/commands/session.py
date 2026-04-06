@@ -48,6 +48,12 @@ def cmd_clear(args: str, state: dict) -> dict:
     """Clear session data."""
     state["perf_summary"] = ""
     state["perf_analysis"] = ""
+    state["attribution_data"] = ""
+    state["attribution_result"] = ""
+    state["_trace_path"] = ""
+    state.pop("trace_duration_ms", None)
+    state.pop("trace_target_process", None)
+    state.pop("_route", None)
     state["messages"] = []
     print("Session cleared.")
     return state

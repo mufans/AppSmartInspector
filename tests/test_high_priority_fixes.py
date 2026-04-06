@@ -174,35 +174,35 @@ class TestThreadSafeSingleton:
 
 class TestPathTraversalProtection:
     def test_normal_path_valid(self):
-        from smartinspector.tools.glob import _validate_search_path
+        from smartinspector.tools.path_utils import validate_search_path
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = _validate_search_path(tmpdir)
+            result = validate_search_path(tmpdir)
             assert result is not None
 
     def test_dotdot_path_rejected(self):
-        from smartinspector.tools.glob import _validate_search_path
-        result = _validate_search_path("/etc/../etc/passwd")
+        from smartinspector.tools.path_utils import validate_search_path
+        result = validate_search_path("/etc/../etc/passwd")
         assert result is None
 
     def test_nested_dotdot_rejected(self):
-        from smartinspector.tools.glob import _validate_search_path
-        result = _validate_search_path("/tmp/../../../etc/shadow")
+        from smartinspector.tools.path_utils import validate_search_path
+        result = validate_search_path("/tmp/../../../etc/shadow")
         assert result is None
 
     def test_simple_path_valid(self):
-        from smartinspector.tools.glob import _validate_search_path
-        result = _validate_search_path("/tmp")
+        from smartinspector.tools.path_utils import validate_search_path
+        result = validate_search_path("/tmp")
         assert result is not None
 
     def test_current_dir_valid(self):
-        from smartinspector.tools.glob import _validate_search_path
-        result = _validate_search_path(".")
+        from smartinspector.tools.path_utils import validate_search_path
+        result = validate_search_path(".")
         assert result is not None
 
     def test_grep_path_validation(self):
-        from smartinspector.tools.grep import _validate_search_path
-        result = _validate_search_path("/etc/../secret")
+        from smartinspector.tools.path_utils import validate_search_path
+        result = validate_search_path("/etc/../secret")
         assert result is None
 
 

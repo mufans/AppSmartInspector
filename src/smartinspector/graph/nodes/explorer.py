@@ -1,9 +1,10 @@
 """Explorer node: source code search agent."""
 
 from smartinspector.agents.explorer import get_explorer_graph
-from smartinspector.graph.state import AgentState, _pass_through
+from smartinspector.graph.state import AgentState, _pass_through, node_error_handler
 
 
+@node_error_handler("explorer")
 def explorer_node(state: AgentState) -> dict:
     """Run the code explorer agent."""
     explorer = get_explorer_graph()

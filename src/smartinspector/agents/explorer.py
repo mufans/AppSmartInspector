@@ -1,5 +1,7 @@
 """Code Explorer agent: searches source code with grep/glob/read tools."""
 
+import threading
+
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
@@ -11,20 +13,23 @@ from smartinspector.prompts import load_prompt
 
 # Compile the agent once, reuse across calls
 _agent = None
+_agent_lock = threading.Lock()
 
 
 def _get_agent():
     global _agent
     if _agent is not None:
         return _agent
-
-    llm = ChatOpenAI(**get_llm_kwargs(temperature=0.1, streaming=True))
-    system_prompt = load_prompt("code-explorer")
-    _agent = create_agent(
-        model=llm,
-        tools=[grep, glob, read],
-        system_prompt=system_prompt,
-    )
+    with _agent_lock:
+        if _agent is not None:
+            return _agent
+        llm = ChatOpenAI(**get_llm_kwargs(temperature=0.1, streaming=True))
+        system_prompt = load_prompt("code-explorer")
+        _agent = create_agent(
+            model=llm,
+            tools=[grep, glob, read],
+            system_prompt=system_prompt,
+        )
     return _agent
 
 

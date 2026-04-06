@@ -114,3 +114,57 @@ def set_source_dir(path: str) -> None:
     global _source_dir
     expanded = os.path.expanduser(path)
     _source_dir = os.path.abspath(expanded)
+
+
+# ── Tool limits ───────────────────────────────────────────────
+
+
+def get_tool_timeout() -> int:
+    """Timeout in seconds for tool subprocess calls (grep, glob).
+
+    Priority: SI_TOOL_TIMEOUT env var > default (30).
+    """
+    try:
+        return int(os.environ.get("SI_TOOL_TIMEOUT", "30"))
+    except (ValueError, TypeError):
+        return 30
+
+
+def get_read_max_lines() -> int:
+    """Max lines returned by the read tool."""
+    try:
+        return int(os.environ.get("SI_READ_MAX_LINES", "2000"))
+    except (ValueError, TypeError):
+        return 2000
+
+
+def get_read_max_bytes() -> int:
+    """Max bytes returned by the read tool."""
+    try:
+        return int(os.environ.get("SI_READ_MAX_BYTES", str(50 * 1024)))
+    except (ValueError, TypeError):
+        return 50 * 1024
+
+
+def get_read_max_line_length() -> int:
+    """Max characters per line in read tool output."""
+    try:
+        return int(os.environ.get("SI_READ_MAX_LINE_LENGTH", "2000"))
+    except (ValueError, TypeError):
+        return 2000
+
+
+def get_report_max_tokens() -> int:
+    """Max input tokens for report generation."""
+    try:
+        return int(os.environ.get("SI_REPORT_MAX_TOKENS", "4000"))
+    except (ValueError, TypeError):
+        return 4000
+
+
+def get_ws_ping_timeout() -> int:
+    """WebSocket ping timeout in seconds."""
+    try:
+        return int(os.environ.get("SI_WS_PING_TIMEOUT", "30"))
+    except (ValueError, TypeError):
+        return 30

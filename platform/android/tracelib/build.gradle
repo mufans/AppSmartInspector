@@ -20,16 +20,16 @@ android {
 }
 
 dependencies {
-    // Pine hook framework
-    api 'top.canyie.pine:core:0.3.0'
+    // Pine hook framework — debug only
+    debugApi 'top.canyie.pine:core:0.3.0'
+    // release does not declare pine dependency, uses no-op stubs
 
     compileOnly 'androidx.annotation:annotation:1.7.1'
     compileOnly 'androidx.fragment:fragment:1.6.2'
     compileOnly 'androidx.recyclerview:recyclerview:1.3.2'
 
-    // JSON serialization for HookConfig
     implementation 'org.json:json:20231013'
 
-    // WebSocket client
-    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    // OkHttp — debug only for WS client
+    debugImplementation 'com.squareup.okhttp3:okhttp:4.12.0'
 }

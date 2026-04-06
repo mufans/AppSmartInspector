@@ -5,23 +5,34 @@ from langchain_openai import ChatOpenAI
 
 from smartinspector.config import get_llm_kwargs
 from smartinspector.token_tracker import get_tracker
-from smartinspector.graph.state import AgentState, RouteDecision, _pass_through
+from smartinspector.graph.state import AgentState, RouteDecision, _pass_through, node_error_handler
 
 
 _ROUTE_PROMPT = """Classify this user message. Reply with ONE word only.
 
 Categories (pick ONE):
-- full_analysis : wants a COMPLETE performance analysis pipeline including trace collection, analysis, source attribution, and report (keywords: 全面分析/完整分析/全量分析/full/归因)
+- full_analysis : wants a COMPLETE performance analysis pipeline including trace collection, analysis, source attribution, and report (keywords: 全面分析/完整分析/全量分析/full/归因/冷启动/启动耗时/启动时间/启动分析/启动优化/应用启动/app启动/cold start/启动性能)
 - explorer : wants to SEARCH or READ source code (keywords: 源码/代码/搜索/查看/定位/函数/grep/.ets/.ts/.java)
 - android : wants to COLLECT or ANALYZE performance from Android device (keywords: trace/adb/采集/perfetto/FPS/CPU/内存指标)
 - analyze : wants deep interpretation of an ALREADY EXISTING perf JSON summary that is present in context (keywords: 解读perf_summary/分析这份数据/解读一下这个)
-- end : general Q&A, advice, or vague analysis request WITHOUT existing data (keywords: 什么是/怎么优化/如何/为什么/分析性能/帮我分析)
+- end : general Q&A, advice, or vague analysis request WITHOUT existing data (keywords: 什么是/怎么优化/如何/为什么)
 
 CRITICAL:
 - If the user wants the full pipeline (trace + analyze + source attribution) → MUST be full_analysis
+- 启动/冷启动 related analysis MUST be full_analysis (needs trace collection first)
 - If the user mentions 源码/代码/搜索/查看文件/函数名 → MUST be explorer
 - If the user says 分析性能/帮我分析 but has NOT provided perf data → MUST be end (let LLM guide them)
 - analyze should ONLY be used when user explicitly references existing perf data already in context
+
+Examples:
+- "帮我全面分析一下这个页面的性能" → full_analysis
+- "分析冷启动耗时" → full_analysis
+- "测一下应用启动时间" → full_analysis
+- "搜索一下 LazyForEach 的实现" → explorer
+- "采集一下 trace" → android
+- "你好" → end
+- "怎么优化列表滑动" → end
+- "分析一下刚才采集的这份数据" → analyze
 
 Reply with exactly one word: full_analysis explorer android analyze end"""
 
@@ -32,10 +43,11 @@ def _get_route_llm():
     global _route_llm
     if _route_llm is not None:
         return _route_llm
-    _route_llm = ChatOpenAI(**get_llm_kwargs(temperature=0))
+    _route_llm = ChatOpenAI(**get_llm_kwargs(temperature=0, max_tokens=5))
     return _route_llm
 
 
+@node_error_handler("orchestrator")
 def orchestrator_node(state: AgentState) -> dict:
     """Pure LLM classification to decide routing."""
     messages = state.get("messages", [])
@@ -63,9 +75,13 @@ def orchestrator_node(state: AgentState) -> dict:
     ]
 
     llm = _get_route_llm()
-    response = llm.invoke(orch_input)
-    get_tracker().record_from_message("orchestrator", response)
-    raw = response.content.strip().lower()
+    try:
+        response = llm.invoke(orch_input)
+        get_tracker().record_from_message("orchestrator", response)
+        raw = response.content.strip().lower()
+    except Exception as e:
+        print(f"  [orchestrator] LLM call failed: {e}", flush=True)
+        raw = ""
 
     # Extract valid label
     valid = {rd.value: rd for rd in RouteDecision}
@@ -84,7 +100,19 @@ def orchestrator_node(state: AgentState) -> dict:
         }
         print(f"  {_ROUTE_LABELS.get(decision, '处理中...')}", flush=True)
 
-    return {"messages": [], "_route": decision, **_pass_through(state)}
+    # Detect cold-start / startup profiling intent for skip_wait
+    skip_wait = False
+    if decision == RouteDecision.FULL_ANALYSIS and user_msg:
+        _STARTUP_KEYWORDS = (
+            "冷启动", "启动耗时", "启动时间", "启动性能", "cold start", "cold_start",
+            "启动分析", "启动优化", "开机", "app启动", "应用启动",
+        )
+        user_msg_lower = user_msg.lower()
+        skip_wait = any(kw in user_msg_lower for kw in _STARTUP_KEYWORDS)
+        if skip_wait:
+            print("  [orchestrator] 检测到启动分析意图，将跳过等待 App 连接", flush=True)
+
+    return {"messages": [], "_route": decision, "skip_wait": skip_wait, **_pass_through(state)}
 
 
 _FALLBACK_SYSTEM = """你是 SmartInspector，一个移动端性能分析助手。你的核心能力：
@@ -102,9 +130,9 @@ def fallback_node(state: AgentState) -> dict:
     """Use LLM to generate a friendly reply for non-performance queries."""
     messages = state.get("messages", [])
 
-    # Extract recent conversation for context
+    # Extract recent conversation for context (filter out ToolMessage to save tokens)
     recent = []
-    for m in messages[-6:]:  # last 3 turns
+    for m in messages:
         if isinstance(m, dict):
             role = m.get("role", "")
             content = m.get("content", "")
@@ -113,7 +141,11 @@ def fallback_node(state: AgentState) -> dict:
             elif role == "assistant":
                 recent.append(AIMessage(content=content))
         else:
-            recent.append(m)
+            msg_type = getattr(m, "type", "")
+            if msg_type in ("human", "ai"):
+                recent.append(m)
+    # Keep only the last 6 valid conversation messages
+    recent = recent[-6:]
 
     llm = _get_route_llm()
     response = llm.invoke([
@@ -131,18 +163,23 @@ def fallback_node(state: AgentState) -> dict:
 def route_from_orchestrator(state: AgentState) -> str:
     """Map routing decision to node name."""
     decision = state.get("_route", "end")
+
+    # Mapping supports both enum values and string values
     mapping = {
         RouteDecision.FULL_ANALYSIS: "collector",
+        RouteDecision.FULL_ANALYSIS.value: "collector",
         RouteDecision.ANDROID: "android_expert",
+        RouteDecision.ANDROID.value: "android_expert",
         RouteDecision.ANALYZE: "perf_analyzer",
+        RouteDecision.ANALYZE.value: "perf_analyzer",
         RouteDecision.EXPLORER: "explorer",
+        RouteDecision.EXPLORER.value: "explorer",
         RouteDecision.END: "fallback",
+        RouteDecision.END.value: "fallback",
         RouteDecision.TRACE: "collector",
+        RouteDecision.TRACE.value: "collector",
     }
-    # Accept both enum values and raw strings for robustness
-    if decision in mapping:
-        return mapping[decision]
-    return mapping.get(RouteDecision(decision), "fallback")
+    return mapping.get(decision, "fallback")
 
 
 def route_from_android_expert(state: AgentState) -> str:

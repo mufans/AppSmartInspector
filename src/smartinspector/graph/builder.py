@@ -1,6 +1,7 @@
 """Graph construction: create_graph()."""
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 
 from smartinspector.graph.state import AgentState, RouteDecision
 from smartinspector.graph.nodes.orchestrator import (
@@ -90,4 +91,7 @@ def create_graph():
     builder.add_edge("attributor", "reporter")
     builder.add_edge("reporter", END)
 
-    return builder.compile()
+    serde = MemorySaver().serde.with_msgpack_allowlist(
+        [("smartinspector.graph.state", "RouteDecision")],
+    )
+    return builder.compile(checkpointer=MemorySaver(serde=serde))

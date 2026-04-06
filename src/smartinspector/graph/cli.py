@@ -11,7 +11,7 @@ def main():
     import subprocess
     import pathlib
 
-    from smartinspector.config import get_source_dir, set_source_dir
+    from smartinspector.config import get_source_dir, set_source_dir, get_ws_port, get_api_key
     from smartinspector.ws.server import SIServer
 
     parser = argparse.ArgumentParser(description="SmartInspector CLI")
@@ -21,24 +21,47 @@ def main():
     if args.source_dir:
         set_source_dir(args.source_dir)
 
-    print("SmartInspector v0.5.0")
+    from importlib.metadata import version as pkg_version
+    try:
+        _version = pkg_version("smartinspector")
+    except Exception:
+        _version = "dev"
+
+    print(f"SmartInspector v{_version}")
     if args.source_dir:
         print(f"Source dir: {get_source_dir()}")
     else:
         print(f"Source dir: {get_source_dir()} (use --source-dir or /config source_dir <path> to change)")
     print("Type /help for commands, 'quit' or Ctrl+C to exit\n")
 
+    # Check prerequisites
+    issues = []
+    try:
+        subprocess.run(
+            ["adb", "version"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except FileNotFoundError:
+        issues.append("adb not found in PATH. Install Android Platform Tools.")
+    except subprocess.TimeoutExpired:
+        issues.append("adb version check timed out.")
+    if not get_api_key():
+        issues.append("No API key configured. Set SI_API_KEY or OPENAI_API_KEY.")
+    for issue in issues:
+        print(f"  Warning: {issue}")
+
     # Auto-start WS server + adb reverse so app can connect on launch
-    server = SIServer.get(port=9876)
+    port = get_ws_port()
+    server = SIServer.get(port=port)
     server.start()
     try:
         subprocess.run(
-            ["adb", "reverse", "tcp:9876", "tcp:9876"],
+            ["adb", "reverse", f"tcp:{port}", f"tcp:{port}"],
             capture_output=True, text=True, timeout=5,
         )
-        print("  WS server ready on :9876, adb reverse set")
+        print(f"  WS server ready on :{port}, adb reverse set")
     except Exception as e:
-        print(f"  WS server ready on :9876 (adb reverse failed: {e})")
+        print(f"  WS server ready on :{port} (adb reverse failed: {e})")
     print()
 
     graph = create_graph()
@@ -53,8 +76,18 @@ def main():
 
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.completion import WordCompleter
 
-    session = PromptSession(history=FileHistory(str(pathlib.Path.home() / ".smartinspector_history")))
+    from smartinspector.commands import SLASH_COMMANDS
+
+    command_completer = WordCompleter(
+        list(SLASH_COMMANDS.keys()) + ["quit", "exit"],
+        ignore_case=True,
+    )
+    session = PromptSession(
+        history=FileHistory(str(pathlib.Path.home() / ".smartinspector_history")),
+        completer=command_completer,
+    )
 
     while True:
         try:
@@ -69,13 +102,18 @@ def main():
             print("bye!")
             break
 
-        # Slash commands bypass the LLM graph
-        if user_input.startswith("/"):
-            state = handle_slash_command(user_input, state)
-            continue
-
-        state["messages"] = state["messages"] + [
-            {"role": "user", "content": user_input}
-        ]
-
-        state = _stream_run(graph, state)
+        try:
+            # Slash commands bypass the LLM graph
+            if user_input.startswith("/"):
+                state = handle_slash_command(user_input, state)
+            else:
+                state["messages"] = state["messages"] + [
+                    {"role": "user", "content": user_input}
+                ]
+                state = _stream_run(graph, state)
+        except KeyboardInterrupt:
+            print("\n  [interrupted]", flush=True)
+        except Exception as e:
+            print(f"\n  [error] {e}", flush=True)
+            # Keep state unchanged, allow user to continue input
+            print("  Session state preserved. Continue or type /help.\n")

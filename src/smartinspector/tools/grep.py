@@ -1,20 +1,11 @@
 """Grep tool: search file contents using ripgrep."""
 
-import os
 import subprocess
 from langchain_core.tools import tool
 
 from smartinspector.tools.rg import find_rg
-from smartinspector.config import get_source_dir
-
-
-def _validate_search_path(path: str) -> str | None:
-    """Validate and resolve search path. Returns resolved path or None if invalid."""
-    # Block traversal: check raw path components before normalization
-    parts = path.replace("\\", "/").split("/")
-    if ".." in parts:
-        return None
-    return os.path.realpath(path)
+from smartinspector.config import get_source_dir, get_tool_timeout
+from smartinspector.tools.path_utils import validate_search_path
 
 
 @tool
@@ -30,7 +21,7 @@ def grep(pattern: str, path: str = "", include: str | None = None) -> str:
     """
     if not path:
         path = get_source_dir()
-    path = _validate_search_path(path)
+    path = validate_search_path(path)
     if path is None:
         return "Error: invalid path."
     rg = find_rg()
@@ -48,10 +39,10 @@ def grep(pattern: str, path: str = "", include: str | None = None) -> str:
 
     try:
         result = subprocess.run(
-            args, capture_output=True, text=True, timeout=30,
+            args, capture_output=True, text=True, timeout=get_tool_timeout(),
         )
     except subprocess.TimeoutExpired:
-        return "Error: search timed out after 30s."
+        return f"Error: search timed out after {get_tool_timeout()}s."
 
     if result.returncode == 1:
         return "No matches found."

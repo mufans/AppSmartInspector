@@ -10,7 +10,10 @@ Slices whose files cannot be found are marked as system classes.
 """
 
 import json
+import threading
 from collections import OrderedDict
+
+from pydantic import BaseModel
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
@@ -22,6 +25,21 @@ from smartinspector.tools.read import read
 from smartinspector.prompts import load_prompt
 from smartinspector.token_tracker import get_tracker
 
+
+class AttributionResult(BaseModel):
+    """Single attribution result."""
+    class_method: str
+    status: str  # "found" | "system_class" | "not_found"
+    file_path: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    finding: str = ""
+
+
+class AttributionResponse(BaseModel):
+    """Structured response from attributor LLM."""
+    results: list[AttributionResult]
+
 # Tool name -> callable
 _TOOLS = {
     "grep": grep,
@@ -31,6 +49,8 @@ _TOOLS = {
 
 _llm_with_tools = None
 _system_prompt = None
+_structured_llm = None
+_llm_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -75,14 +95,17 @@ class _FileCache:
 
 
 def _get_llm():
-    """Get LLM with bound tools (singleton)."""
-    global _llm_with_tools, _system_prompt
+    """Get LLM with bound tools (singleton, thread-safe)."""
+    global _llm_with_tools, _system_prompt, _structured_llm
     if _llm_with_tools is not None:
         return _llm_with_tools, _system_prompt
-
-    llm = ChatOpenAI(**get_llm_kwargs(role="attributor", temperature=0))
-    _llm_with_tools = llm.bind_tools([grep, glob, read])
-    _system_prompt = load_prompt("attributor")
+    with _llm_lock:
+        if _llm_with_tools is not None:
+            return _llm_with_tools, _system_prompt
+        llm = ChatOpenAI(**get_llm_kwargs(role="attributor", temperature=0))
+        _llm_with_tools = llm.bind_tools([grep, glob, read])
+        _structured_llm = llm.with_structured_output(AttributionResponse)
+        _system_prompt = load_prompt("attributor")
     return _llm_with_tools, _system_prompt
 
 
@@ -176,6 +199,11 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
 
         max_iterations = 12  # Safety limit
         for iteration in range(max_iterations):
+            # Message window trimming: keep system(0) + human(1) + recent 4 rounds
+            # Each round = 1 AIMessage + 1 ToolMessage = 2 messages
+            if len(messages) > 10:
+                messages = [messages[0], messages[1]] + messages[-8:]
+
             response = llm.invoke(messages)
 
             # Record token usage
@@ -244,7 +272,33 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
             content = getattr(msg, "content", "")
             if content:
                 all_text += "\n" + content
-        if all_text:
+
+        # Try structured output first, fall back to text parsing
+        structured_ok = False
+        if _structured_llm is not None and all_text:
+            try:
+                structured = _structured_llm.invoke(messages)
+                for sr in structured.results:
+                    for r in results:
+                        key = f"{r['class_name']}.{r['method_name']}"
+                        if key == sr.class_method:
+                            if sr.status == "found":
+                                r.update({
+                                    "attributable": True,
+                                    "reason": "found",
+                                    "file_path": sr.file_path,
+                                    "line_start": sr.line_start,
+                                    "line_end": sr.line_end,
+                                    "source_snippet": sr.finding,
+                                })
+                            elif sr.status == "system_class":
+                                r["reason"] = "system_class"
+                            break
+                structured_ok = True
+            except Exception:
+                pass
+
+        if not structured_ok and all_text:
             _parse_agent_response(all_text, results)
 
         # Mark any still-pending results as parse_failed

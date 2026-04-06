@@ -1,6 +1,7 @@
 """Perf Analyzer: single-shot LLM call to interpret performance summaries."""
 
 import json
+import threading
 
 from langchain_openai import ChatOpenAI
 
@@ -10,13 +11,17 @@ from smartinspector.token_tracker import get_tracker
 
 _prompt = load_prompt("perf-analyzer")
 _llm = None
+_llm_lock = threading.Lock()
 
 
 def _get_llm():
     global _llm
     if _llm is not None:
         return _llm
-    _llm = ChatOpenAI(**get_llm_kwargs(temperature=0.1))
+    with _llm_lock:
+        if _llm is not None:
+            return _llm
+        _llm = ChatOpenAI(**get_llm_kwargs(temperature=0.1))
     return _llm
 
 

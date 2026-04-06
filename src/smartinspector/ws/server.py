@@ -16,8 +16,17 @@ Protocol (JSON):
 
 import asyncio
 import json
+import logging
+import pathlib
 import threading
+import uuid
 from typing import Callable
+
+from smartinspector.config import get_ws_ping_timeout
+
+logger = logging.getLogger(__name__)
+
+_CONFIG_PATH = pathlib.Path.home() / ".smartinspector_config.json"
 
 try:
     import websockets
@@ -39,7 +48,11 @@ class SIServer:
         self._connections: set = set()
         self._latest_config: str = ""  # latest config from app
         self._config_event = threading.Event()  # signals config received
+        self._connection_event = threading.Event()  # signals app connection
+        self._ready_event = threading.Event()
         self._on_message_handler: Callable | None = None
+        self._pending_acks: dict[str, threading.Event] = {}
+        self._latest_config: str = self._load_cached_config()
 
     @classmethod
     def get(cls, port: int = 9876) -> "SIServer":
@@ -59,9 +72,16 @@ class SIServer:
             print("  websockets not installed. Run: uv add websockets")
             return
 
+        self._ready_event.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        print(f"  WS server started on port {self.port}")
+        # Wait for server to be ready (or thread to die)
+        if self._ready_event.wait(timeout=2.0):
+            print(f"  WS server started on port {self.port}")
+        elif self._thread.is_alive():
+            print(f"  WS server starting on port {self.port} (still initializing)")
+        else:
+            print(f"  WS server FAILED to start on port {self.port} (check port conflict)")
 
     def stop(self) -> None:
         """Stop the WS server."""
@@ -81,20 +101,66 @@ class SIServer:
         self._config_event.wait(timeout=timeout)
         return self._latest_config
 
-    def send_config(self, config_json: str) -> bool:
+    def send_config(self, config_json: str, timeout: float = 5.0) -> bool:
         """Send a config_update to all connected apps.
 
         Returns True if at least one app received it.
+        With ACK: waits for app confirmation within timeout.
         """
         if not self._connections:
             return False
-        msg = json.dumps({"type": "config_update", "payload": json.loads(config_json)})
+
+        msg_id = str(uuid.uuid4())
+        msg = json.dumps({
+            "type": "config_update",
+            "msg_id": msg_id,
+            "payload": json.loads(config_json),
+        })
+
+        ack_event = threading.Event()
+        self._pending_acks[msg_id] = ack_event
+
         future = asyncio.run_coroutine_threadsafe(self._broadcast(msg), self._loop)
         try:
-            future.result(timeout=5)
-            return True
+            future.result(timeout=3)
+            # Wait for ACK from any app
+            ack_event.wait(timeout=timeout)
+            if ack_event.is_set():
+                self._persist_config(config_json)
+            return ack_event.is_set()
         except Exception:
             return False
+        finally:
+            self._pending_acks.pop(msg_id, None)
+
+    def send_start_trace(self, timeout: float = 5.0) -> bool:
+        """Send a start_trace command and wait for ACK from the app.
+
+        The app confirms that TraceHook is initialized and hooks are ready.
+        Returns True if ACK received within timeout, False otherwise.
+        """
+        if not self._connections or not self._loop:
+            return False
+
+        msg_id = str(uuid.uuid4())
+        msg = json.dumps({
+            "type": "start_trace",
+            "msg_id": msg_id,
+            "payload": None,
+        })
+
+        ack_event = threading.Event()
+        self._pending_acks[msg_id] = ack_event
+
+        future = asyncio.run_coroutine_threadsafe(self._broadcast(msg), self._loop)
+        try:
+            future.result(timeout=3)
+            ack_event.wait(timeout=timeout)
+            return ack_event.is_set()
+        except Exception:
+            return False
+        finally:
+            self._pending_acks.pop(msg_id, None)
 
     def get_config(self) -> str:
         """Return the latest config received from app."""
@@ -129,8 +195,46 @@ class SIServer:
     def has_connections(self) -> bool:
         return len(self._connections) > 0
 
+    def wait_for_connection(self, timeout: float = 30.0) -> bool:
+        """Block until an app connects and config_sync arrives, or timeout.
+
+        The app sends config_sync in onOpen(), so we also wait for
+        _config_event to ensure config is available before returning.
+
+        Returns True if a connection was established, False on timeout.
+        """
+        if self.has_connections():
+            return True
+        self._connection_event.clear()
+        connected = self._connection_event.wait(timeout=timeout)
+        if not connected:
+            return False
+        # Wait for config_sync from app (sent in onOpen)
+        self._config_event.clear()
+        self._config_event.wait(timeout=5.0)
+        return True
+
     def on_message(self, handler: Callable) -> None:
         self._on_message_handler = handler
+
+    # ── Config persistence ─────────────────────────────────────
+
+    def _persist_config(self, config_json: str) -> None:
+        """Save config to local cache file."""
+        try:
+            _CONFIG_PATH.write_text(config_json)
+        except Exception as e:
+            logger.debug("Failed to persist config: %s", e)
+
+    @staticmethod
+    def _load_cached_config() -> str:
+        """Load config from local cache file."""
+        try:
+            if _CONFIG_PATH.exists():
+                return _CONFIG_PATH.read_text()
+        except Exception as e:
+            logger.debug("Failed to load cached config: %s", e)
+        return ""
 
     # ── Internal async ─────────────────────────────────────────
 
@@ -143,16 +247,22 @@ class SIServer:
                 self._handler,
                 "0.0.0.0",
                 self.port,
+                ping_interval=20,
+                ping_timeout=get_ws_ping_timeout(),
             )
+            self._ready_event.set()
             await asyncio.Future()  # run forever
 
         try:
             self._loop.run_until_complete(_serve())
-        except Exception:
-            pass
+        except OSError as e:
+            print(f"  [ws] Failed to start: {e}")
+        except Exception as e:
+            print(f"  [ws] Unexpected error: {e}")
 
     async def _handler(self, ws) -> None:
         self._connections.add(ws)
+        self._connection_event.set()  # signal app connection
         remote = ws.remote_address if hasattr(ws, "remote_address") else "?"
         print(f"  [ws] App connected: {remote}")
         try:
@@ -172,9 +282,18 @@ class SIServer:
         msg_type = msg.get("type", "")
         payload = msg.get("payload")
 
+        if msg_type == "ack":
+            # Handle ACK from app
+            msg_id = msg.get("msg_id", "")
+            event = self._pending_acks.get(msg_id)
+            if event:
+                event.set()
+            return
+
         if msg_type == "config_sync":
             # App pushed its current config
             self._latest_config = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+            self._persist_config(self._latest_config)
             self._config_event.set()
             # Also notify external handler if registered
             if self._on_message_handler:
