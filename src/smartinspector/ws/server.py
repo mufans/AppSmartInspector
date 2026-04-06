@@ -132,6 +132,35 @@ class SIServer:
         finally:
             self._pending_acks.pop(msg_id, None)
 
+    def send_start_trace(self, timeout: float = 5.0) -> bool:
+        """Send a start_trace command and wait for ACK from the app.
+
+        The app confirms that TraceHook is initialized and hooks are ready.
+        Returns True if ACK received within timeout, False otherwise.
+        """
+        if not self._connections or not self._loop:
+            return False
+
+        msg_id = str(uuid.uuid4())
+        msg = json.dumps({
+            "type": "start_trace",
+            "msg_id": msg_id,
+            "payload": None,
+        })
+
+        ack_event = threading.Event()
+        self._pending_acks[msg_id] = ack_event
+
+        future = asyncio.run_coroutine_threadsafe(self._broadcast(msg), self._loop)
+        try:
+            future.result(timeout=3)
+            ack_event.wait(timeout=timeout)
+            return ack_event.is_set()
+        except Exception:
+            return False
+        finally:
+            self._pending_acks.pop(msg_id, None)
+
     def get_config(self) -> str:
         """Return the latest config received from app."""
         return self._latest_config
