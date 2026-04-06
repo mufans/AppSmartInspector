@@ -4,6 +4,7 @@ import json
 
 from langchain_core.messages import AIMessage
 
+from smartinspector.debug_log import debug_log
 from smartinspector.graph.state import AgentState
 
 
@@ -24,6 +25,7 @@ def _read_perfetto_config() -> dict:
 
     try:
         config = json.loads(config_str)
+        debug_log("collector", f"config_sync raw JSON: {config_str}")
         return config.get("perfetto_collection", {})
     except (json.JSONDecodeError, AttributeError):
         return {}
@@ -174,6 +176,7 @@ def collector_node(state: AgentState) -> dict:
             collect_java_heap=collect_java_heap if target_process else False,
         )
         print(f"  [collector] Trace saved to {trace_path}", flush=True)
+        debug_log("collector", f"trace_path: {trace_path}")
 
         collector = PerfettoCollector(trace_path)
         summary = collector.summarize()

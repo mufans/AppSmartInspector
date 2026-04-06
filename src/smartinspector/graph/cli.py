@@ -16,10 +16,17 @@ def main():
 
     parser = argparse.ArgumentParser(description="SmartInspector CLI")
     parser.add_argument("--source-dir", default="", help="Source code directory for attribution search")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging to reports/debug_*.log")
     args, _ = parser.parse_known_args()
 
     if args.source_dir:
         set_source_dir(args.source_dir)
+
+    if args.debug:
+        import os
+        os.environ["SI_DEBUG"] = "1"
+        from smartinspector.debug_log import debug_log
+        debug_log("cli", "Debug logging enabled via --debug flag")
 
     from importlib.metadata import version as pkg_version
     try:

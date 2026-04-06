@@ -49,6 +49,7 @@ def compute_hints(perf_json: str) -> str:
     frame_budget_ms = _detect_frame_budget_ms(data)
 
     sections = [
+        _detect_empty_scenario(data),
         _classify_severity(data, frame_budget_ms),
         _compute_call_chain_distribution(data),
         _rank_rv_hotspots(data),
@@ -57,6 +58,32 @@ def compute_hints(perf_json: str) -> str:
     ]
 
     return "\n\n".join(s for s in sections if s)
+
+
+# ---------------------------------------------------------------------------
+# Helper 0: Empty scenario detection
+# ---------------------------------------------------------------------------
+
+def _detect_empty_scenario(data: dict) -> str:
+    """Detect when there is no UI activity (FPS=0, no frames, low CPU)."""
+    ft = data.get("frame_timeline") or {}
+    fps = ft.get("fps", 0)
+    total_frames = ft.get("total_frames", 0)
+
+    cpu = data.get("cpu_usage") or {}
+    cpu_pct = cpu.get("cpu_usage_pct", 0)
+
+    if fps == 0 and total_frames == 0 and cpu_pct < 15:
+        lines = [
+            "[疑似无UI活动]",
+            "  FPS为0，总帧数为0，CPU占用低。可能原因：",
+            "  1) 应用未启动或未在前台运行",
+            "  2) 采集期间未对应用进行操作",
+            "  3) target_process 未匹配到目标进程",
+        ]
+        return "\n".join(lines)
+
+    return ""
 
 
 # ---------------------------------------------------------------------------

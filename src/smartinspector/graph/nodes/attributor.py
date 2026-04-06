@@ -5,6 +5,7 @@ import json
 from langchain_core.messages import AIMessage
 
 from smartinspector.agents.attributor import run_attribution
+from smartinspector.debug_log import debug_log
 from smartinspector.graph.state import AgentState, _pass_through
 
 
@@ -42,6 +43,9 @@ def attributor_node(state: AgentState) -> dict:
 
     print("  [attributor] Extracting attributable slices...", flush=True)
     attributable = extract_attributable_slices(perf_json, min_dur_ms=1.0)
+    debug_log("attributor", f"extract_attributable_slices: {len(attributable)} slices")
+    if attributable:
+        debug_log("attributor", f"slices detail: {json.dumps(attributable[:20], ensure_ascii=False)}")
 
     if not attributable:
         print("  [attributor] No attributable slices found", flush=True)
@@ -59,6 +63,7 @@ def attributor_node(state: AgentState) -> dict:
         print(f"    {s['dur_ms']:>8.2f}ms  {s['class_name']}.{s['method_name']}  ({s.get('search_type', 'java')})", flush=True)
 
     results = run_attribution(attributable)
+    debug_log("attributor", f"run_attribution results: {json.dumps(results, ensure_ascii=False)}")
 
     # Summarize results
     found = sum(1 for r in results if r.get("attributable"))

@@ -21,7 +21,7 @@ public class HookConfig {
     public boolean fragmentLifecycle = true;
     public boolean rvPipeline = true;
     public boolean rvAdapter = true;
-    public boolean layoutInflate = false;
+    public boolean layoutInflate = true;
     public boolean viewTraverse = false;
     public boolean handlerDispatch = false;
     public boolean blockMonitor = true;

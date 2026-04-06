@@ -12,9 +12,22 @@ def _split_fqn_method(body: str) -> tuple[str, str]:
 
     The last dot-separated segment is the method name, everything before it
     is the fully-qualified class name.
+
+    Handles edge cases where there is no separate method segment and the
+    entire string is a class FQN (e.g. block tags whose msgClass is the
+    full FQN like ``com.smartinspector.hook.worker.CpuBurnWorker$startMainThreadWork$1``).
+    Java method names always start with a lowercase letter by convention,
+    so if the last segment starts with an uppercase letter or contains '$'
+    it is part of the class name, not a method.
     """
     if "." in body:
         fqn, method = body.rsplit(".", 1)
+        # Java methods start with lowercase.  If the last segment looks
+        # like a class (starts uppercase or contains '$' for inner
+        # classes / lambdas), the whole body is the FQN — there is no
+        # separate method name.
+        if method[:1].isupper() or "$" in method:
+            return body, ""
         return fqn, method
     return "", body
 
@@ -179,7 +192,17 @@ _SYSTEM_CLASS_PATTERNS = (
     "MessageQueue",           # android.os.MessageQueue
     "HandlerThread",          # android.os.HandlerThread
     "FragmentActivity",       # androidx.fragment.app.FragmentActivity
+    "AppCompatActivity",      # androidx.appcompat.app.AppCompatActivity
     "AppCompatDelegateImpl",  # androidx.appcompat.app.AppCompatDelegateImpl
+    "ComponentActivity",      # androidx.activity.ComponentActivity
+    "AppCompatViewInflater",  # androidx.appcompat.app.AppCompatViewInflater
+    "ActionBarActivity",      # androidx.appcompat.app.ActionBarActivity
+    "ActionBarImpl",          # androidx.appcompat.app.ActionBarImpl
+    "KeyEvent",               # android.view.KeyEvent
+    "MotionEvent",            # android.view.MotionEvent
+    "View",                   # android.view.View (short match)
+    "ViewGroup",              # android.view.ViewGroup
+    "RecyclerView",           # androidx.recyclerview.widget.RecyclerView
 )
 
 # RV pipeline method names — these belong to RecyclerView/LayoutManager, not user code
@@ -444,7 +467,7 @@ def extract_attributable_slices(perf_summary_json: str, min_dur_ms: float = 1.0)
             continue
 
         # Skip system/framework classes and RV pipeline methods
-        if is_system_class(name):
+        if classify_search_type(name) == "system":
             continue
         if is_system_method(name):
             continue
@@ -477,7 +500,7 @@ def extract_attributable_slices(perf_summary_json: str, min_dur_ms: float = 1.0)
         name = s.get("name", "")
         if not name.startswith("SI$") or name in seen_names:
             continue
-        if is_system_class(name) or is_system_method(name):
+        if classify_search_type(name) == "system" or is_system_method(name):
             continue
         # Block tags have shortened class names — use pattern-based check
         if name.startswith("SI$block#") and _is_block_system_class(name):

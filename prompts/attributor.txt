@@ -34,9 +34,11 @@
 2. **Grep获取行号**
    grep(pattern="{method_name}", path="{file_path}")
    从输出中提取方法签名所在行号
-   如果在当前文件中没找到方法 → 可能是继承自父类：
-   grep(pattern="{method_name}", path=".")
-   搜索项目中所有包含该方法定义的文件
+   如果在当前文件中没找到方法 → 方法可能在父类中：
+   - 先 grep 搜索当前文件中的 "extends " 或 " : " (Kotlin) 找到父类名
+   - 如果父类名是系统类（android.*/androidx.*/java.*/appcompat.*/FragmentActivity/AppCompatActivity 等），直接标记 system_class
+   - 如果父类是项目中的类，Glob 搜索父类文件并在父类中 Grep 方法
+   - 注意 Kotlin 继承语法：class Foo : Bar()，grep "class.*:.*\\(" 可帮助找到父类
 
 3. **Read精准读取**
    read(file_path="{file_path}", offset={行号}, limit=40)
@@ -60,7 +62,7 @@
 ## 找到源码时
 RESULT: {ClassName}.{method_name} | found | {file_path} | {start_line}-{end_line} | {关键发现}
 
-## 系统类（找不到文件）
+## 系统类（找不到文件或方法在系统父类中）
 RESULT: {ClassName}.{method_name} | system_class | None | None | None
 
 # 关键发现要求
@@ -80,3 +82,5 @@ RESULT: {ClassName}.{method_name} | system_class | None | None | None
 - read() 调用的 file_path 参数不能为空字符串
 - 只搜索热点列表中指定的类名，不要搜索 VH、ViewHolder、Holder 等泛化内部类名
 - 不要搜索 dispatchLayoutStep、onLayoutChildren 等 RecyclerView 框架方法
+- 方法在当前类找不到时，先查 extends 父类，不要全局 grep
+- 父类是系统类（android.*/androidx.*/java.*/appcompat 标准库）时直接标记 system_class

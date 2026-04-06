@@ -81,7 +81,11 @@ def format_attribution_section(attribution_result: str) -> list[str]:
     if found:
         parts = ["## 源码归因结果\n"]
         for r in found:
-            parts.append(f"- {r['class_name']}.{r['method_name']} ({r['dur_ms']:.2f}ms)")
+            type_tag = ""
+            raw_name = r.get("raw_name", "")
+            if raw_name.startswith("SI$block#"):
+                type_tag = " [主线程卡顿]"
+            parts.append(f"- {r['class_name']}.{r['method_name']} ({r['dur_ms']:.2f}ms){type_tag}")
             parts.append(f"  位置: {r.get('file_path', '?')}:{r.get('line_start', '?')}-{r.get('line_end', '?')}")
             if r.get("source_snippet"):
                 parts.append(f"  发现: {r['source_snippet'][:200]}")

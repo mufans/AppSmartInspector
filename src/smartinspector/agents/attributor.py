@@ -19,6 +19,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 from langchain_openai import ChatOpenAI
 
 from smartinspector.config import get_llm_kwargs
+from smartinspector.debug_log import debug_log
 from smartinspector.tools.grep import grep
 from smartinspector.tools.glob import glob
 from smartinspector.tools.read import read
@@ -50,6 +51,7 @@ _TOOLS = {
 _llm_with_tools = None
 _system_prompt = None
 _structured_llm = None
+_structured_ok: bool | None = None  # None = not tested yet
 _llm_lock = threading.Lock()
 
 
@@ -104,8 +106,26 @@ def _get_llm():
             return _llm_with_tools, _system_prompt
         llm = ChatOpenAI(**get_llm_kwargs(role="attributor", temperature=0))
         _llm_with_tools = llm.bind_tools([grep, glob, read])
+        # Test structured output support — some providers (e.g. DeepSeek) don't
+        # support response_format, so we probe once and cache the result.
         _structured_llm = llm.with_structured_output(AttributionResponse)
         _system_prompt = load_prompt("attributor")
+        # Probe structured output support with a realistic multi-turn request.
+        # A trivial "test" message can succeed on some providers that then fail
+        # on real multi-turn tool-call conversations (e.g. DeepSeek returns
+        # "This response_format type is unavailable now" intermittently).
+        global _structured_ok
+        try:
+            probe_messages = [
+                SystemMessage(content=_system_prompt),
+                HumanMessage(content="1. TestClass.testMethod (10.00ms, java)\n\n按 Glob→Grep→Read 搜索，输出 RESULT 行。"),
+                AIMessage(content="RESULT: TestClass.testMethod | found | /tmp/Test.java | 1-5 | test"),
+            ]
+            _structured_llm.invoke(probe_messages)
+            _structured_ok = True
+        except Exception as e:
+            _structured_ok = False
+            debug_log("attributor", f"structured output not supported ({e}), will use text parsing fallback")
     return _llm_with_tools, _system_prompt
 
 
@@ -162,6 +182,7 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
         group: List of issues sharing the same target file/class.
         file_cache: Shared LRU cache for glob/read results across groups.
     """
+    global _structured_ok
     results: list[dict] = []
 
     # Base result template for each issue
@@ -273,15 +294,18 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
             if content:
                 all_text += "\n" + content
 
+        debug_log("attributor", f"group prompt: {prompt[:300]}")
+        debug_log("attributor", f"all_text (last 1500 chars): {all_text[-1500:]}")
+
         # Try structured output first, fall back to text parsing
         structured_ok = False
-        if _structured_llm is not None and all_text:
+        if _structured_ok and _structured_llm is not None and all_text:
             try:
                 structured = _structured_llm.invoke(messages)
+                debug_log("attributor", f"structured results: {[sr.model_dump() for sr in structured.results]}")
                 for sr in structured.results:
                     for r in results:
-                        key = f"{r['class_name']}.{r['method_name']}"
-                        if key == sr.class_method:
+                        if _match_result(r, sr.class_method):
                             if sr.status == "found":
                                 r.update({
                                     "attributable": True,
@@ -295,8 +319,11 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
                                 r["reason"] = "system_class"
                             break
                 structured_ok = True
-            except Exception:
-                pass
+            except Exception as e:
+                debug_log("attributor", f"structured output failed: {e}")
+                # Permanently disable structured output after first failure
+                # to avoid repeated errors across groups
+                _structured_ok = False
 
         if not structured_ok and all_text:
             _parse_agent_response(all_text, results)
@@ -336,6 +363,9 @@ def _build_group_prompt(group: list[dict]) -> str:
         # Append BlockMonitor stack trace if available
         if issue.get("stack_trace"):
             line += f", 堆栈:{issue['stack_trace'][0]}"
+        # Hint for XML layout files — search .xml directly, not .java/.kt
+        if search_type == "xml":
+            line += f", xml布局:Glob **/{cn}.xml → Read完整文件, RESULT行请用: {cn}.{issue['method_name']}"
         line += ")"
         lines.append(line)
 
@@ -348,6 +378,46 @@ def _build_group_prompt(group: list[dict]) -> str:
     lines.append("\n按 Glob→Grep→Read 搜索，输出 RESULT 行。")
 
     return "\n".join(lines)
+
+
+def _match_result(result: dict, class_method: str) -> bool:
+    """Check if a LLM-returned class_method string matches a result entry.
+
+    Handles edge cases:
+      - method_name is "unknown"/empty -> match by class_name only
+      - inner classes ($ in class_name) -> match outer class name
+      - LLM uses partial class name -> match by method name suffix
+    """
+    r_cls = result["class_name"]
+    r_mtd = result["method_name"]
+
+    # Exact match: "ClassName.method"
+    if f"{r_cls}.{r_mtd}" == class_method:
+        return True
+
+    # method_name is unknown/empty: LLM may return "ClassName" or "ClassName.run"
+    if r_mtd in ("unknown", ""):
+        if class_method == r_cls or class_method.startswith(r_cls + "."):
+            return True
+        # Inner class: LLM may use outer class name
+        if "$" in r_cls:
+            outer = r_cls.split("$")[0]
+            if class_method == outer or class_method.startswith(outer + "."):
+                return True
+
+    # Inner class fallback: LLM may output "OuterClass.method"
+    if "$" in r_cls and class_method == f"{r_cls.split('$')[0]}.{r_mtd}":
+        return True
+
+    # LLM returned just the class_name without method (e.g. "item_complex")
+    if class_method == r_cls:
+        return True
+
+    # Method name match: LLM may use partial class name
+    if r_mtd and r_mtd not in ("unknown", "") and r_mtd in class_method and class_method.endswith(r_mtd):
+        return True
+
+    return False
 
 
 def _parse_agent_response(response_text: str, results: list[dict]) -> None:
@@ -370,19 +440,8 @@ def _parse_agent_response(response_text: str, results: list[dict]) -> None:
         finding = parts[4].strip() if len(parts) > 4 else ""
 
         # Match to the corresponding result
-        matched = False
         for r in results:
-            key = f"{r['class_name']}.{r['method_name']}"
-            if key == class_method:
-                matched = True
-            # Fallback 1: inner class — LLM may output "OuterClass.method"
-            # while result has "OuterClass$Inner.method"
-            elif "$" in r["class_name"] and class_method == f"{r['class_name'].split('$')[0]}.{r['method_name']}":
-                matched = True
-            # Fallback 2: method name match — LLM may output partial class name
-            elif r["method_name"] and r["method_name"] in class_method and class_method.endswith(r["method_name"]):
-                matched = True
-            if not matched:
+            if not _match_result(r, class_method):
                 continue
 
             if status == "found":
