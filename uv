@@ -1,0 +1,26 @@
+Traceback (most recent call last):
+  File "/Users/liujun/langchainProjects/smartinspector/.venv/bin/smartinspector", line 4, in <module>
+Traceback (most recent call last):
+  File "/Users/liujun/langchainProjects/smartinspector/.venv/bin/smartinspector", line 4, in <module>
+    from smartinspector.cli import main
+  File "/Users/liujun/langchainProjects/smartinspector/src/smartinspector/cli.py", line 3, in <module>
+    from smartinspector.graph import main
+  File "/Users/liujun/langchainProjects/smartinspector/src/smartinspector/graph/__init__.py", line 9, in <module>
+    from smartinspector.graph.builder import create_graph
+  File "/Users/liujun/langchainProjects/smartinspector/src/smartinspector/graph/builder.py", line 16, in <module>
+    from smartinspector.graph.nodes.collector import collector_node
+  File "/Users/liujun/langchainProjects/smartinspector/src/smartinspector/graph/nodes/collector.py", line 127
+    print("  [collector] No app connected, waiting for app to connect...", flush=True)
+    ^^^^^
+    from smartinspector.cli import main
+  File "/Users/liujun/langchainProjects/smartinspector/src/smartinspector/cli.py", line 3, in <module>
+    from smartinspector.graph import main
+  File "/Users/liujun/langchainProjects/smartinspector/src/smartinspector/graph/__init__.py", line 9, in <module>
+    from smartinspector.graph.builder import create_graph
+  File "/Users/liujun/langchainProjects/smartinspector/src/smartinspector/graph/builder.py", line 16, in <module>
+    from smartinspector.graph.nodes.collector import collector_node
+  File "/Users/liujun/langchainProjects/smartinspector/src/smartinspector/graph/nodes/collector.py", line 127
+    print("  [collector] No app connected, waiting for app to connect...", flush=True)
+    ^^^^^
+IndentationError: expected an indented block after 'if' statement on line 126
+IndentationError: expected an indented block after 'if' statement on line 126
