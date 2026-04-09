@@ -88,6 +88,7 @@ def grep(
     pattern: str,
     path: str = "",
     include: str | None = None,
+    type: str | None = None,
     output_mode: str = "content",
     head_limit: int = DEFAULT_HEAD_LIMIT,
     offset: int = 0,
@@ -101,6 +102,7 @@ def grep(
         pattern: The regex pattern to search for, e.g. "LazyForEach", "class\\s+\\w+".
         path: The directory to search in. Defaults to source_dir from config.
         include: File glob to filter, e.g. "*.ets" or "*.{ts,tsx}".
+        type: File type to search, e.g. "js", "py", "rust", "java", "kotlin". Uses ripgrep's built-in type mappings.
         output_mode: "content" (default, show matched lines), "files_with_matches" (file list), or "count" (match counts per file).
         head_limit: Max number of results to return. Default 250. Use 0 for unlimited.
         offset: Skip first N results before applying head_limit. Default 0.
@@ -137,6 +139,9 @@ def grep(
 
     if include:
         args.extend(["--glob", include])
+
+    if type:
+        args.extend(["--type", type])
 
     if context > 0:
         args.extend(["-C", str(context)])
