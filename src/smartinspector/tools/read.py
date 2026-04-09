@@ -4,11 +4,18 @@ import os
 from functools import lru_cache
 from langchain_core.tools import tool
 
-from smartinspector.config import get_read_max_lines, get_read_max_bytes, get_read_max_line_length
+from smartinspector.config import get_read_max_lines, get_read_max_line_length
 
 MAX_LINES = get_read_max_lines()
 MAX_LINE_LENGTH = get_read_max_line_length()
-MAX_BYTES = get_read_max_bytes()
+MAX_OUTPUT_TOKENS = 8000
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimation: ~4 chars per token for English, ~1.5 chars for CJK."""
+    cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    ascii_chars = len(text) - cjk
+    return int(ascii_chars / 4 + cjk / 1.5)
 
 
 def _file_mtime(file_path: str) -> float:
@@ -52,7 +59,7 @@ def _read_file_content(file_path: str, offset: int, limit: int, _mtime: float) -
         pass
 
     raw: list[str] = []
-    bytes_read = 0
+    tokens_used = 0
     truncated = False
     total_lines = 0
 
@@ -66,12 +73,12 @@ def _read_file_content(file_path: str, offset: int, limit: int, _mtime: float) -
                 continue
             if len(line_text) > MAX_LINE_LENGTH:
                 line_text = line_text[:MAX_LINE_LENGTH] + f"... (truncated to {MAX_LINE_LENGTH} chars)\n"
-            line_bytes = len(line_text.encode("utf-8"))
-            if bytes_read + line_bytes > MAX_BYTES:
+            line_tokens = _estimate_tokens(line_text)
+            if tokens_used + line_tokens > MAX_OUTPUT_TOKENS:
                 truncated = True
                 break
             raw.append(line_text.rstrip("\n\r"))
-            bytes_read += line_bytes
+            tokens_used += line_tokens
 
     if total_lines < offset and not (total_lines == 0 and offset == 1):
         return f"Offset {offset} exceeds file length ({total_lines} lines)."
