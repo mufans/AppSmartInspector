@@ -11,9 +11,17 @@ MAX_LINE_LENGTH = get_read_max_line_length()
 MAX_BYTES = get_read_max_bytes()
 
 
+def _file_mtime(file_path: str) -> float:
+    """Get file modification time for cache invalidation."""
+    try:
+        return os.path.getmtime(file_path)
+    except OSError:
+        return 0.0
+
+
 @lru_cache(maxsize=64)
-def _read_file_content(file_path: str, offset: int, limit: int) -> str:
-    """Cached file reading. Separated from @tool to allow lru_cache."""
+def _read_file_content(file_path: str, offset: int, limit: int, _mtime: float) -> str:
+    """Cached file reading. Includes mtime in cache key to prevent stale data."""
     if not os.path.exists(file_path):
         # try to suggest similar files
         parent = os.path.dirname(file_path)
@@ -94,4 +102,5 @@ def read(file_path: str, offset: int = 1, limit: int = 2000) -> str:
         offset: Line number to start reading from (1-indexed). Defaults to 1.
         limit: Maximum number of lines to read. Defaults to 2000.
     """
-    return _read_file_content(file_path, offset, limit)
+    mtime = _file_mtime(file_path)
+    return _read_file_content(file_path, offset, limit, mtime)

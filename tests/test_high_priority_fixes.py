@@ -97,15 +97,16 @@ class TestHookInputValidation:
 
 class TestReadCache:
     def test_cache_hit(self):
-        from smartinspector.tools.read import _read_file_content, read
+        from smartinspector.tools.read import _read_file_content, _file_mtime
         # Create a temp file
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write("line1\nline2\nline3\n")
             tmp = f.name
 
         try:
-            result1 = _read_file_content(tmp, 1, 10)
-            result2 = _read_file_content(tmp, 1, 10)
+            mtime = _file_mtime(tmp)
+            result1 = _read_file_content(tmp, 1, 10, mtime)
+            result2 = _read_file_content(tmp, 1, 10, mtime)
             assert result1 == result2
             # Verify cache info
             info = _read_file_content.cache_info()
@@ -113,21 +114,48 @@ class TestReadCache:
         finally:
             os.unlink(tmp)
 
+    def test_cache_invalidation_on_mtime_change(self):
+        """Cache should return fresh data when file mtime changes."""
+        import time
+        from smartinspector.tools.read import _read_file_content, _file_mtime
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("original\n")
+            tmp = f.name
+
+        try:
+            mtime1 = _file_mtime(tmp)
+            result1 = _read_file_content(tmp, 1, 10, mtime1)
+            assert "original" in result1
+
+            # Modify file and ensure mtime changes
+            time.sleep(0.05)
+            with open(tmp, "w") as f:
+                f.write("modified\n")
+            mtime2 = _file_mtime(tmp)
+            assert mtime2 != mtime1
+            result2 = _read_file_content(tmp, 1, 10, mtime2)
+            assert "modified" in result2
+            assert "original" not in result2
+        finally:
+            os.unlink(tmp)
+
     def test_read_file_content(self):
-        from smartinspector.tools.read import _read_file_content
+        from smartinspector.tools.read import _read_file_content, _file_mtime
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write("hello world\n")
             tmp = f.name
 
         try:
-            result = _read_file_content(tmp, 1, 10)
+            mtime = _file_mtime(tmp)
+            result = _read_file_content(tmp, 1, 10, mtime)
             assert "hello world" in result
         finally:
             os.unlink(tmp)
 
     def test_read_nonexistent_file(self):
-        from smartinspector.tools.read import _read_file_content
-        result = _read_file_content("/nonexistent/path/file.txt", 1, 10)
+        from smartinspector.tools.read import _read_file_content, _file_mtime
+        mtime = _file_mtime("/nonexistent/path/file.txt")
+        result = _read_file_content("/nonexistent/path/file.txt", 1, 10, mtime)
         assert "not found" in result.lower()
 
 
