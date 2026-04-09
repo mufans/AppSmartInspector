@@ -171,6 +171,13 @@ def grep(
     except RipgrepTimeoutError:
         return f"Error: search timed out. Try a more specific pattern or narrower path."
 
+    # EAGAIN / resource exhaustion retry: fall back to single-threaded
+    if result.returncode == 2 and result.stderr and "EAGAIN" in result.stderr:
+        try:
+            result = run_rg(args + ["-j", "1"])
+        except RipgrepTimeoutError:
+            return f"Error: search timed out. Try a more specific pattern or narrower path."
+
     if result.returncode == 1:
         return "No matches found."
     if result.returncode == 2 and not result.stdout.strip():
