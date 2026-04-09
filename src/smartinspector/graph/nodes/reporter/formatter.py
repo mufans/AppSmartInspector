@@ -85,7 +85,16 @@ def format_attribution_section(attribution_result: str) -> list[str]:
             raw_name = r.get("raw_name", "")
             if raw_name.startswith("SI$block#"):
                 type_tag = " [主线程卡顿]"
-            parts.append(f"- {r['class_name']}.{r['method_name']} ({r['dur_ms']:.2f}ms){type_tag}")
+            elif r.get("method_name") == "inflate":
+                type_tag = " [XML布局]"
+                if r.get("count", 0) > 1:
+                    type_tag += f" 调用{r['count']}次"
+                    if r.get("total_ms"):
+                        type_tag += f" 累计{r['total_ms']:.1f}ms"
+            display_method = r['method_name']
+            if r.get("context_method"):
+                display_method = f"{r['context_method']}${display_method}"
+            parts.append(f"- {r['class_name']}.{display_method} ({r['dur_ms']:.2f}ms){type_tag}")
             parts.append(f"  位置: {r.get('file_path', '?')}:{r.get('line_start', '?')}-{r.get('line_end', '?')}")
             if r.get("source_snippet"):
                 parts.append(f"  发现: {r['source_snippet'][:200]}")

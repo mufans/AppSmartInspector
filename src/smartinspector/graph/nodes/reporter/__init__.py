@@ -26,7 +26,14 @@ def reporter_node(state: AgentState) -> dict:
     attribution_result = state.get("attribution_result", "")
 
     # Build user content with all available data
+    # IMPORTANT: attribution section MUST come first (before header/analysis)
+    # to avoid being truncated when total content exceeds token budget.
+    # Attribution data is the core input for problem generation;
+    # header is reference data that can survive partial truncation.
     user_parts: list[str] = []
+
+    # Attribution first — highest priority, must not be truncated
+    user_parts.extend(format_attribution_section(attribution_result))
 
     if perf_json:
         user_parts.extend(format_perf_sections(perf_json))
@@ -36,13 +43,11 @@ def reporter_node(state: AgentState) -> dict:
         print(f"  [reporter] trace_path from state: '{trace_path}'", flush=True)
 
         header_md = _build_report_header(perf_json, trace_path)
-        # Insert header right after hints, before other sections
-        user_parts.insert(1 if len(user_parts) > 1 else 0, header_md)
+        # Insert header after attribution and perf sections
+        user_parts.append(header_md)
 
     if perf_analysis:
         user_parts.append(f"## 性能分析\n{perf_analysis}")
-
-    user_parts.extend(format_attribution_section(attribution_result))
 
     if not user_parts:
         return {
@@ -64,10 +69,13 @@ def reporter_node(state: AgentState) -> dict:
     # Token estimation and truncation (CJK: 1 token ≈ 1.5 chars)
     MAX_REPORT_INPUT_TOKENS = get_report_max_tokens()
     estimated_tokens = len(user_content) / 1.5
+    debug_log("reporter", f"user_content: {len(user_content)} chars, ~{estimated_tokens:.0f} tokens, max={MAX_REPORT_INPUT_TOKENS}")
     if estimated_tokens > MAX_REPORT_INPUT_TOKENS:
         target_chars = int(MAX_REPORT_INPUT_TOKENS * 1.5)
         if len(user_content) > target_chars:
+            debug_log("reporter", f"TRUNCATING user_content from {len(user_content)} to {target_chars} chars")
             user_content = user_content[:target_chars] + "\n\n[... 数据过长已截断 ...]"
+    debug_log("reporter", f"attribution section: {user_content[-1500:] if len(user_content) > 1500 else user_content}")
     full_content = generate_report(report_prompt, user_content)
     debug_log("reporter", f"LLM output ({len(full_content)} chars): {full_content[:2000]}")
     debug_log("reporter", f"attribution_result JSON: {attribution_result}")
