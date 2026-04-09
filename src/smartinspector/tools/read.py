@@ -49,6 +49,11 @@ def _read_file_content(file_path: str, offset: int, limit: int, _mtime: float) -
         output = "\n".join(dirs + files)
         return f"{file_path}/\n{output}"
 
+    # Block special files (device files, pipes, sockets) to prevent infinite reads
+    BLOCKED_DEVICE_PATHS = {"/dev/zero", "/dev/random", "/dev/urandom", "/dev/null", "/dev/full", "/dev/stdin"}
+    if file_path in BLOCKED_DEVICE_PATHS or not os.path.isfile(file_path):
+        return f"Cannot read special file: {file_path}"
+
     # detect binary file
     try:
         with open(file_path, "rb") as f:
