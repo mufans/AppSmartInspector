@@ -205,6 +205,8 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
             result["count"] = issue["count"]
         if issue.get("total_ms"):
             result["total_ms"] = issue["total_ms"]
+        if issue.get("context_method"):
+            result["context_method"] = issue["context_method"]
         results.append(result)
 
     # Build prompt for the agent

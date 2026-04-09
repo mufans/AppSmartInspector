@@ -6,6 +6,7 @@ output with relative paths and automatic VCS exclusion.
 """
 
 import os
+import tempfile
 from langchain_core.tools import tool
 
 from smartinspector.tools.rg import find_rg, run_rg, RipgrepTimeoutError
@@ -16,8 +17,23 @@ from smartinspector.tools.path_utils import validate_search_path
 
 DEFAULT_HEAD_LIMIT = 250
 MAX_RESULT_SIZE = 20_000  # chars
+PERSIST_THRESHOLD = 20_000  # persist to file above this size
 
 VCS_DIRS = [".git", ".svn", ".hg", ".bzr", ".jj", ".sl"]
+
+
+def _maybe_persist_result(output: str) -> str:
+    """Persist large results to a temp file and return a reference."""
+    if len(output) <= PERSIST_THRESHOLD:
+        return output
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", prefix="grep_results_", delete=False
+    ) as f:
+        f.write(output)
+        return (
+            f"[Results persisted to {f.name} ({len(output)} chars). "
+            f"Use read tool to access the full output.]"
+        )
 
 
 def _apply_head_limit(
@@ -88,6 +104,7 @@ def grep(
     pattern: str,
     path: str = "",
     include: str | None = None,
+    type: str | None = None,
     output_mode: str = "content",
     head_limit: int = DEFAULT_HEAD_LIMIT,
     offset: int = 0,
@@ -101,6 +118,7 @@ def grep(
         pattern: The regex pattern to search for, e.g. "LazyForEach", "class\\s+\\w+".
         path: The directory to search in. Defaults to source_dir from config.
         include: File glob to filter, e.g. "*.ets" or "*.{ts,tsx}".
+        type: File type to search, e.g. "js", "py", "rust", "java", "kotlin". Uses ripgrep's built-in type mappings.
         output_mode: "content" (default, show matched lines), "files_with_matches" (file list), or "count" (match counts per file).
         head_limit: Max number of results to return. Default 250. Use 0 for unlimited.
         offset: Skip first N results before applying head_limit. Default 0.
@@ -138,6 +156,9 @@ def grep(
     if include:
         args.extend(["--glob", include])
 
+    if type:
+        args.extend(["--type", type])
+
     if context > 0:
         args.extend(["-C", str(context)])
 
@@ -149,6 +170,13 @@ def grep(
         result = run_rg(args)
     except RipgrepTimeoutError:
         return f"Error: search timed out. Try a more specific pattern or narrower path."
+
+    # EAGAIN / resource exhaustion retry: fall back to single-threaded
+    if result.returncode == 2 and result.stderr and "EAGAIN" in result.stderr:
+        try:
+            result = run_rg(args + ["-j", "1"])
+        except RipgrepTimeoutError:
+            return f"Error: search timed out. Try a more specific pattern or narrower path."
 
     if result.returncode == 1:
         return "No matches found."
@@ -178,7 +206,7 @@ def grep(
         if applied_limit is not None:
             output += f"\n\n[Showing results with pagination = limit: {applied_limit}, offset: {offset}]"
 
-        return output[:MAX_RESULT_SIZE]
+        return _maybe_persist_result(output)
 
     if output_mode == "count":
         lines = [l for l in raw.split("\n") if l.strip()]
@@ -205,7 +233,7 @@ def grep(
             footer += f" with pagination = limit: {applied_limit}"
         output += footer
 
-        return output[:MAX_RESULT_SIZE]
+        return _maybe_persist_result(output)
 
     # ── content mode (default) ───────────────────────────────
     matches = _parse_content_lines(raw)
@@ -242,4 +270,4 @@ def grep(
     if applied_limit is not None:
         output += f"\n\n[Showing results with pagination = limit: {applied_limit}, offset: {offset}]"
 
-    return output[:MAX_RESULT_SIZE]
+    return _maybe_persist_result(output)

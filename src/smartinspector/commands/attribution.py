@@ -1,6 +1,11 @@
 """Source code attribution: extract SI$ slices from perf_summary for explorer."""
 
 import json
+import re
+
+
+# Matches trailing $number (anonymous inner class index), e.g. $1, $2
+_ANON_SUFFIX = re.compile(r'\$(\d+)$')
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +37,74 @@ def _split_fqn_method(body: str) -> tuple[str, str]:
     return "", body
 
 
+def _extract_method_from_anonymous(fqn: str) -> str:
+    """Extract context method name from an anonymous inner class FQN.
+
+    JVM anonymous inner class naming (compiled Java/Kotlin):
+    - OuterClass$1 → anonymous inner class, no method context
+    - OuterClass$MethodName$1 → Kotlin method-scoped anonymous class
+    - OuterClass$Inner$1 → named inner class Inner's anonymous, no method context
+    - OuterClass$MethodName$1$2 → multi-level anonymous, MethodName is the method
+    - OuterClass$$inlined$lambda$0 → Kotlin inlined lambda, no method context
+
+    Heuristic: the segment immediately before the trailing $number is the
+    method name if it starts with a lowercase letter (Java/Kotlin convention)
+    and is not a Kotlin compiler artifact.
+    """
+    m = _ANON_SUFFIX.search(fqn)
+    if not m:
+        return ""
+    prefix = fqn[:m.start()]
+    # Need at least one $ in prefix to have a segment before the trailing $N
+    # (e.g. OuterClass$Method$1 has prefix "OuterClass$Method")
+    if "$" not in prefix:
+        return ""
+    # Take the segment between the last two $ signs
+    last_seg = prefix.rsplit("$", 1)[-1]
+    # Method names start with lowercase in Java/Kotlin
+    if not last_seg or not last_seg[0].islower():
+        return ""
+    # Filter out Kotlin compiler artifacts
+    if last_seg == "lambda":
+        return ""
+    # Segments containing "$" are compiler-generated, not user method names
+    if "$" in last_seg:
+        return ""
+    # Check if the segment is preceded by "lambda$" in the original prefix
+    # (e.g. Outer$lambda$click$1 → "click" is part of a lambda descriptor)
+    if "$lambda$" in prefix:
+        # The last_seg after $lambda$ is a lambda descriptor, not a method name
+        lambda_idx = prefix.rfind("$lambda$")
+        if lambda_idx >= 0 and prefix[lambda_idx + 8:].startswith(last_seg):
+            return ""
+    return last_seg
+
+
+def _extract_method_from_stack(stack_trace: list[str]) -> str:
+    """Extract the actual method name from the first stack frame.
+
+    Stack frame format: "at com.example.Class$Inner.method(File.kt:42)"
+    Returns the method name (e.g. "method") or empty string.
+    """
+    if not stack_trace:
+        return ""
+    frame = stack_trace[0]
+    # Pattern: "at ...ClassName.method(File:line)"
+    # Find the last "." before "(" that contains the method name
+    paren = frame.rfind("(")
+    if paren < 0:
+        return ""
+    before_paren = frame[:paren]
+    dot = before_paren.rfind(".")
+    if dot < 0:
+        return ""
+    method = before_paren[dot + 1:]
+    # Filter out non-method segments (class names with $, file paths, etc.)
+    if "." in method or "/" in method:
+        return ""
+    return method
+
+
 def extract_class(name: str) -> str:
     """Extract simple class name from an SI$ tag.
 
@@ -58,7 +131,11 @@ def extract_class(name: str) -> str:
         if hash_idx >= 0 and rest[hash_idx:].endswith("ms"):
             rest = rest[:hash_idx]
         fqn, _ = _split_fqn_method(rest)
-        return fqn.rsplit(".", 1)[-1] if fqn else rest
+        simple = fqn.rsplit(".", 1)[-1] if fqn else rest
+        # Anonymous inner class: take outer class name before $ for Glob search
+        if "$" in simple:
+            simple = simple.split("$")[0]
+        return simple
 
     if body.startswith("RV#"):
         # SI$RV#viewId#com.example.Adapter.method
@@ -263,7 +340,9 @@ def extract_method(name: str) -> str:
         hash_idx = rest.rfind("#")
         if hash_idx >= 0 and rest[hash_idx:].endswith("ms"):
             rest = rest[:hash_idx]
-        _, method = _split_fqn_method(rest)
+        fqn, method = _split_fqn_method(rest)
+        if not method and "$" in fqn:
+            method = _extract_method_from_anonymous(fqn)
         return method if method else "unknown"
 
     if body.startswith("RV#"):
@@ -402,7 +481,37 @@ def _attach_block_stacks(attributable: list[dict], block_events: list[dict]) -> 
         method_name = extract_method(raw_name)
         dur_ms = block.get("dur_ms", 0)
         stack = block.get("stack_trace", [])
+
+        # For anonymous inner classes, the actual method (e.g. "run") is
+        # in the stack trace, not in the class name.  Use it as the primary
+        # method name and store the context method (e.g. "startMainThreadWork")
+        # for search hints.
+        context_method = ""
+        if "$" in raw_name and stack:
+            stack_method = _extract_method_from_stack(stack)
+            if stack_method and stack_method != method_name:
+                context_method = method_name
+                method_name = stack_method
+
         key = f"{class_name}.{method_name}"
+
+        # When stack trace reveals the actual method differs from the
+        # class-name-derived method (anonymous inner class), try to
+        # update the original entry in-place so we don't create a duplicate.
+        if context_method:
+            orig_key = f"{class_name}.{context_method}"
+            if orig_key in attr_lookup:
+                orig = attr_lookup[orig_key]
+                orig["method_name"] = method_name
+                orig["context_method"] = context_method
+                if stack and not orig.get("stack_trace"):
+                    orig["stack_trace"] = stack
+                if dur_ms > orig.get("dur_ms", 0):
+                    orig["dur_ms"] = dur_ms
+                # Re-index under the new key
+                del attr_lookup[orig_key]
+                attr_lookup[key] = orig
+                continue
 
         if key in attr_lookup:
             # Existing hook slice — attach stack and update dur_ms if block has real duration
@@ -412,6 +521,8 @@ def _attach_block_stacks(attributable: list[dict], block_events: list[dict]) -> 
                 existing["stack_trace"] = stack
             if dur_ms > existing.get("dur_ms", 0):
                 existing["dur_ms"] = dur_ms
+            if context_method and not existing.get("context_method"):
+                existing["context_method"] = context_method
             # If the matched entry is itself a system class, mark it and skip
             if _is_block_system_class(raw_name):
                 existing["_system"] = True
@@ -432,6 +543,8 @@ def _attach_block_stacks(attributable: list[dict], block_events: list[dict]) -> 
                 "stack_trace": stack,
                 "instance": None,
             }
+            if context_method:
+                entry["context_method"] = context_method
             attributable.append(entry)
             attr_lookup[key] = entry
 
@@ -655,6 +768,11 @@ def build_attribution_prompt(attributable: list[dict]) -> str:
             lines.append(f"   - 堆栈采样 (BlockMonitor):")
             for frame in s["stack_trace"][:12]:
                 lines.append(f"     {frame}")
+        if "$" in s['class_name']:
+            outer_class = s['class_name'].split("$")[0]
+            lines.append(f"   - 匿名/内部类，请搜索外层类 {outer_class} 的源码")
+        if s.get("context_method"):
+            lines.append(f"   - 匿名类定义在方法 {s['context_method']} 中，耗时操作在 {s['method_name']} 方法体内")
         lines.append(f"   - 搜索类型: {s.get('search_type', 'java')}")
         lines.append(f"   - 原始tag: {s['raw_name']}")
         lines.append("")
