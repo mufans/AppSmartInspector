@@ -6,6 +6,7 @@ output with relative paths and automatic VCS exclusion.
 """
 
 import os
+import tempfile
 from langchain_core.tools import tool
 
 from smartinspector.tools.rg import find_rg, run_rg, RipgrepTimeoutError
@@ -16,8 +17,23 @@ from smartinspector.tools.path_utils import validate_search_path
 
 DEFAULT_HEAD_LIMIT = 250
 MAX_RESULT_SIZE = 20_000  # chars
+PERSIST_THRESHOLD = 20_000  # persist to file above this size
 
 VCS_DIRS = [".git", ".svn", ".hg", ".bzr", ".jj", ".sl"]
+
+
+def _maybe_persist_result(output: str) -> str:
+    """Persist large results to a temp file and return a reference."""
+    if len(output) <= PERSIST_THRESHOLD:
+        return output
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", prefix="grep_results_", delete=False
+    ) as f:
+        f.write(output)
+        return (
+            f"[Results persisted to {f.name} ({len(output)} chars). "
+            f"Use read tool to access the full output.]"
+        )
 
 
 def _apply_head_limit(
@@ -183,7 +199,7 @@ def grep(
         if applied_limit is not None:
             output += f"\n\n[Showing results with pagination = limit: {applied_limit}, offset: {offset}]"
 
-        return output[:MAX_RESULT_SIZE]
+        return _maybe_persist_result(output)
 
     if output_mode == "count":
         lines = [l for l in raw.split("\n") if l.strip()]
@@ -210,7 +226,7 @@ def grep(
             footer += f" with pagination = limit: {applied_limit}"
         output += footer
 
-        return output[:MAX_RESULT_SIZE]
+        return _maybe_persist_result(output)
 
     # ── content mode (default) ───────────────────────────────
     matches = _parse_content_lines(raw)
@@ -247,4 +263,4 @@ def grep(
     if applied_limit is not None:
         output += f"\n\n[Showing results with pagination = limit: {applied_limit}, offset: {offset}]"
 
-    return output[:MAX_RESULT_SIZE]
+    return _maybe_persist_result(output)
