@@ -63,7 +63,7 @@ def _read_file_content(file_path: str, offset: int, limit: int, _mtime: float) -
     truncated = False
     total_lines = 0
 
-    with open(file_path, encoding="utf-8", errors="replace") as f:
+    with open(file_path, encoding="utf-8-sig", errors="replace") as f:
         for line_text in f:
             total_lines += 1
             if total_lines < offset:
@@ -71,13 +71,15 @@ def _read_file_content(file_path: str, offset: int, limit: int, _mtime: float) -
             if len(raw) >= limit:
                 truncated = True
                 continue
+            # Normalize CRLF to LF
+            line_text = line_text.replace("\r\n", "\n").replace("\r", "\n")
             if len(line_text) > MAX_LINE_LENGTH:
                 line_text = line_text[:MAX_LINE_LENGTH] + f"... (truncated to {MAX_LINE_LENGTH} chars)\n"
             line_tokens = _estimate_tokens(line_text)
             if tokens_used + line_tokens > MAX_OUTPUT_TOKENS:
                 truncated = True
                 break
-            raw.append(line_text.rstrip("\n\r"))
+            raw.append(line_text.rstrip("\n"))
             tokens_used += line_tokens
 
     if total_lines < offset and not (total_lines == 0 and offset == 1):
