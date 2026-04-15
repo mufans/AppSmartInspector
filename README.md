@@ -29,10 +29,15 @@ cp .env.example .env
 # 启动 CLI（自动检查 adb/API key，启动 WS server + adb reverse）
 uv run smartinspector --source-dir /path/to/your/app/source
 
+# adb连接手机
+
 # 交互式使用（支持 Tab 补全 slash 命令）
-you> 全面分析列表滑动性能
-you> 采集一个 10s trace 分析卡顿
-you> 搜索源码中 LazyForEach 的用法
+# 自然语言开启采集和分析
+you> 分析冷启动耗时
+# 指令开启采集分析
+you> /full
+# 打开perfetto ui 
+you> /open
 ```
 
 ## 架构概览
@@ -62,9 +67,7 @@ collector (设备 trace 采集) → analyzer (LLM 性能解读) → attributor (
   → 结果回传 Perfetto UI 展示（实时进度 + Markdown 报告）
 ```
 
-<p align="center">
-  <img src="img/perfetto_ui.png" width="800" alt="Perfetto UI 交互帧分析">
-</p>
+
 
 使用 `/open` 启动自托管 Perfetto UI 后，在时间轴上拖选一段范围，点击右侧 **SI Frame Analysis** 面板中的 **Analyze with SI Agent** 按钮。分析过程中实时显示查询进度、源码归因工具调用（Glob/Grep/Read）和 LLM 分析状态，最终在面板中展示 Markdown 格式的帧分析报告。
 
@@ -86,6 +89,7 @@ collector (设备 trace 采集) → analyzer (LLM 性能解读) → attributor (
 ```
 
 构建脚本会自动完成以下步骤：
+
 1. Clone Perfetto 仓库（shallow clone）到 `perfetto-build/`
 2. 复制 SI Bridge 插件到 Perfetto 插件目录
 3. 在 `default_plugins.ts` 中注册插件
@@ -110,11 +114,13 @@ REPL 主循环 ─── 全局 try/except，异常后保留 state 继续输入
 
 ## 平台支持
 
-| 平台 | 状态 | Trace 采集 | 方法 Hook | 源码归因 |
-|------|------|-----------|----------|---------|
-| Android | **已实现** | Perfetto + adb | Pine AOP | 支持 |
-| HarmonyOS | 规划中 | hdc + hiperf/hitrace | — | — |
-| iOS | 规划中 | Instruments + Xcode | — | — |
+
+| 平台        | 状态      | Trace 采集             | 方法 Hook  | 源码归因 |
+| --------- | ------- | -------------------- | -------- | ---- |
+| Android   | **已实现** | Perfetto + adb       | Pine AOP | 支持   |
+| HarmonyOS | 规划中     | hdc + hiperf/hitrace | —        | —    |
+| iOS       | 规划中     | Instruments + Xcode  | —        | —    |
+
 
 ### Android
 
@@ -212,19 +218,21 @@ SDK 通过 Pine AOP 框架 hook 框架方法，用 `SI$` 前缀的 `Trace.beginS
 
 ### Hook 类别
 
-| Hook | 默认 | Tag 格式 | 说明 |
-|------|------|----------|------|
-| Activity Lifecycle | ON | `SI$ActivityClass.onCreate` | Activity 生命周期 |
-| Fragment Lifecycle | ON | `SI$FragmentClass.onCreateView` | Fragment 生命周期 (AndroidX + app) |
-| RV Pipeline | ON | `SI$RV#[viewId]#[Adapter].dispatchLayoutStep2` | RecyclerView 管线 |
-| RV Adapter | ON | `SI$RV#[viewId]#[Adapter].onBindViewHolder` | Adapter 数据绑定 |
-| Layout Inflate | OFF | `SI$inflate#[layout]#[parent]` | 布局加载 |
-| View Traverse | OFF | `SI$view#[ViewClass].measure` | View measure/layout/draw |
-| Handler Dispatch | OFF | `SI$handler#[msgClass]` | Handler 消息分发 |
-| Block Monitor | ON | `SI$block#[MsgClass]#[dur]ms` | 主线程卡顿检测 (≥100ms) |
-| Network IO | OFF | `SI$net#[Class].execute` | OkHttp / HttpURLConnection |
-| Database IO | OFF | `SI$db#[Class].query#[table]` | SQLiteDatabase / Room |
-| Image Load | OFF | `SI$img#[Class].into` | Glide / Coil |
+
+| Hook               | 默认  | Tag 格式                                         | 说明                             |
+| ------------------ | --- | ---------------------------------------------- | ------------------------------ |
+| Activity Lifecycle | ON  | `SI$ActivityClass.onCreate`                    | Activity 生命周期                  |
+| Fragment Lifecycle | ON  | `SI$FragmentClass.onCreateView`                | Fragment 生命周期 (AndroidX + app) |
+| RV Pipeline        | ON  | `SI$RV#[viewId]#[Adapter].dispatchLayoutStep2` | RecyclerView 管线                |
+| RV Adapter         | ON  | `SI$RV#[viewId]#[Adapter].onBindViewHolder`    | Adapter 数据绑定                   |
+| Layout Inflate     | OFF | `SI$inflate#[layout]#[parent]`                 | 布局加载                           |
+| View Traverse      | OFF | `SI$view#[ViewClass].measure`                  | View measure/layout/draw       |
+| Handler Dispatch   | OFF | `SI$handler#[msgClass]`                        | Handler 消息分发                   |
+| Block Monitor      | ON  | `SI$block#[MsgClass]#[dur]ms`                  | 主线程卡顿检测 (≥100ms)               |
+| Network IO         | OFF | `SI$net#[Class].execute`                       | OkHttp / HttpURLConnection     |
+| Database IO        | OFF | `SI$db#[Class].query#[table]`                  | SQLiteDatabase / Room          |
+| Image Load         | OFF | `SI$img#[Class].into`                          | Glide / Coil                   |
+
 
 **IO Hook 说明**：Network/DB/Image hook 在所有线程执行，使用独立前缀 (`SI$net#`/`SI$db#`/`SI$img#`)，Python 端单独收集到 `io_slices`，不污染主线程 `view_slices` 分析。
 
@@ -235,41 +243,44 @@ Trace → SI$ slices → 过滤系统类 → 提取 class+method → Glob→Grep
 ```
 
 归因系统通过两层过滤排除系统/框架代码：
-1. **FQN 包名匹配**：`android.*`、`androidx.*`、`java.*` 等
+
+1. **FQN 包名匹配**：`android.`*、`androidx.*`、`java.*` 等
 2. **短类名模式匹配**：`Choreographer`、`FragmentManager`、`ViewRootImpl` 等（Perfetto atrace 截断 FQN 时）
 
 ## CLI 命令
 
 ### Slash 命令
 
-| 命令 | 说明 |
-|------|------|
-| `/full [--no-wait]` | 全量分析流水线 (采集→分析→归因→报告)。`--no-wait` 跳过等待 App 连接，适用于冷启动耗时分析 |
-| `/trace [duration_ms] [pkg]` | 采集 + 自动分析 Perfetto trace |
-| `/record [duration_ms] [pkg]` | 只采集不分析，返回 .pb 文件路径 |
-| `/analyze [path]` | 分析 trace 文件（无参数时分析上次采集结果） |
-| `/frame ts=X dur=Y` | 分析指定时间范围的帧（ts/dur 为纳秒，CLI 直接分析） |
-| `/open [path]` | 启动 Perfetto UI + Bridge Server，交互式框选帧分析 |
-| `/close` | 关闭 Perfetto UI Bridge Server |
-| `/report [path]` | 生成性能报告（可选输出到文件） |
-| `/config` | 查看当前 hook 配置（通过 WS 从 App 获取） |
-| `/config <json>` | 推送 JSON 配置到 App（如 `{"rv_adapter": false}`） |
-| `/config reset` | 恢复 hook 默认配置 |
-| `/config source_dir <path>` | 设置源码目录（自动持久化） |
-| `/hooks` | 查看所有 hook 点开关状态 |
-| `/hook on <hook_id>` | 开启指定内置 hook 点（如 `layout_inflate`） |
-| `/hook off <hook_id>` | 关闭指定内置 hook 点 |
-| `/hook add <class> <method>` | 添加自定义 hook 点 |
-| `/hook rm <class>` | 删除自定义 hook 点 |
-| `/devices` | 列出已连接 adb 设备 |
-| `/connect <host:port>` | 通过 adb TCP 连接设备 |
-| `/disconnect` | 断开 TCP 设备连接 |
-| `/status` | 查看当前会话状态（WS 连接、perf 数据等） |
-| `/summary` | 查看 perf_summary 摘要 |
-| `/tokens` | 查看 token 使用量 |
-| `/clear` | 清除所有分析状态和对话 |
-| `/debug` | 打开设备端 Hook 调试配置面板 |
-| `/help` | 帮助信息（支持 Tab 补全） |
+
+| 命令                            | 说明                                                       |
+| ----------------------------- | -------------------------------------------------------- |
+| `/full [--no-wait]`           | 全量分析流水线 (采集→分析→归因→报告)。`--no-wait` 跳过等待 App 连接，适用于冷启动耗时分析 |
+| `/trace [duration_ms] [pkg]`  | 采集 + 自动分析 Perfetto trace                                 |
+| `/record [duration_ms] [pkg]` | 只采集不分析，返回 .pb 文件路径                                       |
+| `/analyze [path]`             | 分析 trace 文件（无参数时分析上次采集结果）                                |
+| `/frame ts=X dur=Y`           | 分析指定时间范围的帧（ts/dur 为纳秒，CLI 直接分析）                          |
+| `/open [path]`                | 启动 Perfetto UI + Bridge Server，交互式框选帧分析                  |
+| `/close`                      | 关闭 Perfetto UI Bridge Server                             |
+| `/report [path]`              | 生成性能报告（可选输出到文件）                                          |
+| `/config`                     | 查看当前 hook 配置（通过 WS 从 App 获取）                             |
+| `/config <json>`              | 推送 JSON 配置到 App（如 `{"rv_adapter": false}`）               |
+| `/config reset`               | 恢复 hook 默认配置                                             |
+| `/config source_dir <path>`   | 设置源码目录（自动持久化）                                            |
+| `/hooks`                      | 查看所有 hook 点开关状态                                          |
+| `/hook on <hook_id>`          | 开启指定内置 hook 点（如 `layout_inflate`）                        |
+| `/hook off <hook_id>`         | 关闭指定内置 hook 点                                            |
+| `/hook add <class> <method>`  | 添加自定义 hook 点                                             |
+| `/hook rm <class>`            | 删除自定义 hook 点                                             |
+| `/devices`                    | 列出已连接 adb 设备                                             |
+| `/connect <host:port>`        | 通过 adb TCP 连接设备                                          |
+| `/disconnect`                 | 断开 TCP 设备连接                                              |
+| `/status`                     | 查看当前会话状态（WS 连接、perf 数据等）                                 |
+| `/summary`                    | 查看 perf_summary 摘要                                       |
+| `/tokens`                     | 查看 token 使用量                                             |
+| `/clear`                      | 清除所有分析状态和对话                                              |
+| `/debug`                      | 打开设备端 Hook 调试配置面板                                        |
+| `/help`                       | 帮助信息（支持 Tab 补全）                                          |
+
 
 ### 自然语言路由
 
@@ -285,60 +296,125 @@ Orchestrator 通过 LLM 分类将用户请求路由到对应 Agent：
 
 全量分析流水线（`/full`、`/full --no-wait` 或自然语言触发 `full_analysis`）会生成 Markdown 性能报告，保存到 `reports/` 目录。以下为实际生成的报告摘要：
 
-### 测试概要
-
 ```
-| 项目 | 内容 |
-|------|------|
-| 应用 | com.smartinspector.hook |
-| 时长 | 10.0s |
-| 日期 | 2026-04-04 09:30 |
+## 问题列表
+
+**源码归因结果共包含6条记录，已全部生成对应问题条目。**
+
+### P0 CpuBurnWorker 主线程执行CPU密集型计算导致卡顿
+
+**现象**：`CpuBurnWorker.startMainThreadWork$run` 在主线程执行耗时 145.00ms。该方法在主线程循环执行100,000次 `Math.sqrt` 计算，是导致主线程卡顿的直接原因。
+
+**原因**：根据源码归因，该方法是CPU烧录测试代码，在主线程上执行密集的数学运算，每次循环约5ms，每200ms执行一次，严重阻塞了主线程的UI渲染。
+
+**调用链**：`CpuBurnWorker.startMainThreadWork$run 145ms`
+
+**位置**：`app/src/main/java/com/smartinspector/hook/worker/CpuBurnWorker.kt:41-49`
+
+**建议**：
+1.  **移除或禁用测试代码**：在正式发布版本中，应移除或禁用此类用于测试的CPU烧录代码。
+2.  **移至后台线程**：如果该逻辑是应用功能所需，必须将其移至后台线程（如使用 `CoroutineScope(Dispatchers.Default).launch` 或 `ExecutorService`）执行，避免阻塞主线程。
+3.  **降低计算频率和强度**：如果必须在主线程执行，应大幅减少循环次数（例如从100,000次减少到1,000次以内）或延长执行间隔。
+
+### P0 DemoAdapter.onBindViewHolder 存在多项耗时操作导致列表滑动卡顿
+
+**现象**：`DemoAdapter.onBindViewHolder` 单次调用最高耗时 74.95ms，在测试期间共调用7次，累计耗时 202.29ms。该方法是导致帧#111严重卡顿（267.25ms）和 RecyclerView `dispatchLayoutStep2` 耗时 229.07ms 的主要原因。
+
+**原因**：根据源码归因，该方法内存在多个阻塞主线程的耗时操作：
+1.  `doExpensiveWork()` 中调用了 `Thread.sleep(20)` 进行强制等待。
+2.  `repository.loadItemsSync(5)` 进行同步数据加载。
+3.  执行了30次字符串拼接循环。
+4.  进行了 `Bitmap` 解码操作。
+
+**调用链**：`LinearLayoutManager.onLayoutChildren 228.97ms → RV OnBindView 75.05ms → DemoAdapter.onBindViewHolder 74.95ms`
+
+**位置**：`app/src/main/java/com/smartinspector/hook/adapter/DemoAdapter.java:40-64`
+
+**建议**：
+1.  **移除 Thread.sleep**：在主线程中绝对禁止使用 `Thread.sleep()`，应立即移除。
+2.  **异步加载数据**：将 `repository.loadItemsSync(5)` 改为异步加载（如使用 `LiveData`、`RxJava` 或 `Coroutine`），在数据准备好后再通知 `Adapter` 更新。
+3.  **优化字符串构建**：使用 `StringBuilder` 替代多次 `+` 操作进行字符串拼接。
+4.  **异步加载与缓存图片**：将 `Bitmap` 解码移至后台线程，并使用 `Glide`、`Picasso` 等图片加载库进行异步加载和缓存，避免每次绑定都解码。
+
+### P1 MainActivity.onCreate 中延迟任务过多且存在潜在风险
+
+**现象**：`MainActivity.onCreate` 耗时 14.67ms。方法中启动了多个 `Handler.postDelayed` 任务。
+
+**原因**：根据源码归因，方法中启动了多个延迟任务：1) 5秒后加载数据，2) 500ms间隔的循环padding调整，3) 8秒后显示详情Fragment。过多的延迟任务可能阻塞主线程，500ms的循环任务可能造成不必要的性能开销，且使用 `Handler.postDelayed` 有潜在的内存泄漏风险。
+
+**调用链**：`MainActivity.onCreate 14.67ms`
+
+**位置**：`app/src/main/java/com/smartinspector/hook/MainActivity.java:31-67`
+
+**建议**：
+1.  **合并或优化任务**：评估500ms循环任务的必要性，考虑是否可以合并或由事件驱动（如监听视图状态）来触发。
+2.  **使用 View.post**：对于需要在主线程执行的延迟UI操作，优先使用 `View.post()` 或 `View.postDelayed()`，这可以自动处理 `View` 生命周期，降低内存泄漏风险。
+3.  **使用 Lifecycle-aware 组件**：对于需要在特定生命周期执行的任务，考虑使用 `Lifecycle` 和 `Coroutine` 等现代架构组件来管理。
+
+### P1 DemoAdapter.onCreateViewHolder 加载复杂布局耗时
+
+**现象**：`DemoAdapter.onCreateViewHolder` 单次调用最高耗时 4.89ms，在测试期间共调用7次，累计耗时 10.49ms。
+
+**原因**：根据源码归因，该方法加载了复杂布局 `item_complex`。布局的复杂度直接影响 `inflate` 和后续测量、布局的速度。
+
+**调用链**：`DemoAdapter.onCreateViewHolder 4.89ms`
+
+**位置**：`app/src/main/java/com/smartinspector/hook/adapter/DemoAdapter.java:33-37`
+
+**建议**：
+1.  **检查并简化布局**：使用 Layout Inspector 或 `ConstraintLayout` 的布局优化工具，检查 `item_complex.xml` 的层级，减少不必要的嵌套。
+2.  **使用 ViewStub**：对于列表中并非立即显示的复杂部分，可以考虑使用 `ViewStub` 进行延迟加载。
+3.  **启用视图复用**：确保 `RecyclerView` 和 `Adapter` 正确设置了 `setHasStableIds(true)` 并实现了 `getItemId()`，以优化视图复用。
+
+### P1 item_complex.xml 布局嵌套过深导致inflate耗时
+
+**现象**：`item_complex.xml` 的 inflate 操作单次最高耗时 4.77ms，在测试期间共执行7次，累计耗时 9.80ms。
+
+**原因**：根据源码归因，该布局有4层嵌套，并且包含自定义视图 `HeavyDrawView`。深层级的嵌套会导致测量和布局过程计算量增大。
+
+**调用链**：`inflate#item_complex 4.77ms`
+
+**位置**：`app/src/main/res/layout/item_complex.xml:1-64`
+
+**建议**：
+1.  **使用 ConstraintLayout 扁平化布局**：将根布局替换为 `ConstraintLayout`，利用其约束关系减少嵌套层级，目标是控制在2层以内。
+2.  **优化 HeavyDrawView**：分析 `HeavyDrawView` 的 `onDraw` 方法，确保其绘制操作高效，避免在 `onDraw` 中分配对象或进行复杂计算。
+3.  **使用 merge 标签**：如果该布局被 `include`，考虑在根节点使用 `<merge>` 标签以消除一层冗余的 `ViewGroup`。
+
+
+## 附录
+
+**采集工具**：Smart Inspector
+**原始数据位置**：`/var/folders/tb/6pgk76d11bd278v01zfqkq540000gn/T/tmpatm5lr_x.pb`
+  [reporter] Report generated
+  [reporter] Report saved to /xx/xx/reports/perf_report_20260415_232256.md (7.8KB)
+
+Token usage:
+Stage                   Input   Output    Total  Calls
+------------------------------------------------------
+orchestrator              456        3      459      1
+perf_analyzer            2.9k      415     3.3k      1
+attributor              59.1k     3.3k    62.4k     24
+reporter                 3.1k     1.3k     4.4k      1
+------------------------------------------------------
+TOTAL                   65.6k     5.0k    70.6k     27
 ```
-
-### 性能总览
-
-```
-| 指标       | 数值     | 评价 |
-|------------|----------|------|
-| 平均 FPS   | 27.8     | 差   |
-| 卡顿次数   | 5        |      |
-| CPU 峰值   | 50.3%    | 良   |
-| 内存峰值   | 993MB    | 差   |
-```
-
-### 问题列表（源码归因）
-
-报告会通过 SI$ tag 将性能热点归因到具体源码位置，并给出优化建议：
-
-```
-### P0 RecyclerView 布局与数据绑定严重卡顿
-
-现象：DemoAdapter.dispatchLayoutStep2 单次耗时 221.24ms，超出帧预算 15.5 倍。
-原因：onBindViewHolder 中存在 Thread.sleep、同步数据加载、主线程图片解码。
-位置：platform/android/app/.../DemoAdapter.java:40-64
-
-建议：
-1. 移除 Thread.sleep(20ms)
-2. 将 loadItemsSync 改为异步加载
-3. 使用 Glide/Coil 异步图片加载
-4. 使用 DiffUtil 增量更新
-```
-
-完整报告示例见 [reports/perf_report_20260404_093038.md](reports/perf_report_20260404_093038.md)。
 
 ## 技术栈
 
-| 组件 | 技术 |
-|------|------|
-| Agent 编排 | LangGraph + LangChain |
-| LLM | DeepSeek / Claude / OpenAI (通过 SI_MODEL 配置) |
-| Android Trace | Perfetto + atrace (ftrace + CPU callstack + Java heap) |
-| HarmonyOS Trace | hiperf + hitrace (规划) |
-| 方法 Hook (Android) | Pine AOP Framework |
-| CLI 交互 | prompt_toolkit (Tab 补全, REPL) |
-| 通信 | WebSocket (CLI ↔ App, 心跳检测, 动态端口) |
-| Trace 分析 | trace_processor_shell (SQL) |
-| 状态管理 | LangGraph MemorySaver (get_state) |
+
+| 组件                | 技术                                                     |
+| ----------------- | ------------------------------------------------------ |
+| Agent 编排          | LangGraph + LangChain                                  |
+| LLM               | DeepSeek / Claude / OpenAI (通过 SI_MODEL 配置)            |
+| Android Trace     | Perfetto + atrace (ftrace + CPU callstack + Java heap) |
+| HarmonyOS Trace   | hiperf + hitrace (规划)                                  |
+| 方法 Hook (Android) | Pine AOP Framework                                     |
+| CLI 交互            | prompt_toolkit (Tab 补全, REPL)                          |
+| 通信                | WebSocket (CLI ↔ App, 心跳检测, 动态端口)                      |
+| Trace 分析          | trace_processor_shell (SQL)                            |
+| 状态管理              | LangGraph MemorySaver (get_state)                      |
+
 
 ## LLM 配置
 
@@ -348,20 +424,23 @@ Orchestrator 通过 LLM 分类将用户请求路由到对应 Agent：
 cp .env.example .env
 ```
 
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `SI_MODEL` | 全局默认模型 | `deepseek-chat` |
-| `SI_BASE_URL` | API Base URL (OpenAI 兼容) | `https://api.deepseek.com` |
-| `SI_API_KEY` | API Key (回退到 `OPENAI_API_KEY`) | — |
-| `SI_ATTRIBUTOR_MODEL` | 归因 Agent 模型覆盖 (代码理解) | 同 `SI_MODEL` |
-| `SI_TOOL_TIMEOUT` | 工具子进程超时 (grep/glob) | `30` |
-| `SI_READ_MAX_LINES` | Read 工具最大返回行数 | `2000` |
-| `SI_READ_MAX_BYTES` | Read 工具最大返回字节数 | `51200` |
-| `SI_READ_MAX_LINE_LENGTH` | Read 工具单行最大字符数 | `2000` |
-| `SI_REPORT_MAX_TOKENS` | 报告生成最大输入 token | `4000` |
-| `SI_WS_PING_TIMEOUT` | WebSocket ping 超时 (秒) | `30` |
+
+| 变量                        | 说明                             | 默认值                        |
+| ------------------------- | ------------------------------ | -------------------------- |
+| `SI_MODEL`                | 全局默认模型                         | `deepseek-chat`            |
+| `SI_BASE_URL`             | API Base URL (OpenAI 兼容)       | `https://api.deepseek.com` |
+| `SI_API_KEY`              | API Key (回退到 `OPENAI_API_KEY`) | —                          |
+| `SI_ATTRIBUTOR_MODEL`     | 归因 Agent 模型覆盖 (代码理解)           | 同 `SI_MODEL`               |
+| `SI_TOOL_TIMEOUT`         | 工具子进程超时 (grep/glob)            | `30`                       |
+| `SI_READ_MAX_LINES`       | Read 工具最大返回行数                  | `2000`                     |
+| `SI_READ_MAX_BYTES`       | Read 工具最大返回字节数                 | `51200`                    |
+| `SI_READ_MAX_LINE_LENGTH` | Read 工具单行最大字符数                 | `2000`                     |
+| `SI_REPORT_MAX_TOKENS`    | 报告生成最大输入 token                 | `4000`                     |
+| `SI_WS_PING_TIMEOUT`      | WebSocket ping 超时 (秒)          | `30`                       |
+
 
 **切换到 Claude 示例：**
+
 ```bash
 SI_MODEL=claude-sonnet-4-20250514
 SI_BASE_URL=https://api.anthropic.com
@@ -369,6 +448,7 @@ SI_API_KEY=sk-ant-xxx
 ```
 
 **归因用更强模型示例：**
+
 ```bash
 SI_MODEL=deepseek-chat
 SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
@@ -388,88 +468,93 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 
 ### 高优先级
 
-- [ ] 帧严重度阈值区分刷新率 (120Hz 设备帧预算 8.33ms)
-- [ ] 输入事件关联 (touch event → frame jank 因果)
-- [ ] 系统类模式补充: `WindowCallback`, `IdleHandler`, Jetpack Compose 类
+- 帧严重度阈值区分刷新率 (120Hz 设备帧预算 8.33ms)
+- 输入事件关联 (touch event → frame jank 因果)
+- 系统类模式补充: `WindowCallback`, `IdleHandler`, Jetpack Compose 类
 
 ### 中优先级
 
-- [ ] RV Instance 区分 create vs bind 开销
-- [ ] attributor agent 内部类 `$数字` 跳过 Glob 直接 grep 外部类
-- [ ] Perfetto `android.surfaceflinger.frame` 维度 (CPU vs GPU 瓶颈)
-- [ ] 自适应阈值 (基于设备能力动态调整)
-- [ ] 报告缺少对比基线 (before/after)
+- RV Instance 区分 create vs bind 开销
+- attributor agent 内部类 `$数字` 跳过 Glob 直接 grep 外部类
+- Perfetto `android.surfaceflinger.frame` 维度 (CPU vs GPU 瓶颈)
+- 自适应阈值 (基于设备能力动态调整)
+- 报告缺少对比基线 (before/after)
 
 ### 平台扩展
 
-- [ ] HarmonyOS collector (hdc + hiperf/hitrace)
-- [ ] iOS Instruments 集成
-- [ ] Jetpack Compose 性能 hook
-- [ ] Native C/C++ 代码覆盖
-- [ ] 内存分配热点追踪 (当前仅 RSS)
+- HarmonyOS collector (hdc + hiperf/hitrace)
+- iOS Instruments 集成
+- Jetpack Compose 性能 hook
+- Native C/C++ 代码覆盖
+- 内存分配热点追踪 (当前仅 RSS)
 
 ### 工程优化
 
-- [ ] LRU 文件缓存减少重复 Read
-- [ ] 工具结果截断 (10K 字符上限)
-- [ ] 更多复杂 trace 测试 (Kotlin、多文件)
-- [ ] CI/CD 集成
+- LRU 文件缓存减少重复 Read
+- 工具结果截断 (10K 字符上限)
+- 更多复杂 trace 测试 (Kotlin、多文件)
+- CI/CD 集成
 
 ### ✅ 已完成 (2026-04-05 重构)
 
 **Collector 采集层**
-- [x] 修复内存数值单位错误（/1024 转换问题）
-- [x] 修复 Block Events 数据覆盖（WS+SQL 合并）
-- [x] CPU 热点添加调用链重建
-- [x] sched 添加阻塞原因分析
-- [x] 新增系统级 CPU 指标采集
-- [x] HookConfig 透传 + Tag 截断保护
-- [x] PerfettoCollector 支持 context manager 协议
+
+- 修复内存数值单位错误（/1024 转换问题）
+- 修复 Block Events 数据覆盖（WS+SQL 合并）
+- CPU 热点添加调用链重建
+- sched 添加阻塞原因分析
+- 新增系统级 CPU 指标采集
+- HookConfig 透传 + Tag 截断保护
+- PerfettoCollector 支持 context manager 协议
 
 **Agents 编排层**
-- [x] Orchestrator LLM 调用异常处理
-- [x] REPL 主循环全局异常保护
-- [x] graph.stream 循环防崩溃
-- [x] node_error_handler 统一节点错误处理
-- [x] 路由支持 enum 和 string 双模式
-- [x] 路由 prompt few-shot 提升准确率
-- [x] 路由 LLM max_tokens=5 减少 token 浪费
-- [x] Reporter 输入 token 估算和截断
-- [x] Attributor 消息窗口裁剪防 O(n²) 增长
-- [x] Fallback 消息窗口过滤仅 Human/AI
-- [x] Reporter 真正流式输出防重复打印
-- [x] 用 get_state()+MemorySaver 替代手动 state 重建
-- [x] Attributor 结构化输出 + 文本解析 fallback
-- [x] 清理无引用的 prompts/main.txt
-- [x] Agent LLM 单例双重检查锁线程安全
+
+- Orchestrator LLM 调用异常处理
+- REPL 主循环全局异常保护
+- graph.stream 循环防崩溃
+- node_error_handler 统一节点错误处理
+- 路由支持 enum 和 string 双模式
+- 路由 prompt few-shot 提升准确率
+- 路由 LLM max_tokens=5 减少 token 浪费
+- Reporter 输入 token 估算和截断
+- Attributor 消息窗口裁剪防 O(n²) 增长
+- Fallback 消息窗口过滤仅 Human/AI
+- Reporter 真正流式输出防重复打印
+- 用 get_state()+MemorySaver 替代手动 state 重建
+- Attributor 结构化输出 + 文本解析 fallback
+- 清理无引用的 prompts/main.txt
+- Agent LLM 单例双重检查锁线程安全
 
 **SDK 层**
-- [x] Release 变体替换为纯 no-op stubs
-- [x] PineConfig.debug=true 替换为 BuildConfig.DEBUG
-- [x] FragmentLifecycleCallbacks registered 集合内存泄漏修复
-- [x] BlockMonitor.blockEvents 容量限制防 OOM
-- [x] view_traverse 过滤系统 widget
-- [x] SI$ Tag 超 127 字节自动截断
-- [x] 高频 hook Log.d BuildConfig.DEBUG 守卫
-- [x] Trace 嵌套深度保护防 atrace 溢出
+
+- Release 变体替换为纯 no-op stubs
+- PineConfig.debug=true 替换为 BuildConfig.DEBUG
+- FragmentLifecycleCallbacks registered 集合内存泄漏修复
+- BlockMonitor.blockEvents 容量限制防 OOM
+- view_traverse 过滤系统 widget
+- SI$ Tag 超 127 字节自动截断
+- 高频 hook Log.d BuildConfig.DEBUG 守卫
+- Trace 嵌套深度保护防 atrace 溢出
 
 **基础设施层**
-- [x] REPL 全局异常保护
-- [x] WS server 启动异常不再静默吞掉
-- [x] WebSocket ping/pong 心跳检测
-- [x] WS server ready event 防止启动竞态
-- [x] streaming graph 迭代错误处理
-- [x] state 合并重构为 AgentState 驱动
-- [x] 硬编码端口 9876 替换为 get_ws_port()
-- [x] Slash 命令 Tab 自动补全
-- [x] 版本号从 package metadata 读取
-- [x] /clear 清理所有分析状态字段
-- [x] 启动前置条件检查 (adb + API key)
-- [x] 所有依赖添加版本上限
-- [x] /report 支持文件输出
-- [x] Hook config 持久化到本地文件
-- [x] send_config msg_id + ACK 机制
-- [x] 硬编码配置值集中到 config.py，支持环境变量覆盖
-- [x] 工具共享路径校验提取到 path_utils 模块
-- [x] Collector 全链路异常日志补全
-- [x] WS 异常日志替换静默吞掉
+
+- REPL 全局异常保护
+- WS server 启动异常不再静默吞掉
+- WebSocket ping/pong 心跳检测
+- WS server ready event 防止启动竞态
+- streaming graph 迭代错误处理
+- state 合并重构为 AgentState 驱动
+- 硬编码端口 9876 替换为 get_ws_port()
+- Slash 命令 Tab 自动补全
+- 版本号从 package metadata 读取
+- /clear 清理所有分析状态字段
+- 启动前置条件检查 (adb + API key)
+- 所有依赖添加版本上限
+- /report 支持文件输出
+- Hook config 持久化到本地文件
+- send_config msg_id + ACK 机制
+- 硬编码配置值集中到 config.py，支持环境变量覆盖
+- 工具共享路径校验提取到 path_utils 模块
+- Collector 全链路异常日志补全
+- WS 异常日志替换静默吞掉
+
