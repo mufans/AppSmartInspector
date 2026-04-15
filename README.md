@@ -13,6 +13,7 @@ AI 驱动的跨平台移动端性能分析 CLI 工具。通过自然语言交互
 - ⚡ **Token 效率优化** — 消息窗口裁剪、路由 token 限制、流式输出
 - 🔒 **Release 零开销** — Release 变体为纯 no-op stubs，编译器内联后零运行时开销
 - 💬 **实时通信** — WebSocket CLI↔App 双向通信，支持心跳检测和断线重连
+- 🖥️ **Perfetto UI 交互** — 自托管 Perfetto UI + SI Bridge 插件，框选时间范围即可 AI 分析
 - ⌨️ **交互增强** — Tab 补全、全局异常保护、启动前置条件检查
 
 ## 快速开始
@@ -50,6 +51,49 @@ you> 搜索源码中 LazyForEach 的用法
 ```
 collector (设备 trace 采集) → analyzer (LLM 性能解读) → attributor (源码归因) → reporter (生成 Markdown 报告)
 ```
+
+### Perfetto UI 交互分析
+
+```
+用户在 Perfetto UI 框选时间范围
+  → SI Bridge Plugin (WebSocket client)
+  → BridgeServer (ws://127.0.0.1:9877/bridge)
+  → frame_analyzer agent (查询切片 → 源码归因 → LLM 分析)
+  → 结果回传 Perfetto UI 展示（实时进度 + Markdown 报告）
+```
+
+<p align="center">
+  <img src="img/perfetto_ui.png" width="800" alt="Perfetto UI 交互帧分析">
+</p>
+
+使用 `/open` 启动自托管 Perfetto UI 后，在时间轴上拖选一段范围，点击右侧 **SI Frame Analysis** 面板中的 **Analyze with SI Agent** 按钮。分析过程中实时显示查询进度、源码归因工具调用（Glob/Grep/Read）和 LLM 分析状态，最终在面板中展示 Markdown 格式的帧分析报告。
+
+- `/frame ts=X dur=Y` CLI 直接分析指定时间范围
+- 插件自动重连，进度实时推送，归因过程透明可见
+
+### 构建 Perfetto UI 插件
+
+使用 `perfetto-plugin/build.sh` 构建包含 SI Bridge 插件的自托管 Perfetto UI：
+
+**前置条件：** Node.js >= 18、npm、git
+
+```bash
+# 首次构建（clone Perfetto + 复制插件 + 编译）
+./perfetto-plugin/build.sh
+
+# 后续构建（跳过 clone，仅重新编译）
+./perfetto-plugin/build.sh --skip-clone
+```
+
+构建脚本会自动完成以下步骤：
+1. Clone Perfetto 仓库（shallow clone）到 `perfetto-build/`
+2. 复制 SI Bridge 插件到 Perfetto 插件目录
+3. 在 `default_plugins.ts` 中注册插件
+4. 执行 `ui/build` 编译（含依赖安装、TypeScript 编译、WASM）
+
+构建产物输出到 `perfetto-build/ui/out/dist/`，可通过 `/open` 命令启动自托管 Perfetto UI。
+
+> **注意：** 脚本会自动移除 PATH 中的 Android NDK `strip` 以避免 macOS 上 Mach-O arm64 兼容性问题。如需代理，请提前设置 `http_proxy`/`https_proxy`。
 
 ### 健壮性设计
 
@@ -121,6 +165,7 @@ smartinspector/
 │   │   ├── explorer.py             #     Code Explorer Agent
 │   │   ├── perf_analyzer.py        #     Perf Analyzer (单次 LLM 调用)
 │   │   ├── attributor.py           #     源码归因 Agent (run_attribution)
+│   │   ├── frame_analyzer.py       #     帧分析 Agent (Perfetto UI 交互归因)
 │   │   └── deterministic.py        #     确定性预计算 (减少 LLM token)
 │   │
 │   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU, context manager)
@@ -131,11 +176,12 @@ smartinspector/
 │   │   ├── hook.py                 #     Hook 配置 (/config, /hooks)
 │   │   ├── orchestrate.py          #     编排命令 (/full, /report)
 │   │   ├── session.py              #     会话管理 (/help, /clear)
-│   │   └── trace.py                #     Trace 采集 (/trace, /record)
+│   │   └── trace.py                #     Trace 采集 (/trace, /record, /open, /close, /frame)
 │   │
 │   ├── tools/                      #   LangChain 工具 (grep/glob/read/perfetto)
 │   │   └── path_utils.py           #     共享路径校验 (防目录遍历)
 │   ├── ws/server.py                #   WebSocket Server (心跳检测, ready event, 动态端口)
+│   ├── ws/bridge_server.py         #   Perfetto UI Bridge Server (自托管 UI + WS 桥接)
 │   ├── prompts.py                  #   Prompt 文件加载器
 │   ├── config.py                   #   全局配置 (LLM 模型, source dir, hook config 持久化, 环境变量覆盖)
 │   ├── token_tracker.py            #   LLM Token 使用量追踪
@@ -149,6 +195,10 @@ smartinspector/
 │           ├── SIClient.java           # WebSocket 客户端
 │           ├── HookConfig.java         # 配置模型 (JSON 序列化, BuildConfig.DEBUG守卫)
 │           └── HookConfigManager.java  # 配置管理 (SP 持久化)
+│
+├── perfetto-plugin/                # Perfetto UI SI Bridge 插件
+│   ├── com.smartinspector.Bridge/  #   插件源码 (TypeScript)
+│   └── build.sh                    #   构建脚本 (clone Perfetto + 复制插件 + build)
 │
 ├── prompts/                        # LLM Prompt 模板
 ├── bin/                            # trace_processor_shell
@@ -198,6 +248,9 @@ Trace → SI$ slices → 过滤系统类 → 提取 class+method → Glob→Grep
 | `/trace [duration_ms] [pkg]` | 采集 + 自动分析 Perfetto trace |
 | `/record [duration_ms] [pkg]` | 只采集不分析，返回 .pb 文件路径 |
 | `/analyze [path]` | 分析 trace 文件（无参数时分析上次采集结果） |
+| `/frame ts=X dur=Y` | 分析指定时间范围的帧（ts/dur 为纳秒，CLI 直接分析） |
+| `/open [path]` | 启动 Perfetto UI + Bridge Server，交互式框选帧分析 |
+| `/close` | 关闭 Perfetto UI Bridge Server |
 | `/report [path]` | 生成性能报告（可选输出到文件） |
 | `/config` | 查看当前 hook 配置（通过 WS 从 App 获取） |
 | `/config <json>` | 推送 JSON 配置到 App（如 `{"rv_adapter": false}`） |

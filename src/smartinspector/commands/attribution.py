@@ -677,6 +677,9 @@ def extract_attributable_slices(perf_summary_json: str, min_dur_ms: float = 1.0)
     if block_events:
         _attach_block_stacks(attributable, block_events)
 
+    # Remove entries marked as system classes by block event matching
+    attributable = [e for e in attributable if not e.get("_system")]
+
     # Filter by minimum duration threshold
     attributable = [e for e in attributable if e["dur_ms"] >= min_dur_ms]
 

@@ -61,6 +61,15 @@ def format_perf_sections(perf_json: str) -> list[str]:
     return user_parts
 
 
+def _to_relative_path(file_path: str) -> str:
+    """Convert absolute file path to relative path from source dir."""
+    from smartinspector.config import get_source_dir
+    source_dir = get_source_dir()
+    if file_path and file_path.startswith(source_dir):
+        return file_path[len(source_dir):].lstrip("/")
+    return file_path
+
+
 def format_attribution_section(attribution_result: str) -> list[str]:
     """Build user-facing markdown sections from attribution JSON."""
     user_parts: list[str] = []
@@ -75,8 +84,17 @@ def format_attribution_section(attribution_result: str) -> list[str]:
 
     found = [r for r in attr_data if r.get("attributable")]
     system = [r for r in attr_data if r.get("reason") == "system_class"]
+    failed = [r for r in attr_data if r.get("reason") in ("parse_failed", "error")]
     unresolved = [r for r in attr_data
-                  if not r.get("attributable") and r.get("reason") not in ("system_class", "found")]
+                  if not r.get("attributable")
+                  and r.get("reason") not in ("system_class", "found", "parse_failed", "error")]
+
+    if failed:
+        import logging
+        logging.getLogger("smartinspector.reporter").debug(
+            "Skipped %d failed/error attribution entries (parse_failed or error)",
+            len(failed),
+        )
 
     if found:
         parts = ["## 源码归因结果\n"]
@@ -87,17 +105,18 @@ def format_attribution_section(attribution_result: str) -> list[str]:
                 type_tag = " [主线程卡顿]"
             elif r.get("method_name") == "inflate":
                 type_tag = " [XML布局]"
-                if r.get("count", 0) > 1:
-                    type_tag += f" 调用{r['count']}次"
-                    if r.get("total_ms"):
-                        type_tag += f" 累计{r['total_ms']:.1f}ms"
+            if r.get("count", 0) > 1:
+                type_tag += f", 调用{r['count']}次"
+                if r.get("total_ms"):
+                    type_tag += f", 累计{r['total_ms']:.1f}ms"
             display_method = r['method_name']
             if r.get("context_method"):
                 display_method = f"{r['context_method']}${display_method}"
             parts.append(f"- {r['class_name']}.{display_method} ({r['dur_ms']:.2f}ms){type_tag}")
-            parts.append(f"  位置: {r.get('file_path', '?')}:{r.get('line_start', '?')}-{r.get('line_end', '?')}")
+            fp = _to_relative_path(r.get('file_path', '?'))
+            parts.append(f"  位置: {fp}:{r.get('line_start', '?')}-{r.get('line_end', '?')}")
             if r.get("source_snippet"):
-                parts.append(f"  发现: {r['source_snippet'][:200]}")
+                parts.append(f"  发现: {r['source_snippet'][:300]}")
         user_parts.append("\n".join(parts))
 
     if system:
