@@ -67,7 +67,9 @@ collector (设备 trace 采集) → analyzer (LLM 性能解读) → attributor (
   → 结果回传 Perfetto UI 展示（实时进度 + Markdown 报告）
 ```
 
-
+<p align="center">
+  <img src="img/perfetto_ui.png" width="800" alt="Perfetto UI 交互帧分析">
+</p>
 
 使用 `/open` 启动自托管 Perfetto UI 后，在时间轴上拖选一段范围，点击右侧 **SI Frame Analysis** 面板中的 **Analyze with SI Agent** 按钮。分析过程中实时显示查询进度、源码归因工具调用（Glob/Grep/Read）和 LLM 分析状态，最终在面板中展示 Markdown 格式的帧分析报告。
 
