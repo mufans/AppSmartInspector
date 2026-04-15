@@ -403,6 +403,12 @@ def _build_group_prompt(group: list[dict]) -> str:
         line = f"{i}. {cn}.{issue['method_name']} ({issue['dur_ms']:.2f}ms, {search_type}"
         if issue.get("count"):
             line += f", count={issue['count']}"
+
+        # ── 调用栈上下文 ──
+        call_ctx = issue.get("call_context", "")
+        if call_ctx:
+            line += f", 调用链: {call_ctx}"
+
         # Hint for inner classes ($ in name) — extract outer class for Glob
         if "$" in cn:
             outer = cn.split("$")[0]

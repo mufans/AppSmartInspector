@@ -549,6 +549,167 @@ def _attach_block_stacks(attributable: list[dict], block_events: list[dict]) -> 
             attr_lookup[key] = entry
 
 
+# ---------------------------------------------------------------------------
+# Call stack context extraction
+# ---------------------------------------------------------------------------
+
+_STAGE_KEYWORDS = {
+    "doFrame": "帧渲染",
+    "performMeasure": "measure阶段",
+    "performLayout": "layout阶段",
+    "performDraw": "draw阶段",
+    "Choreographer": "vsync",
+}
+
+
+def _extract_context_from_chain(chain: list[str]) -> list[str]:
+    """从调用链中提取有意义的上下文节点。
+
+    过滤掉系统标签（doFrame, Choreographer 等），保留 SI$ 自定义标签和
+    关键系统标签（作为阶段标识）。
+    """
+    context_parts = []
+    for item in chain:
+        # chain item 格式: "slice_name [XX.XXms]" 或 "slice_name"
+        name = item.split(" [")[0] if " [" in item else item
+
+        if name.startswith("SI$"):
+            # SI$ 标签：提取关键信息
+            context_parts.append(_summarize_si_tag(name))
+        else:
+            # 系统标签：只保留阶段标识
+            for keyword, label in _STAGE_KEYWORDS.items():
+                if keyword in name:
+                    context_parts.append(f"[{label}]")
+                    break
+
+    return context_parts
+
+
+def _summarize_si_tag(tag: str) -> str:
+    """将 SI$ 标签转换为可读的上下文摘要。"""
+    body = tag[3:] if tag.startswith("SI$") else tag
+
+    if body.startswith("RV#"):
+        # SI$RV#viewId#Adapter.method → "RV(viewId, Adapter.method)"
+        parts = body.split("#")
+        if len(parts) >= 3:
+            view_id = parts[1]
+            fqn_method = parts[2]
+            _, method = _split_fqn_method(fqn_method)
+            adapter = fqn_method.rsplit(".", 1)[0].rsplit(".", 1)[-1]
+            return f"RV#{view_id}#{adapter}.{method or '?'}"
+        return body
+
+    if body.startswith("inflate#"):
+        parts = body[8:].split("#")
+        layout = parts[0] if parts else "?"
+        return f"inflate({layout})"
+
+    if body.startswith("view#"):
+        fqn, method = _split_fqn_method(body[5:])
+        cls = fqn.rsplit(".", 1)[-1] if fqn else "?"
+        return f"{cls}.{method or '?'}"
+
+    if body.startswith("handler#"):
+        fqn_part = body[8:].split("#")[0]
+        fqn, method = _split_fqn_method(fqn_part)
+        cls = fqn.rsplit(".", 1)[-1] if fqn else fqn_part
+        return f"handler({cls}.{method or '?'})"
+
+    if body.startswith("Activity.lifecycle"):
+        return "Activity生命周期"
+
+    if body.startswith("Fragment.lifecycle"):
+        return "Fragment生命周期"
+
+    # 默认
+    fqn, method = _split_fqn_method(body)
+    cls = fqn.rsplit(".", 1)[-1] if fqn else body
+    return f"{cls}.{method or '?'}"
+
+
+def _walk_parent_chain(slice_data: dict, slice_by_id: dict, max_depth: int = 5) -> list[str]:
+    """从 slice 数据沿 parent_id 向上回溯，构建调用链。
+
+    Returns:
+        调用链 [root, ..., leaf]，每项格式 "name [dur_ms]"
+    """
+    chain = []
+    visited = set()
+    current = slice_data
+
+    for _ in range(max_depth):
+        sid = current.get("id")
+        if sid is None or sid in visited:
+            break
+        visited.add(sid)
+
+        name = current.get("name", "")
+        dur_ms = current.get("dur_ms", 0)
+        chain.append(f"{name} [{dur_ms:.2f}ms]")
+
+        parent_id = current.get("parent_id")
+        if not parent_id or parent_id not in slice_by_id:
+            break
+        current = slice_by_id[parent_id]
+
+    chain.reverse()  # root → leaf
+    return chain
+
+
+def _build_parent_contexts(view_slices: dict) -> dict[str, str]:
+    """为每个 slowest_slice 构建 parent chain 上下文摘要。
+
+    利用 collect_view_slices() 已构建的 call_chains 数据和 slice 的 parent_id，
+    生成精简的调用上下文字符串，用于辅助 attributor agent 精确定位。
+
+    Returns:
+        dict: slice_name → context_string 映射
+    """
+    slices_data = view_slices.get("slowest_slices", [])
+    call_chains = view_slices.get("call_chains", [])
+
+    # 从 call_chains 提取 name → chain 映射
+    chain_map: dict[str, list[str]] = {}
+    for cc in call_chains:
+        name = cc.get("name", "")
+        chain = cc.get("chain", [])
+        if name and chain:
+            chain_map[name] = chain
+
+    # 从原始 slice 数据构建 parent_id → slice_name 映射
+    slice_by_id: dict[int, dict] = {}
+    for s in slices_data:
+        sid = s.get("id")
+        if sid is not None:
+            slice_by_id[sid] = s
+
+    contexts: dict[str, str] = {}
+    for s in slices_data:
+        name = s.get("name", "")
+        if not name.startswith("SI$"):
+            continue
+
+        # 策略1: 使用 call_chains 中的预构建链
+        if name in chain_map:
+            chain = chain_map[name]
+            # chain 是 [root, ..., leaf]，提取上下文节点
+            context_parts = _extract_context_from_chain(chain)
+            if context_parts:
+                contexts[name] = " → ".join(context_parts)
+                continue
+
+        # 策略2: 从 parent_id 向上回溯（call_chains 未覆盖的 slice）
+        parent_chain = _walk_parent_chain(s, slice_by_id, max_depth=5)
+        if parent_chain:
+            context_parts = _extract_context_from_chain(parent_chain)
+            if context_parts:
+                contexts[name] = " → ".join(context_parts)
+
+    return contexts
+
+
 def extract_attributable_slices(perf_summary_json: str, min_dur_ms: float = 1.0) -> list[dict]:
     """Extract SI$ slices from perf_summary for source code attribution.
 
@@ -704,6 +865,18 @@ def extract_attributable_slices(perf_summary_json: str, min_dur_ms: float = 1.0)
             elif stack and not existing.get("stack_trace"):
                 existing["stack_trace"] = stack
 
+    # ── 注入调用栈上下文 ──
+    parent_contexts = _build_parent_contexts(view_slices)
+
+    for entry in seen.values():
+        raw_name = entry.get("raw_name", "")
+        if raw_name in parent_contexts:
+            entry["call_context"] = parent_contexts[raw_name]
+
+        # 对 RV 实例方法，补充 RV 上下文
+        if entry.get("instance"):
+            entry["call_context"] = f"RV实例: {entry['instance']}"
+
     return sorted(seen.values(), key=lambda x: -x["dur_ms"])
 
 
@@ -767,6 +940,11 @@ def build_attribution_prompt(attributable: list[dict]) -> str:
             lines.append(f"   - 调用次数: {s['count']}")
         if s.get("total_ms"):
             lines.append(f"   - 总耗时: {s['total_ms']:.1f}ms")
+
+        # ── 调用链上下文 ──
+        if s.get("call_context"):
+            lines.append(f"   - 调用链上下文: {s['call_context']}")
+
         if s.get("stack_trace"):
             lines.append(f"   - 堆栈采样 (BlockMonitor):")
             for frame in s["stack_trace"][:12]:
