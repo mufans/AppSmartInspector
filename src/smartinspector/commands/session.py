@@ -18,6 +18,9 @@ SmartInspector Commands:
     /trace [ms] [pkg]     Collect + analyze trace (default 10000ms)
     /record [ms] [pkg]    Record trace without analysis
     /analyze [path]       Analyze a trace file
+    /frame ts=X dur=Y     Analyze a selected frame (from Perfetto UI)
+    /open                 Open Perfetto UI with SI Agent bridge
+    /close                Stop the Perfetto UI bridge server
 
   Hooks:
     /config [json|reset]  View/set hook configuration

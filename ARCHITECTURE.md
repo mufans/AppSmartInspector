@@ -80,6 +80,7 @@ smartinspector/
 │   │   ├── explorer.py          #   Code Explorer: grep/glob/read
 │   │   ├── perf_analyzer.py     #   Perf Analyzer: single-shot LLM interpretation
 │   │   ├── attributor.py        #   Source attribution: run_attribution()
+│   │   ├── frame_analyzer.py    #   Frame Analyzer: Perfetto UI 交互帧分析 (query→attribution→LLM)
 │   │   └── deterministic.py     #   Deterministic pre-computation (reduces LLM tokens)
 │   │
 │   ├── collector/               # Data collection & processing
@@ -92,7 +93,7 @@ smartinspector/
 │   │   ├── hook.py              #   /config, /hooks, /hook, /debug
 │   │   ├── orchestrate.py       #   /full, /report (文件输出)
 │   │   ├── session.py           #   /help, /clear (全字段清理), /summary, /tokens
-│   │   └── trace.py             #   /trace, /record, /analyze
+│   │   └── trace.py             #   /trace, /record, /analyze, /frame, /open, /close
 │   │
 │   ├── tools/                   # LangChain @tool functions
 │   │   ├── perfetto.py          #   analyze_perfetto, collect_android_trace
@@ -103,13 +104,19 @@ smartinspector/
 │   │   └── path_utils.py        #   shared path validation (prevent traversal)
 │   │
 │   └── ws/                      # WebSocket communication
-│       └── server.py            #   SIServer (心跳检测, ready event, 动态端口, msg_id+ACK)
+│       ├── server.py            #   SIServer (心跳检测, ready event, 动态端口, msg_id+ACK)
+│       └── bridge_server.py     #   BridgeServer (自托管 Perfetto UI + WS 桥接帧分析)
+│
+├── perfetto-plugin/             # Perfetto UI SI Bridge 插件
+│   ├── com.smartinspector.Bridge/  插件源码 (TypeScript, AreaSelection tab)
+│   └── build.sh                 #   构建脚本 (clone Perfetto + 复制插件 + build)
 │
 ├── prompts/                     # System prompts (text files)
 │   ├── main.txt                 #   Main persona (HarmonyOS perf tool)
 │   ├── android-expert.txt       #   Android agent prompt
 │   ├── perf-analyzer.txt        #   Perf analysis prompt
 │   ├── code-explorer.txt        #   Code search prompt
+│   ├── frame-analyzer.txt       #   Frame analysis prompt (Perfetto UI /frame)
 │   ├── report-generator.txt     #   Report format prompt
 │   ├── compaction.txt           #   Context compression prompt
 │   ├── monkey-driver.txt        #   Monkey test driver prompt
@@ -233,6 +240,20 @@ you> /debug         → 打开设备端 Hook 调试配置面板
 | `/record [duration_ms] [pkg]` | 只采集不分析，返回 .pb 路径 | 默认 10000ms，可选指定目标包名 |
 | `/analyze [path]` | 分析 trace 文件（无参数时分析上次 `/record` 结果） | 可选 trace 文件路径 |
 
+### Perfetto UI 交互类
+
+| 指令 | 功能 |
+|------|------|
+| `/frame ts=X dur=Y` | 分析指定时间范围的帧（ts/dur 纳秒，CLI 直接分析） |
+| `/open [path]` | 启动自托管 Perfetto UI + Bridge Server + trace_processor_shell，浏览器自动打开 |
+| `/close` | 关闭 Bridge Server 和 trace_processor_shell |
+
+**Perfetto UI 交互流程**：
+1. `/open` 启动 BridgeServer（端口 9877），提供自托管 Perfetto UI 静态文件 + trace 自动加载
+2. 用户在 Perfetto UI 中拖选时间范围 → "SI Frame Analysis" 面板 → "Analyze with SI Agent"
+3. BridgeServer 转发到 `frame_analyzer` agent：查询切片 → 源码归因 → LLM 分析
+4. 实时进度推送（查询、归因工具调用、LLM 分析）→ 最终 Markdown 报告回传 UI
+
 ### Hook 配置类
 
 | 指令 | 功能 | 参数 |
@@ -270,7 +291,7 @@ you> /debug         → 打开设备端 Hook 调试配置面板
 # commands/__init__.py — command registry pattern
 
 from smartinspector.commands.device import cmd_devices, cmd_connect, cmd_status, cmd_disconnect
-from smartinspector.commands.trace import cmd_trace, cmd_record, cmd_analyze
+from smartinspector.commands.trace import cmd_trace, cmd_record, cmd_analyze, cmd_frame, cmd_open, cmd_close
 from smartinspector.commands.hook import cmd_config, cmd_hooks, cmd_hook, cmd_debug
 from smartinspector.commands.session import cmd_help, cmd_clear, cmd_summary, cmd_tokens
 from smartinspector.commands.orchestrate import cmd_full, cmd_report
@@ -284,6 +305,9 @@ SLASH_COMMANDS = {
     "/trace": cmd_trace,
     "/record": cmd_record,
     "/analyze": cmd_analyze,
+    "/frame": cmd_frame,
+    "/open": cmd_open,
+    "/close": cmd_close,
     "/config": cmd_config,
     "/hooks": cmd_hooks,
     "/hook": cmd_hook,
@@ -364,7 +388,59 @@ def handle_slash_command(user_input: str, state: dict) -> dict:
 
 **Output**: `{ attribution_data: "<json>", attribution_result: "<json>" }`
 
-### 5. Reporter (`graph/nodes/reporter/`)
+### 5. Frame Analyzer (`agents/frame_analyzer.py`)
+
+**Role**: Analyze a user-selected time range from Perfetto UI. Used in two contexts:
+- `/frame ts=X dur=Y` — CLI direct invocation
+- Perfetto UI "Analyze with SI Agent" — via BridgeServer WebSocket
+
+**Model**: Uses `SI_MODEL`, temperature=0.1
+
+**Workflow**:
+1. `query_frame_slices()` — query slices, frames, call chains overlapping [ts, ts+dur]
+2. `_run_source_attribution()` — extract SI$ slices → `_attach_block_stacks()` → `run_attribution()`
+3. LLM analysis with frame-analyzer prompt, incorporating precomputed hints + attribution results
+
+**Progress reporting**: `on_progress` callback pushes real-time status (query → slice count → attribution tool calls → LLM analysis) to CLI (`print`) and Perfetto UI (`WebSocket`).
+
+### 6. BridgeServer (`ws/bridge_server.py`)
+
+**Role**: Self-hosted Perfetto UI + WebSocket bridge for interactive frame analysis.
+
+**Components**:
+- Static file serving from `perfetto-build/ui/out/dist/`
+- `/trace.pb` endpoint for auto-loading trace in Perfetto UI
+- WebSocket `/bridge` endpoint for SI Bridge plugin communication
+- `on_progress` callback bridges sync thread pool → async WebSocket for real-time progress
+
+**Protocol** (Plugin → Server):
+| type | payload |
+|------|---------|
+| `frame_selected` | `{ts, dur}` — user selected time range |
+| `ping` | heartbeat |
+
+**Protocol** (Server → Plugin):
+| type | payload |
+|------|---------|
+| `analysis_progress` | `{step, detail}` — real-time progress updates |
+| `analysis_result` | `{analysis}` — final Markdown report |
+| `analysis_error` | `{error}` |
+| `pong` | heartbeat response |
+
+### 7. Perfetto UI Plugin (`perfetto-plugin/com.smartinspector.Bridge/`)
+
+**Role**: Perfetto UI area selection tab for triggering SI Agent analysis.
+
+**Features**:
+- Area selection tab "SI Frame Analysis" — display selected range + "Analyze" button
+- Keyboard shortcut `Ctrl+Shift+A` for quick analysis
+- Cumulative progress log (`progressLog[]`) with auto-scroll — shows query, attribution tool calls, LLM steps
+- Markdown result display panel
+- Auto-reconnect WebSocket on disconnection
+
+**Build**: `perfetto-plugin/build.sh` clones Perfetto, copies plugin, registers in `default_plugins.ts`, builds UI.
+
+### 8. Reporter (`graph/nodes/reporter/`)
 
 **Role**: Generate the final Markdown performance report with LLM.
 
@@ -375,7 +451,7 @@ def handle_slash_command(user_input: str, state: dict) -> dict:
 
 **Output**: Complete Markdown report (header tables + LLM analysis + source attribution)
 
-### 6. Code Explorer (`graph/nodes/explorer.py`)
+### 9. Code Explorer (`graph/nodes/explorer.py`)
 
 **Role**: Search and read source code files.
 
@@ -385,7 +461,7 @@ def handle_slash_command(user_input: str, state: dict) -> dict:
 
 **Output**: `[file_path]:[line_number]` + code snippet + analysis.
 
-### 7. Fallback (`graph/nodes/orchestrator.py`)
+### 10. Fallback (`graph/nodes/orchestrator.py`)
 
 **Role**: Friendly LLM reply for non-performance queries (greetings, Q&A).
 

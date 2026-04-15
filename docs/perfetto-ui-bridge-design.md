@@ -441,22 +441,105 @@ def create_graph():
 9. 分析结果面板美化（Markdown 渲染、源码高亮）
 10. 支持多次选中分析、分析历史
 
-## 八、结论
+## 八、插件系统深度调研（2026-04-15 补充）
 
-**可行性评估：可行，推荐实施。**
+### 8.1 核心发现：必须 Fork
 
-- **技术成熟度**：Perfetto UI 的 URL API、postMessage、trace_processor HTTP 模式均为官方支持的功能，非 hack
-- **架构兼容性**：与现有 LangGraph pipeline 完全兼容，可渐进式集成（独立运行 -> pipeline 节点 -> 对话式）
-- **数据复用度**：现有 80%+ 的分析能力（collector、analyzer、attributor、deterministic）可直接复用
-- **主要挑战**：获取 Perfetto UI 的选中事件需要变通方案（URL hash 轮询为最可靠的 MVP 方案）
-- **最大价值**：将"全量自动分析"升级为"用户驱动的交互式分析"，用户可以聚焦自己关心的帧，获得更精准的分析结果
+Perfetto UI 插件 API 非常强大，但 **不支持外部加载**：
 
-**MVP 改动量**：约 5 个新文件 + 3 个现有文件小改动，核心逻辑约 800-1200 行代码。
+> "All plugins are currently in-tree... There is no way, currently, to side-load closed-source plugins."
+
+插件位于 `ui/src/plugins/`，编译时打包。使用自定义插件只有两条路：
+1. **向上游贡献** — PR 到 `google/perfetto`，Apache-2.0 开源（SI Agent 场景不现实）
+2. **Fork + 自托管** — fork 仓库，添加自定义插件，构建部署（推荐）
+
+### 8.2 插件 API 能力
+
+| 扩展点 | API | 说明 |
+|--------|-----|------|
+| 自定义 Track | `trace.tracks.registerTrack()` | slice/counter track，支持 SQL 驱动 |
+| Tab 面板 | `trace.tabs.registerTab()` | 详情面板标签页，Mithril 渲染 |
+| 命令+快捷键 | `trace.commands.registerCommand()` | 命令面板操作 |
+| 区域选择 Tab | `trace.selection.registerAreaSelectionTab()` | 框选时间范围时显示自定义面板 |
+| Overlay | `trace.tracks.registerOverlay()` | 时间线上画箭头、标注 |
+| SQL 查询 | `trace.engine.query()` | 插件内执行 SQL |
+| 持久状态 | `trace.mountStore()` | permalink 安全的状态 |
+
+### 8.3 选中事件响应方式
+
+- `trace.selection.selection` 可读取当前选中状态
+- 无显式 `onSelectionChanged` 回调
+- **响应方式 1**：`registerAreaSelectionTab` — 用户框选区域时 Tab 的 `render()` 被调用，接收 `AreaSelection {start, end}`
+- **响应方式 2**：自定义 Track 的 `detailsPanel()` — 用户点击 slice 时展示自定义详情面板
+
+### 8.4 原方案 D 的跨域问题
+
+原方案 D（iframe 嵌入 Perfetto UI）存在 **跨域限制**：
+- Perfetto UI 在 `ui.perfetto.dev`，桥接页面在 `localhost`
+- 跨域 iframe 无法读取 `contentWindow.location.hash`
+- `MutationObserver` 无法访问跨域 `contentDocument`
+- URL hash 轮询策略在跨域场景下不可行
+
+### 8.5 修正方案：Fork + 自托管 + 插件
+
+由于插件 API 原生支持区域选择 Tab 和自定义命令，Fork + 自托管是最佳方案：
+
+```
+1. Fork google/perfetto
+2. 新建 com.smartinspector.Bridge 插件（~150 行 TS）
+3. 插件通过 WebSocket 连接 SI Agent
+4. 用户框选帧 → 点击分析 → WS 发送 ts/dur → Agent 分析 → 结果回传显示
+5. 构建静态文件 → 本地 HTTP Server 托管（同源，无跨域问题）
+```
+
+## 九、修正后的实施计划
+
+### Phase 1：命令行验证（已完成）
+
+- `/frame ts=X dur=Y` 命令，复用现有 REPL 架构
+- `query_frame_slices()` + `analyze_frame()` agent
+- 零前端开发，验证后端分析逻辑
+
+### Phase 2：Fork + 自托管 Perfetto UI 插件
+
+1. **创建 SI Bridge 插件** `perfetto-plugin/com.smartinspector.Bridge/index.ts`
+   - `registerAreaSelectionTab`: 用户框选帧 → 显示"分析"按钮 + 结果面板
+   - `registerCommand`: 快捷键 `Ctrl+Shift+A` 触发分析
+   - WebSocket 客户端连接 `ws://127.0.0.1:9877/bridge`
+2. **构建脚本** `perfetto-plugin/build.sh`：clone + 复制插件 + 构建
+
+### Phase 3：端到端串联
+
+3. **Bridge Server** `ws/bridge_server.py`：aiohttp 服务，端口 9877
+   - 托管 Perfetto UI 静态文件
+   - WebSocket `/bridge` 端点接收插件消息
+   - 调用 `frame_analyzer` agent 并回传结果
+4. **`/open` 命令**：启动 TraceServer + BridgeServer + 打开浏览器
+5. **自动启动**：`/trace` 完成后自动启动 TraceServer
+
+### Phase 4：体验优化（未来）
+
+6. 分析结果 Markdown 渲染
+7. 多次选中分析历史
+8. attributor 集成（源码定位直接显示在插件面板中）
+
+## 十、结论
+
+**可行性评估：可行，推荐 Fork + 自托管方案。**
+
+- **Phase 1（已完成）**：命令行 `/frame` 验证后端分析逻辑
+- **Phase 2**：Fork Perfetto + 自定义插件，原生 UI 集成质量最高
+- **Phase 3**：Bridge Server 端到端串联，`/open` 一键打开
+- **关键技术路径**：Perfetto 插件 API → WebSocket → SI Agent frame_analyzer → 结果回传
+- **最大优势**：插件 API 原生支持区域选择 Tab，用户交互自然流畅
 
 ## 参考资料
 
 - [Perfetto UI Plugin 文档](https://perfetto.dev/docs/contributing/ui-plugins)
 - [Perfetto UI Deep Linking](https://perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui)
 - [Perfetto Commands Automation Reference](https://perfetto.dev/docs/visualization/commands-automation-reference)
+- [Perfetto Plugin API (plugin.ts)](https://github.com/google/perfetto/blob/master/ui/src/public/plugin.ts)
+- [Perfetto Trace API (trace.ts)](https://github.com/google/perfetto/blob/master/ui/src/public/trace.ts)
+- [Perfetto Selection API (selection.ts)](https://github.com/google/perfetto/blob/master/ui/src/public/selection.ts)
+- [Example Plugin: com.example.Tracks](https://github.com/google/perfetto/blob/main/ui/src/plugins/com.example.Tracks/index.ts)
 - [trace_processor_shell HTTP 源码](https://github.com/google/perfetto/blob/master/src/trace_processor/rpc/httpd.cc)
-- [post_message_handler.ts 源码](https://github.com/google/perfetto/blob/master/ui/src/frontend/post_message_handler.ts)

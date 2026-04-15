@@ -73,15 +73,25 @@ def reporter_node(state: AgentState) -> dict:
     if estimated_tokens > MAX_REPORT_INPUT_TOKENS:
         target_chars = int(MAX_REPORT_INPUT_TOKENS * 1.5)
         if len(user_content) > target_chars:
-            debug_log("reporter", f"TRUNCATING user_content from {len(user_content)} to {target_chars} chars")
-            user_content = user_content[:target_chars] + "\n\n[... 数据过长已截断 ...]"
+            # Truncate at paragraph (\n\n) boundaries to avoid cutting
+            # mid-table, mid-code-block, or mid-attribution entry
+            sections = user_content.split("\n\n")
+            truncated: list[str] = []
+            total = 0
+            for sec in sections:
+                if total + len(sec) > target_chars and truncated:
+                    break
+                truncated.append(sec)
+                total += len(sec)
+            user_content = "\n\n".join(truncated) + "\n\n[... 数据过长已截断 ...]"
+            debug_log("reporter", f"TRUNCATING user_content from {len(user_content)} to ~{total} chars ({len(truncated)}/{len(sections)} sections)")
     debug_log("reporter", f"attribution section: {user_content[-1500:] if len(user_content) > 1500 else user_content}")
     full_content = generate_report(report_prompt, user_content)
     debug_log("reporter", f"LLM output ({len(full_content)} chars): {full_content[:2000]}")
     debug_log("reporter", f"attribution_result JSON: {attribution_result}")
 
     # Prepend pre-generated header (LLM does not output header per prompt instructions)
-    complete_report = header_md + "\n" + full_content if perf_json else full_content
+    complete_report = (header_md + "\n" + full_content) if perf_json else full_content
 
     # Save report to file
     report_path = save_report(complete_report)
