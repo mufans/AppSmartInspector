@@ -1463,3 +1463,207 @@ class PerfettoCollector:
         )
 
         return output_path
+
+
+class TraceServer:
+    """Manage trace_processor_shell HTTP server for on-demand querying.
+
+    Starts ``trace_processor_shell -D <trace> --http-port <port>``
+    so that both Perfetto UI (native acceleration) and Python code can
+    query the trace via HTTP without loading it into memory repeatedly.
+    """
+
+    def __init__(self, trace_path: str, port: int = 9001):
+        self.trace_path = trace_path
+        self.port = port
+        self.process: subprocess.Popen | None = None
+
+    def start(self, timeout: float = 10.0) -> bool:
+        """Start trace_processor_shell in HTTP mode.
+
+        Returns True if the server becomes ready within *timeout* seconds.
+        """
+        import time
+        import urllib.request
+        import urllib.error
+
+        if self.process is not None and self.process.poll() is None:
+            return True  # already running
+
+        shell = str(SHELL_BIN)
+        if not Path(shell).exists():
+            raise FileNotFoundError(f"trace_processor_shell not found: {shell}")
+
+        self.process = subprocess.Popen(
+            [shell, "-D", self.trace_path,
+             "--http-port", str(self.port)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{self.port}/status", timeout=1)
+                logger.info("TraceServer ready on :%d", self.port)
+                return True
+            except (urllib.error.URLError, OSError):
+                if self.process.poll() is not None:
+                    stderr = self.process.stderr.read().decode()
+                    raise RuntimeError(f"trace_processor_shell exited: {stderr}")
+                time.sleep(0.2)
+
+        self.stop()
+        return False
+
+    def query(self, sql: str) -> list[dict]:
+        """Execute a SQL query via the Python API connecting to HTTP server.
+
+        Returns list of row dicts.
+        """
+        tp = TraceProcessor(addr=f"127.0.0.1:{self.port}",
+                            config=TraceProcessorConfig(bin_path=str(SHELL_BIN)))
+        try:
+            result = tp.query(sql)
+            return _rows_to_dicts(result)
+        finally:
+            tp.close()
+
+    def stop(self):
+        """Terminate the trace_processor_shell process."""
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        self.process = None
+
+
+def _rows_to_dicts(query_result) -> list[dict]:
+    """Convert a perfetto QueryResult iterator to list of dicts."""
+    rows = []
+    for r in query_result:
+        row = {}
+        for desc in query_result.describe():
+            col_name = desc.name
+            row[col_name] = getattr(r, col_name, None)
+        rows.append(row)
+    return rows
+
+
+def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
+                       shell_path: str | None = None) -> dict:
+    """Query trace data overlapping a user-selected time range.
+
+    Opens a short-lived TraceProcessor, queries:
+      1. All slices overlapping [ts_ns, ts_ns+dur_ns]
+      2. Frame timeline entries overlapping the range
+      3. Build call chain from parent_slice join
+
+    Returns a dict with 'slices', 'frames', 'call_chains'.
+    """
+    config = TraceProcessorConfig(
+        bin_path=shell_path or str(SHELL_BIN),
+        load_timeout=10,
+    )
+    tp = TraceProcessor(trace=trace_path, config=config)
+    try:
+        # Slices overlapping the selected time range
+        slice_rows = tp.query(f"""
+            SELECT id, name, ts, dur, depth, track_id, cat, parent_id
+            FROM slice
+            WHERE ts <= {ts_ns + dur_ns} AND ts + dur >= {ts_ns}
+            ORDER BY dur DESC
+            LIMIT 50
+        """)
+        slices = []
+        for r in slice_rows:
+            slices.append({
+                "id": r.id,
+                "name": r.name,
+                "ts_ns": r.ts,
+                "dur_ns": r.dur,
+                "dur_ms": round(r.dur / 1e6, 2),
+                "depth": r.depth,
+                "track_id": r.track_id,
+                "cat": r.cat,
+                "parent_id": r.parent_id,
+            })
+
+        # Frame timeline overlapping the range
+        frames = []
+        try:
+            frame_rows = tp.query(f"""
+                SELECT display_frame_token, MIN(ts) AS frame_ts,
+                       MAX(dur) AS frame_dur_ns,
+                       GROUP_CONCAT(DISTINCT jank_type) AS jank_types
+                FROM actual_frame_timeline_slice
+                WHERE dur > 0 AND surface_frame_token > 0
+                  AND ts <= {ts_ns + dur_ns} AND ts + dur >= {ts_ns}
+                GROUP BY display_frame_token
+                ORDER BY frame_ts
+            """)
+            for r in frame_rows:
+                jank_list = [j.strip() for j in (r.jank_types or "").split(",")
+                             if j.strip() and j.strip() != "None"]
+                frames.append({
+                    "ts_ns": r.frame_ts,
+                    "dur_ms": round(r.frame_dur_ns / 1e6, 2),
+                    "jank_types": jank_list,
+                    "is_jank": len(jank_list) > 0,
+                })
+        except Exception:
+            pass
+
+        # Build call chains for top slices (parent -> child walk)
+        call_chains = []
+        seen_ids: set[int] = set()
+        for s in slices[:10]:
+            if s["id"] in seen_ids:
+                continue
+            chain = _walk_call_chain(tp, s["id"], seen_ids)
+            if chain:
+                call_chains.append(chain)
+
+        return {
+            "ts_ns": ts_ns,
+            "dur_ns": dur_ns,
+            "dur_ms": round(dur_ns / 1e6, 2),
+            "slices": slices,
+            "frames": frames,
+            "call_chains": call_chains,
+        }
+    finally:
+        tp.close()
+
+
+def _walk_call_chain(tp, slice_id: int, seen: set[int]) -> dict:
+    """Walk from a slice up through parents to build a call chain."""
+    chain_items = []
+    current_id = slice_id
+    for _ in range(20):  # max depth safety
+        try:
+            rows = list(tp.query(f"""
+                SELECT id, name, ts, dur, depth, parent_id
+                FROM slice WHERE id = {current_id}
+            """))
+        except Exception:
+            break
+        if not rows:
+            break
+        r = rows[0]
+        seen.add(r.id)
+        chain_items.append({
+            "name": r.name,
+            "dur_ms": round(r.dur / 1e6, 2),
+            "depth": r.depth,
+        })
+        if r.parent_id is None or r.parent_id == 0:
+            break
+        current_id = r.parent_id
+
+    # Reverse so parent is first
+    chain_items.reverse()
+    top = chain_items[0] if chain_items else {}
+    top["children"] = chain_items[1:] if len(chain_items) > 1 else []
+    return top

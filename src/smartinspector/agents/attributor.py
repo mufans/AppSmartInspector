@@ -10,6 +10,7 @@ Slices whose files cannot be found are marked as system classes.
 """
 
 import json
+import os
 import threading
 from collections import OrderedDict
 
@@ -306,7 +307,7 @@ def _deterministic_search(group: list[dict], file_cache: _FileCache) -> list[dic
     return results
 
 
-def run_attribution(attributable: list[dict]) -> list[dict]:
+def run_attribution(attributable: list[dict], on_progress=None) -> list[dict]:
     """Run source code attribution on a list of SI$ slices.
 
     Args:
@@ -355,11 +356,11 @@ def run_attribution(attributable: list[dict]) -> list[dict]:
                 else:
                     failed_issues.append(issue)
             if failed_issues:
-                llm_results = _search_group(failed_issues, file_cache)
+                llm_results = _search_group(failed_issues, file_cache, on_progress)
                 results.extend(llm_results)
             continue
 
-        group_results = _search_group(group, file_cache)
+        group_results = _search_group(group, file_cache, on_progress)
         results.extend(group_results)
 
     # Sort by dur_ms descending
@@ -367,7 +368,7 @@ def run_attribution(attributable: list[dict]) -> list[dict]:
     return results
 
 
-def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
+def _search_group(group: list[dict], file_cache: _FileCache, on_progress=None) -> list[dict]:
     """Search source code for a group of issues using manual tool-call loop.
 
     Uses llm.bind_tools() + manual tool dispatch to avoid message history
@@ -400,7 +401,19 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
             result["count"] = issue["count"]
         if issue.get("total_ms"):
             result["total_ms"] = issue["total_ms"]
+        if issue.get("context_method"):
+            result["context_method"] = issue["context_method"]
         results.append(result)
+
+    # Validate source_dir exists before entering expensive LLM loop
+    from smartinspector.config import get_source_dir
+    source_dir = get_source_dir()
+    resolved = os.path.realpath(source_dir)
+    if not os.path.isdir(resolved):
+        debug_log("attributor", f"source_dir '{source_dir}' resolves to '{resolved}' which does not exist")
+        for r in results:
+            r["reason"] = "source_dir_not_found"
+        return results
 
     # Build prompt for the agent
     prompt = _build_group_prompt(group)
@@ -413,14 +426,17 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
             HumanMessage(content=prompt),
         ]
 
-        max_iterations = 12  # Safety limit
+        max_iterations = 8  # Safety limit
+        consecutive_failures = 0
         for iteration in range(max_iterations):
-            # Message window trimming: keep system(0) + human(1) + recent 4 rounds
+            # Message window trimming: keep system(0) + human(1) + recent 6 rounds
             # Each round = 1 AIMessage + 1 ToolMessage = 2 messages
-            if len(messages) > 10:
-                messages = [messages[0], messages[1]] + messages[-8:]
+            if len(messages) > 16:
+                messages = [messages[0], messages[1]] + messages[-12:]
 
+            debug_log("attributor", f"iteration {iteration}: invoking LLM ({len(messages)} messages)...")
             response = llm.invoke(messages)
+            debug_log("attributor", f"iteration {iteration}: LLM responded")
 
             # Record token usage
             get_tracker().record_from_message("attributor", response)
@@ -429,8 +445,14 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
             tool_calls = response.tool_calls if hasattr(response, "tool_calls") else []
             if not tool_calls:
                 # No more tool calls — LLM is done
+                debug_log("attributor", f"iteration {iteration}: no tool calls, done")
                 messages.append(response)
                 break
+
+            debug_log("attributor", f"iteration {iteration}: {len(tool_calls)} tool calls: {[tc['name'] for tc in tool_calls]}")
+            print(f"  [attributor] iteration {iteration}: {[tc['name'] for tc in tool_calls]}", flush=True)
+            if on_progress:
+                on_progress(f"  [attributor] iteration {iteration}: {[tc['name'] for tc in tool_calls]}")
 
             # Add AI message with tool calls
             messages.append(response)
@@ -447,7 +469,10 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
                     if cached is not None:
                         tool_result = cached
                         args_preview = ", ".join(f"{k}={v!r}" for k, v in tool_args.items() if isinstance(v, (str, int)) and len(str(v)) < 80)
+                        debug_log("attributor", f"  [{tool_name}] (cached) {args_preview or '(no args)'}")
                         print(f"    [{tool_name}] (cached) {args_preview or '(no args)'}", flush=True)
+                        if on_progress:
+                            on_progress(f"  [attributor]   [{tool_name}] (cached) {args_preview or '(no args)'}")
                         messages.append(ToolMessage(
                             content=str(tool_result),
                             tool_call_id=tc["id"],
@@ -469,11 +494,14 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
                 if tool_name in ("glob", "read") and not str(tool_result).startswith("Error:"):
                     file_cache.put(tool_name, tool_args, str(tool_result))
 
-                # Print concise progress: just tool name + args summary
+                # Log tool call
                 args_preview = ", ".join(f"{k}={v!r}" for k, v in tool_args.items() if isinstance(v, (str, int)) and len(str(v)) < 80)
                 if not args_preview:
                     args_preview = "(no args)"
+                debug_log("attributor", f"  [{tool_name}] {args_preview}")
                 print(f"    [{tool_name}] {args_preview}", flush=True)
+                if on_progress:
+                    on_progress(f"  [attributor]   [{tool_name}] {args_preview}")
 
                 # Add tool result to messages
                 messages.append(ToolMessage(
@@ -481,6 +509,18 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
                     tool_call_id=tc["id"],
                     name=tool_name,
                 ))
+
+                # Track consecutive search failures for early termination
+                result_str = str(tool_result)
+                if tool_name in ("glob", "grep") and ("No files found" in result_str or not result_str.strip()):
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
+
+            # Early termination on repeated search failures
+            if consecutive_failures >= 3:
+                debug_log("attributor", f"early termination: {consecutive_failures} consecutive search failures")
+                break
 
         # Scan ALL messages for RESULT lines
         all_text = ""
@@ -531,6 +571,14 @@ def _search_group(group: list[dict], file_cache: _FileCache) -> list[dict]:
         for r in results:
             r["reason"] = f"error: {e}"
 
+    # Normalize file paths to relative from source dir
+    from smartinspector.config import get_source_dir
+    source_dir = get_source_dir()
+    for r in results:
+        fp = r.get("file_path")
+        if fp and fp.startswith(source_dir):
+            r["file_path"] = fp[len(source_dir):].lstrip("/")
+
     return results
 
 
@@ -550,6 +598,12 @@ def _build_group_prompt(group: list[dict]) -> str:
         line = f"{i}. {cn}.{issue['method_name']} ({issue['dur_ms']:.2f}ms, {search_type}"
         if issue.get("count"):
             line += f", count={issue['count']}"
+
+        # ── 调用栈上下文 ──
+        call_ctx = issue.get("call_context", "")
+        if call_ctx:
+            line += f", 调用链: {call_ctx}"
+
         # Hint for inner classes ($ in name) — extract outer class for Glob
         if "$" in cn:
             outer = cn.split("$")[0]
