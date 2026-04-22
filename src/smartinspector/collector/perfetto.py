@@ -57,6 +57,7 @@ class PerfSummary:
     block_events: list[dict] = field(default_factory=list)
     input_events: list[dict] = field(default_factory=list)
     sys_stats: dict = field(default_factory=dict)
+    thread_state: list[dict] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, ensure_ascii=False)
@@ -1035,6 +1036,124 @@ class PerfettoCollector:
 
         return block_slices
 
+    def collect_thread_state(self) -> list[dict]:
+        """Analyze per-slice thread state distribution (Running/S/D).
+
+        For each SI$ slow slice, queries the thread_state table to determine
+        how much time the thread spent in each state (Running, S, D, etc.)
+        during the slice's execution window. This helps distinguish "code is
+        slow" (Running) from "thread is blocked/suspended" (S/D).
+
+        Returns a list of dicts with:
+          - slice_name: the SI$ slice name
+          - dur_ms: total slice duration
+          - state_distribution: {state: percentage} e.g. {"Running": 85.2, "S": 14.8}
+          - dominant_state: the state with the highest percentage
+        """
+        tp = self._open()
+
+        # First, get main thread utid
+        try:
+            main_thread_rows = tp.query("""
+                SELECT utid FROM thread WHERE name = 'main' LIMIT 1
+            """)
+            main_utid = None
+            for r in main_thread_rows:
+                main_utid = r.utid
+                break
+            if main_utid is None:
+                return []
+        except Exception as e:
+            logger.debug("thread_state: main thread query failed: %s", e)
+            return []
+
+        # Get SI$ slow slices (top 20 by duration)
+        try:
+            slice_rows = tp.query("""
+                SELECT name, ts, dur
+                FROM slice
+                WHERE name LIKE 'SI$%'
+                  AND name NOT LIKE 'SI$net#%'
+                  AND name NOT LIKE 'SI$db#%'
+                  AND name NOT LIKE 'SI$img#%'
+                  AND name NOT LIKE 'SI$touch#%'
+                  AND dur > 1000000
+                ORDER BY dur DESC
+                LIMIT 20
+            """)
+        except Exception as e:
+            logger.debug("thread_state: slice query failed: %s", e)
+            return []
+
+        results = []
+        for sr in slice_rows:
+            slice_ts = sr.ts
+            slice_dur = sr.dur
+            slice_name = sr.name
+            dur_ms = round(slice_dur / 1e6, 2)
+
+            if dur_ms < 1.0:
+                continue
+
+            # Query thread_state for this slice's time window on main thread
+            try:
+                state_rows = tp.query(f"""
+                    SELECT
+                      state,
+                      SUM(dur) AS state_dur_ns
+                    FROM thread_state
+                    WHERE utid = {main_utid}
+                      AND ts >= {slice_ts}
+                      AND ts + dur <= {slice_ts} + {slice_dur}
+                    GROUP BY state
+                    ORDER BY state_dur_ns DESC
+                """)
+
+                state_dist = {}
+                total_state_ns = 0
+                for st in state_rows:
+                    ns = st.state_dur_ns or 0
+                    total_state_ns += ns
+                    # Normalize state names
+                    state_name = st.state
+                    if state_name == "R" or state_name == "R+":
+                        state_name = "Running"
+                    elif state_name == "S":
+                        state_name = "Sleeping"
+                    elif state_name == "D":
+                        state_name = "DiskSleep"
+                    elif state_name == "D+":
+                        state_name = "DiskSleep"
+                    state_dist[state_name] = ns
+
+                # Convert to percentages
+                if total_state_ns > 0:
+                    pct_dist = {
+                        k: round(v / total_state_ns * 100, 1)
+                        for k, v in state_dist.items()
+                    }
+                else:
+                    pct_dist = state_dist
+
+                dominant = max(pct_dist, key=pct_dist.get) if pct_dist else "unknown"
+
+                results.append({
+                    "slice_name": slice_name,
+                    "dur_ms": dur_ms,
+                    "state_distribution": pct_dist,
+                    "dominant_state": dominant,
+                })
+            except Exception as e:
+                logger.debug("thread_state: state query failed for %s: %s", slice_name, e)
+                results.append({
+                    "slice_name": slice_name,
+                    "dur_ms": dur_ms,
+                    "state_distribution": {},
+                    "dominant_state": "unknown",
+                })
+
+        return results
+
     def _diagnose_tables(self) -> dict:
         """Check which key tables have data, for diagnosing empty results."""
         tp = self._open()
@@ -1155,6 +1274,12 @@ class PerfettoCollector:
                 summary.sys_stats = sys_stats
         except Exception as e:
             logger.debug("sys_stats collection failed: %s", e)
+
+        # Thread state analysis (Running/S/D per SI$ slice)
+        try:
+            summary.thread_state = self.collect_thread_state()
+        except Exception as e:
+            logger.debug("thread_state collection failed: %s", e)
 
         return summary
 

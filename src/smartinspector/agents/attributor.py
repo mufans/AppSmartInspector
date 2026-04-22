@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
-from smartinspector.config import get_llm_kwargs
+from smartinspector.config import get_llm_kwargs, get_source_dir
 from smartinspector.debug_log import debug_log
 from smartinspector.tools.grep import grep
 from smartinspector.tools.glob import glob
@@ -129,6 +129,183 @@ def _get_llm():
     return _llm_with_tools, _system_prompt
 
 
+# ---------------------------------------------------------------------------
+# Deterministic fast path — skip LLM for straightforward searches
+# ---------------------------------------------------------------------------
+
+def _can_use_fast_path(group: list[dict]) -> bool:
+    """Check if all issues in a group can be resolved deterministically.
+
+    Fast path conditions:
+      - All issues are java type (not xml)
+      - No anonymous inner classes ($ in class_name)
+      - Method name is known (not "unknown" or empty)
+    """
+    for issue in group:
+        if issue.get("search_type") != "java":
+            return False
+        cn = issue.get("class_name", "")
+        if "$" in cn:
+            return False
+        mn = issue.get("method_name", "")
+        if not mn or mn == "unknown":
+            return False
+    return True
+
+
+def _deterministic_search(group: list[dict], file_cache: _FileCache) -> list[dict]:
+    """Execute Glob→Grep→Read without LLM for straightforward cases.
+
+    Returns result dicts in the same format as _search_group().
+    """
+    results: list[dict] = []
+
+    for issue in group:
+        result = {
+            "raw_name": issue["raw_name"],
+            "class_name": issue["class_name"],
+            "method_name": issue["method_name"],
+            "dur_ms": issue["dur_ms"],
+            "attributable": False,
+            "reason": "not_found",
+            "file_path": None,
+            "line_start": None,
+            "line_end": None,
+            "source_snippet": None,
+        }
+        if issue.get("instance"):
+            result["instance"] = issue["instance"]
+        if issue.get("count"):
+            result["count"] = issue["count"]
+        if issue.get("total_ms"):
+            result["total_ms"] = issue["total_ms"]
+
+        cn = issue["class_name"]
+        mn = issue["method_name"]
+        source_dir = get_source_dir()
+
+        # Step 1: Glob to find the file
+        glob_args_java = {"pattern": f"**/{cn}.java", "path": source_dir}
+        glob_args_kt = {"pattern": f"**/{cn}.kt", "path": source_dir}
+
+        # Check cache first
+        glob_result = file_cache.get("glob", glob_args_java)
+        if glob_result is None:
+            glob_result = file_cache.get("glob", glob_args_kt)
+            if glob_result is None:
+                # Try .java first
+                glob_result = glob.invoke(glob_args_java)
+                if glob_result.startswith("No files"):
+                    # Try .kt
+                    glob_result_kt = glob.invoke(glob_args_kt)
+                    if not glob_result_kt.startswith("No files"):
+                        glob_result = glob_result_kt
+                        file_cache.put("glob", glob_args_kt, glob_result)
+                    else:
+                        file_cache.put("glob", glob_args_java, glob_result)
+                else:
+                    file_cache.put("glob", glob_args_java, glob_result)
+
+        if glob_result.startswith("No files") or glob_result.startswith("Error"):
+            result["reason"] = "system_class"
+            results.append(result)
+            continue
+
+        # Parse first file path from glob result (skip header lines)
+        file_path = None
+        for line in glob_result.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("Found") or line.startswith("(") or line.startswith("["):
+                continue
+            # Convert relative path to absolute
+            if not line.startswith("/"):
+                import os
+                line = os.path.join(source_dir, line)
+            file_path = line
+            break
+
+        if not file_path:
+            result["reason"] = "system_class"
+            results.append(result)
+            continue
+
+        result["file_path"] = file_path
+
+        # Step 2: Grep for method signature
+        grep_args = {
+            "pattern": mn,
+            "path": file_path,
+            "output_mode": "content",
+            "head_limit": 5,
+        }
+        grep_result = grep.invoke(grep_args)
+
+        if grep_result.startswith("No matches") or grep_result.startswith("Error"):
+            # Method not found in file — still mark file as found but method as not_found
+            result["reason"] = "found_file_only"
+            results.append(result)
+            continue
+
+        # Parse first matching line number
+        line_start = None
+        for line in grep_result.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("Found") or line.startswith("("):
+                continue
+            parts = line.split(":", 2)
+            if len(parts) >= 2:
+                try:
+                    line_start = int(parts[1])
+                    break
+                except ValueError:
+                    continue
+
+        if line_start is None:
+            results.append(result)
+            continue
+
+        # Step 3: Read method body (offset=line_start, limit=40)
+        read_args = {"file_path": file_path, "offset": line_start, "limit": 40}
+        cached_read = file_cache.get("read", read_args)
+        if cached_read is not None:
+            read_result = cached_read
+        else:
+            read_result = read.invoke(read_args)
+            if not str(read_result).startswith("Error"):
+                file_cache.put("read", read_args, str(read_result))
+
+        # Extract source snippet from read result (strip line numbers)
+        snippet_lines = []
+        end_line = line_start
+        for line in str(read_result).split("\n"):
+            line = line.strip()
+            if line.startswith("(") or not line:
+                continue
+            # Format: "NN: content" — strip the line number prefix
+            colon_idx = line.find(": ")
+            if colon_idx >= 0:
+                snippet_lines.append(line[colon_idx + 2:])
+                try:
+                    end_line = int(line[:colon_idx].strip())
+                except ValueError:
+                    pass
+
+        snippet = "\n".join(snippet_lines[:40])
+
+        result.update({
+            "attributable": True,
+            "reason": "found",
+            "file_path": file_path,
+            "line_start": line_start,
+            "line_end": end_line,
+            "source_snippet": snippet,
+        })
+        print(f"    [fast-path] {cn}.{mn} -> {file_path}:{line_start}", flush=True)
+        results.append(result)
+
+    return results
+
+
 def run_attribution(attributable: list[dict]) -> list[dict]:
     """Run source code attribution on a list of SI$ slices.
 
@@ -164,6 +341,24 @@ def run_attribution(attributable: list[dict]) -> list[dict]:
     results: list[dict] = []
 
     for group in groups:
+        # Fast path: deterministic search for straightforward cases
+        if _can_use_fast_path(group):
+            fast_results = _deterministic_search(group, file_cache)
+            if all(r.get("reason") == "found" for r in fast_results):
+                results.extend(fast_results)
+                continue
+            # Partial success: merge found results, fall back to LLM for rest
+            failed_issues = []
+            for r, issue in zip(fast_results, group):
+                if r.get("reason") == "found":
+                    results.append(r)
+                else:
+                    failed_issues.append(issue)
+            if failed_issues:
+                llm_results = _search_group(failed_issues, file_cache)
+                results.extend(llm_results)
+            continue
+
         group_results = _search_group(group, file_cache)
         results.extend(group_results)
 
