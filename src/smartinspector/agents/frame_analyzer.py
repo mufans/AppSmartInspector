@@ -100,12 +100,14 @@ def analyze_frame(trace_path: str, ts_ns: int, dur_ns: int,
     if on_progress:
         on_progress("  [frame] 调用 LLM 分析...")
     debug_log("frame", "Step 3: Calling LLM for analysis...")
+    debug_log("frame", f"Step 3 input (first 2000 chars):\n{user_content[:2000]}")
     llm = _get_llm()
     response = llm.invoke([
         SystemMessage(content=_prompt),
         HumanMessage(content=user_content),
     ])
     get_tracker().record_from_message("frame_analyzer", response)
+    debug_log("frame", f"Step 3 response:\n{response.content}")
     debug_log("frame", "Step 3 done")
     return response.content
 
@@ -121,8 +123,10 @@ def _run_source_attribution(frame_data: dict, existing_summary: str,
     from smartinspector.commands.attribution import (
         extract_class,
         extract_method,
+        extract_fqn,
         classify_search_type,
         is_system_method,
+        _extract_method_from_stack,
     )
     from smartinspector.agents.attributor import run_attribution
 
@@ -132,8 +136,10 @@ def _run_source_attribution(frame_data: dict, existing_summary: str,
         return ""
 
     # Build attributable list from SI$ slices in the selected range
+    import re as _re
+
     attributable = []
-    seen_keys: set[str] = set()
+    seen_keys: dict[str, dict] = {}
     for s in si_slices:
         name = s["name"]
         if classify_search_type(name) == "system":
@@ -141,22 +147,58 @@ def _run_source_attribution(frame_data: dict, existing_summary: str,
         if is_system_method(name):
             continue
 
+        # SI$block# slices have trace dur≈0 (beginSection+endSection are
+        # adjacent).  Extract real duration from the tag suffix (#NNNms).
+        dur_ms = s["dur_ms"]
+        if name.startswith("SI$block#") and dur_ms < 0.01:
+            dur_match = _re.search(r'#(\d+(?:\.\d+)?)ms$', name)
+            if dur_match:
+                dur_ms = float(dur_match.group(1))
+
+        # Skip slices with negligible duration — no analysis value
+        if dur_ms < 0.01:
+            continue
+
         class_name = extract_class(name)
         method_name = extract_method(name)
+
+        # Anonymous inner class detection (e.g., CpuBurnWorker$startMainThreadWork$1)
+        # extract_method returns the enclosing method name from _extract_method_from_anonymous,
+        # but the actual executing method is the anonymous class's method (e.g., Runnable.run).
+        raw_fqn = extract_fqn(name)
+        context_method = ""
+        if raw_fqn and _re.search(r'\$\d+$', raw_fqn) and method_name:
+            context_method = method_name
+            # Try to get the actual method from the slice's stack trace
+            # (populated by _correlate_block_stacks_from_logcat in query_frame_slices)
+            stack = s.get("stack_trace", [])
+            if stack:
+                stack_method = _extract_method_from_stack(stack)
+                if stack_method and stack_method != method_name:
+                    method_name = stack_method
+
         key = f"{class_name}.{method_name}"
         if key in seen_keys:
+            # Accumulate duration and call count for repeated slices
+            existing = seen_keys[key]
+            existing["dur_ms"] += dur_ms
+            existing["call_count"] = existing.get("call_count", 1) + 1
             continue
-        seen_keys.add(key)
+        seen_keys[key] = None  # placeholder, replaced below
 
-        attributable.append({
+        item = {
             "raw_name": name,
             "class_name": class_name,
             "method_name": method_name,
-            "dur_ms": s["dur_ms"],
+            "dur_ms": dur_ms,
             "type": "slice",
             "search_type": classify_search_type(name),
             "instance": None,
-        })
+        }
+        if context_method:
+            item["context_method"] = context_method
+        seen_keys[key] = item
+        attributable.append(item)
 
     if not attributable:
         return ""
@@ -191,11 +233,17 @@ def _run_source_attribution(frame_data: dict, existing_summary: str,
     if cached_attribution:
         try:
             cached_results = json.loads(cached_attribution)
-            cache_by_key = {
-                f"{r['class_name']}.{r['method_name']}": r
-                for r in cached_results
-                if r.get("attributable")
-            }
+            cache_by_key = {}
+            for r in cached_results:
+                if r.get("attributable"):
+                    key = f"{r['class_name']}.{r['method_name']}"
+                    cache_by_key[key] = r
+                    # Also index by context_method for anonymous inner class matching
+                    # (e.g., cached as "CpuBurnWorker.run" but frame has "CpuBurnWorker.startMainThreadWork")
+                    if r.get("context_method"):
+                        alt_key = f"{r['class_name']}.{r['context_method']}"
+                        if alt_key not in cache_by_key:
+                            cache_by_key[alt_key] = r
             matched = []
             unmatched = []
             for item in attributable:
@@ -236,7 +284,17 @@ def _run_source_attribution(frame_data: dict, existing_summary: str,
             ls = r.get("line_start", "?")
             le = r.get("line_end", "?")
             snippet = r.get("source_snippet", "")
-            lines.append(f"### {r['class_name']}.{r['method_name']} ({r['dur_ms']:.2f}ms)")
+            call_count = r.get("call_count", 0)
+            dur_label = f"{r['dur_ms']:.2f}ms"
+            if call_count > 1:
+                dur_label += f" (累计, {call_count}次调用)"
+            # For anonymous inner classes, show the actual raw tag name
+            # so LLM knows this is an anonymous class execution (e.g. Runnable.run)
+            raw_name = r.get("raw_name", "")
+            method_label = f"{r['class_name']}.{r['method_name']}"
+            if "$" in raw_name and r.get("context_method"):
+                method_label += f" (匿名内部类, 定义在 {r['context_method']} 内)"
+            lines.append(f"### {method_label} ({dur_label})")
             lines.append(f"- 文件: `{fp}:{ls}-{le}`")
             if snippet:
                 lines.append(f"- 分析: {snippet[:300]}")
@@ -268,14 +326,52 @@ def _build_frame_hints(frame_data: dict, existing_summary: str) -> str:
     # SI$ slice classification
     si_slices = [s for s in slices if s.get("name", "").startswith("SI$")]
     if si_slices:
+        import re as _re
         p0_threshold = frame_budget_ms
-        lines = [f"[选中范围 SI$ 切片] (共 {len(si_slices)} 个, 范围 {dur_ms:.2f}ms)"]
-        for s in si_slices[:10]:
+
+        # Compute effective duration for each slice (fix SI$block# dur≈0)
+        for s in si_slices:
+            s["_effective_dur"] = s["dur_ms"]
             name = s["name"]
-            sdur = s["dur_ms"]
+            if name.startswith("SI$block#") and s["_effective_dur"] < 0.01:
+                dur_match = _re.search(r'#(\d+(?:\.\d+)?)ms$', name)
+                if dur_match:
+                    s["_effective_dur"] = float(dur_match.group(1))
+
+        # Sort by effective duration DESC so high-impact slices appear first
+        si_slices.sort(key=lambda s: s["_effective_dur"], reverse=True)
+
+        # Aggregate by method key to show cumulative impact for repeated calls
+        agg: dict[str, dict] = {}
+        agg_order: list[str] = []
+        for s in si_slices:
+            skey = s["name"].split("#")[0] if "#" in s["name"] and not s["name"].startswith("SI$block") else s["name"]
+            # Normalize: strip duration suffix from block tags for grouping
+            if s["name"].startswith("SI$block#"):
+                # SI$block#pkg.Class$method$N#NNms -> group by prefix without ms suffix
+                _m = _re.match(r'(SI\$block#.*?)(#\d+(?:\.\d+)?ms)$', s["name"])
+                skey = _m.group(1) if _m else s["name"]
+            if skey in agg:
+                agg[skey]["dur"] += s["_effective_dur"]
+                agg[skey]["count"] += 1
+            else:
+                agg[skey] = {"name": s["name"], "dur": s["_effective_dur"], "count": 1}
+                agg_order.append(skey)
+
+        # Re-sort aggregated by total dur DESC
+        agg_sorted = sorted(agg.values(), key=lambda a: a["dur"], reverse=True)
+
+        lines = [f"[选中范围 SI$ 切片] (共 {len(si_slices)} 个, 范围 {dur_ms:.2f}ms)"]
+        for a in agg_sorted[:10]:
+            sdur = a["dur"]
             level = "P0" if sdur > p0_threshold else ("P1" if sdur >= p0_threshold * 0.25 else "P2")
-            lines.append(f"  {level}: {name} ({sdur:.2f}ms)")
+            count_label = f", {a['count']}次调用累计" if a["count"] > 1 else ""
+            lines.append(f"  {level}: {a['name']} ({sdur:.2f}ms{count_label})")
         sections.append("\n".join(lines))
+
+        # Clean up temp field
+        for s in si_slices:
+            s.pop("_effective_dur", None)
     else:
         sections.append(f"[选中范围] 无 SI$ 用户代码切片 (共 {len(slices)} 个系统切片)")
 

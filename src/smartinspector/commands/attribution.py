@@ -47,37 +47,46 @@ def _extract_method_from_anonymous(fqn: str) -> str:
     - OuterClass$MethodName$1$2 → multi-level anonymous, MethodName is the method
     - OuterClass$$inlined$lambda$0 → Kotlin inlined lambda, no method context
 
-    Heuristic: the segment immediately before the trailing $number is the
-    method name if it starts with a lowercase letter (Java/Kotlin convention)
-    and is not a Kotlin compiler artifact.
+    Heuristic: walk $-segments from the end, skipping numeric (anonymous index)
+    segments, until we find a segment that looks like a method name (starts with
+    a lowercase letter and is not a Kotlin compiler artifact).
     """
     m = _ANON_SUFFIX.search(fqn)
     if not m:
         return ""
     prefix = fqn[:m.start()]
     # Need at least one $ in prefix to have a segment before the trailing $N
-    # (e.g. OuterClass$Method$1 has prefix "OuterClass$Method")
     if "$" not in prefix:
         return ""
-    # Take the segment between the last two $ signs
-    last_seg = prefix.rsplit("$", 1)[-1]
-    # Method names start with lowercase in Java/Kotlin
-    if not last_seg or not last_seg[0].islower():
-        return ""
-    # Filter out Kotlin compiler artifacts
-    if last_seg == "lambda":
-        return ""
-    # Segments containing "$" are compiler-generated, not user method names
-    if "$" in last_seg:
-        return ""
-    # Check if the segment is preceded by "lambda$" in the original prefix
-    # (e.g. Outer$lambda$click$1 → "click" is part of a lambda descriptor)
-    if "$lambda$" in prefix:
-        # The last_seg after $lambda$ is a lambda descriptor, not a method name
-        lambda_idx = prefix.rfind("$lambda$")
-        if lambda_idx >= 0 and prefix[lambda_idx + 8:].startswith(last_seg):
-            return ""
-    return last_seg
+
+    # Walk $-segments from the end, skipping numeric anonymous indices
+    # e.g. "Outer$doWork$1" → segments ["Outer", "doWork", "1"]
+    #      "Outer$doWork$1$2" → after first peel: "Outer$doWork$1"
+    #        → segments ["Outer", "doWork", "1"] → skip "1" → "doWork"
+    remaining = prefix
+    while "$" in remaining:
+        last_seg = remaining.rsplit("$", 1)[-1]
+        remaining = remaining.rsplit("$", 1)[0]
+        # Skip numeric anonymous indices (e.g. "1", "2")
+        if last_seg.isdigit():
+            continue
+        # Method names start with lowercase in Java/Kotlin
+        if not last_seg or not last_seg[0].islower():
+            continue
+        # Filter out Kotlin compiler artifacts
+        if last_seg in ("lambda", "inlined"):
+            continue
+        # Segments containing "$" are compiler-generated, not user method names
+        if "$" in last_seg:
+            continue
+        # Check if the segment is preceded by "lambda$" in the original prefix
+        # (e.g. Outer$lambda$click$1 → "click" is part of a lambda descriptor)
+        if "$lambda$" in prefix:
+            lambda_idx = prefix.rfind("$lambda$")
+            if lambda_idx >= 0 and prefix[lambda_idx + 8:].startswith(last_seg):
+                continue
+        return last_seg
+    return ""
 
 
 def _extract_method_from_stack(stack_trace: list[str]) -> str:
@@ -280,6 +289,11 @@ _SYSTEM_CLASS_PATTERNS = (
     "View",                   # android.view.View (short match)
     "ViewGroup",              # android.view.ViewGroup
     "RecyclerView",           # androidx.recyclerview.widget.RecyclerView
+    "GapWorker",              # androidx.recyclerview.widget.GapWorker
+    "LinearLayoutManager",    # androidx.recyclerview.widget.LinearLayoutManager
+    "GestureDetector",        # android.view.GestureDetector
+    "InputMethodManager",     # android.view.inputmethod.InputMethodManager
+    "PhoneWindow",            # com.android.internal.policy.PhoneWindow
 )
 
 # RV pipeline method names — these belong to RecyclerView/LayoutManager, not user code
@@ -444,13 +458,21 @@ def _is_block_system_class(raw_name: str) -> bool:
     hash_idx = body.rfind("#")
     if hash_idx >= 0 and body[hash_idx:].endswith("ms"):
         body = body[:hash_idx]
-    # body is now: app.FragmentManager$5 or view.Choreographer$FrameDisplayEventReceiver
+    # body is now: "view.Choreographer$FrameDisplayEventReceiver.run"
+    #   or: "app.FragmentManager$5"
+    # Use _split_fqn_method to properly separate FQN from method name,
+    # since block tags may include a trailing ".method" that simple
+    # rsplit(".", 1) would mistake for the class name segment.
+    fqn, _method = _split_fqn_method(body)
+    # If _split_fqn_method didn't split (method segment looks like a class),
+    # fall back to using the full body as the FQN.
+    if not fqn:
+        fqn = body
     # Take segment after last dot (the class+inner part)
-    if "." in body:
-        body = body.rsplit(".", 1)[-1]
-    # body is now: FragmentManager$5 or Choreographer$FrameDisplayEventReceiver
+    short_name = fqn.rsplit(".", 1)[-1] if "." in fqn else fqn
+    # short_name is now: Choreographer$FrameDisplayEventReceiver or FragmentManager$5
     for pattern in _SYSTEM_CLASS_PATTERNS:
-        if body == pattern or body.startswith(pattern + "$"):
+        if short_name == pattern or short_name.startswith(pattern + "$"):
             return True
     return False
 
@@ -482,16 +504,34 @@ def _attach_block_stacks(attributable: list[dict], block_events: list[dict]) -> 
         dur_ms = block.get("dur_ms", 0)
         stack = block.get("stack_trace", [])
 
-        # For anonymous inner classes, the actual method (e.g. "run") is
-        # in the stack trace, not in the class name.  Use it as the primary
-        # method name and store the context method (e.g. "startMainThreadWork")
-        # for search hints.
+        # For anonymous inner classes ($N suffix in FQN), the method name
+        # derived from the FQN (via _extract_method_from_anonymous) is the
+        # enclosing method that *defines* the anonymous class (e.g.
+        # "startMainThreadWork" from CpuBurnWorker$startMainThreadWork$1),
+        # NOT the method actually executed (e.g. "run").
+        # Strategy:
+        #   - Always treat the FQN-derived method as context_method.
+        #   - Get the real executed method from stack trace.
+        #   - If no stack trace, keep method_name as-is (enclosing method
+        #     from extract_method) — fast path will use context_method to
+        #     locate the correct code.
         context_method = ""
-        if "$" in raw_name and stack:
-            stack_method = _extract_method_from_stack(stack)
-            if stack_method and stack_method != method_name:
-                context_method = method_name
-                method_name = stack_method
+        if "$" in raw_name:
+            # Extract FQN from block tag: SI$block#pkg.Class$Enclosing$N#NNms
+            block_body = raw_name[9:]  # strip "SI$block#"
+            hash_idx = block_body.rfind("#")
+            if hash_idx >= 0 and block_body[hash_idx:].endswith("ms"):
+                fqn = block_body[:hash_idx]
+            else:
+                fqn = block_body
+            enclosing = _extract_method_from_anonymous(fqn)
+            if enclosing:
+                context_method = enclosing
+                # Only override method_name if we have a stack trace
+                if stack:
+                    stack_method = _extract_method_from_stack(stack)
+                    if stack_method and stack_method != enclosing:
+                        method_name = stack_method
 
         key = f"{class_name}.{method_name}"
 

@@ -1568,14 +1568,32 @@ def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
     )
     tp = TraceProcessor(trace=trace_path, config=config)
     try:
-        # Slices overlapping the selected time range
-        slice_rows = tp.query(f"""
+        # Slices overlapping the selected time range.
+        # SI$block# slices have dur≈0 (beginSection+endSection are adjacent),
+        # so a single ORDER BY dur DESC would squeeze them out.  Query in two
+        # batches: all SI$ slices first, then top non-SI$ slices by duration.
+        si_rows = tp.query(f"""
             SELECT id, name, ts, dur, depth, track_id, cat, parent_id
             FROM slice
             WHERE ts <= {ts_ns + dur_ns} AND ts + dur >= {ts_ns}
-            ORDER BY dur DESC
-            LIMIT 50
+              AND name LIKE 'SI$%%'
         """)
+        si_ids = set()
+        si_slices_raw = []
+        for r in si_rows:
+            si_ids.add(r.id)
+            si_slices_raw.append(r)
+
+        remaining = 50 - len(si_slices_raw)
+        other_rows = tp.query(f"""
+            SELECT id, name, ts, dur, depth, track_id, cat, parent_id
+            FROM slice
+            WHERE ts <= {ts_ns + dur_ns} AND ts + dur >= {ts_ns}
+              AND name NOT LIKE 'SI$%%'
+            ORDER BY dur DESC
+            LIMIT {max(remaining, 0)}
+        """)
+        slice_rows = list(si_slices_raw) + list(other_rows)
         slices = []
         for r in slice_rows:
             slices.append({
@@ -1625,6 +1643,10 @@ def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
             if chain:
                 call_chains.append(chain)
 
+        # Correlate SI$block# slices with SIBlock logcat entries for stack traces.
+        # This mirrors the bisect-based correlation in collect_block_events().
+        _correlate_block_stacks_from_logcat(tp, slices, ts_ns, ts_ns + dur_ns)
+
         return {
             "ts_ns": ts_ns,
             "dur_ns": dur_ns,
@@ -1635,6 +1657,68 @@ def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
         }
     finally:
         tp.close()
+
+
+def _correlate_block_stacks_from_logcat(tp, slices: list[dict],
+                                          range_start_ns: int, range_end_ns: int):
+    """Correlate SI$block# slices with SIBlock logcat entries for stack traces.
+
+    Modifies slices in-place, adding 'stack_trace' field to block slices.
+    This mirrors the bisect-based correlation in collect_block_events().
+    """
+    import bisect
+
+    block_slices = [s for s in slices if s["name"].startswith("SI$block#")]
+    if not block_slices:
+        return
+
+    # Query android.log for SIBlock entries within the expanded time range
+    try:
+        log_rows = tp.query(f"""
+            SELECT ts, msg
+            FROM android.log
+            WHERE msg LIKE 'SIBlock|%|%'
+              AND ts >= {range_start_ns - 500_000_000}
+              AND ts <= {range_end_ns + 500_000_000}
+            ORDER BY ts ASC
+        """)
+        log_entries = []
+        for r in log_rows:
+            log_entries.append({"ts_ns": r.ts, "msg": r.msg or ""})
+    except Exception:
+        for s in block_slices:
+            s["stack_trace"] = []
+        return
+
+    if not log_entries:
+        for s in block_slices:
+            s["stack_trace"] = []
+        return
+
+    log_ts_list = sorted(
+        [(log["ts_ns"], log) for log in log_entries],
+        key=lambda x: x[0],
+    )
+    log_timestamps = [t for t, _ in log_ts_list]
+    MATCH_WINDOW_NS = 500_000_000  # 500ms
+
+    for block in block_slices:
+        block_ts = block["ts_ns"]
+        idx = bisect.bisect_left(log_timestamps, block_ts)
+        best_match = None
+        best_dist = MATCH_WINDOW_NS + 1
+
+        for candidate_idx in (idx - 1, idx):
+            if 0 <= candidate_idx < len(log_ts_list):
+                dist = abs(log_ts_list[candidate_idx][0] - block_ts)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_match = log_ts_list[candidate_idx][1]
+
+        if best_match and best_dist <= MATCH_WINDOW_NS:
+            block["stack_trace"] = _parse_siblock_msg(best_match["msg"])
+        else:
+            block["stack_trace"] = []
 
 
 def _walk_call_chain(tp, slice_id: int, seen: set[int]) -> dict:

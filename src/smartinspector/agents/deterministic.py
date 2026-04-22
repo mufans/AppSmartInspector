@@ -55,6 +55,7 @@ def compute_hints(perf_json: str) -> str:
         _rank_rv_hotspots(data),
         _correlate_jank_frames(data, frame_budget_ms),
         _identify_cpu_hotspots(data),
+        _analyze_thread_state(data),
     ]
 
     return "\n\n".join(s for s in sections if s)
@@ -319,3 +320,55 @@ def _identify_cpu_hotspots(data: dict) -> str:
             lines.append(f"    {t.get('name', '?')}: {t['cpu_pct']:.1f}%")
 
     return "\n".join(lines) if len(lines) > 1 else ""
+
+
+# ---------------------------------------------------------------------------
+# Helper 6: Thread state analysis (Running vs Sleeping vs DiskSleep)
+# ---------------------------------------------------------------------------
+
+def _analyze_thread_state(data: dict) -> str:
+    """Analyze per-slice thread state distribution to distinguish code-slow vs blocked.
+
+    For each SI$ slice with thread_state data, reports whether the thread was
+    primarily Running (code is slow) or Sleeping/DiskSleep (blocked by IO/lock).
+    """
+    thread_states = data.get("thread_state") or []
+    if not thread_states:
+        return ""
+
+    lines = ["[线程状态分析]"]
+
+    # Classify slices by dominant state
+    blocked_slices = []   # Sleeping/DiskSleep dominant
+    running_slices = []   # Running dominant, slow
+
+    for ts in thread_states:
+        dominant = ts.get("dominant_state", "unknown")
+        dur = ts.get("dur_ms", 0)
+        name = ts.get("slice_name", "?")
+        dist = ts.get("state_distribution", {})
+
+        if dominant in ("Sleeping", "DiskSleep"):
+            blocked_slices.append((name, dominant, dur, dist))
+        elif dominant == "Running" and dur > 5:
+            running_slices.append((name, dur, dist))
+
+    if blocked_slices:
+        lines.append("  以下切片主要处于阻塞状态（非代码慢，而是被IO/锁挂起）：")
+        for name, state, dur, dist in sorted(blocked_slices, key=lambda x: -x[2]):
+            dist_str = ", ".join(f"{k} {v:.0f}%" for k, v in dist.items())
+            # Shorten slice name for readability
+            short = name.replace("SI$", "").split("#")[0] if "#" in name else name.replace("SI$", "")
+            lines.append(f"    {short} ({dur:.1f}ms): {dist_str}")
+
+    if running_slices:
+        lines.append("  以下切片主要在执行用户代码（Running状态）：")
+        for name, dur, dist in sorted(running_slices, key=lambda x: -x[1])[:5]:
+            running_pct = dist.get("Running", 0)
+            short = name.replace("SI$", "").split("#")[0] if "#" in name else name.replace("SI$", "")
+            lines.append(f"    {short} ({dur:.1f}ms): Running {running_pct:.0f}%")
+
+    if not blocked_slices and not running_slices:
+        return ""
+
+    return "\n".join(lines)

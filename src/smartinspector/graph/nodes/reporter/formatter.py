@@ -58,6 +58,21 @@ def format_perf_sections(perf_json: str) -> list[str]:
             if len(vs_lines) > 1:
                 user_parts.append("\n".join(vs_lines))
 
+    # Thread state analysis — Running vs Sleeping vs DiskSleep
+    thread_states = perf_data.get("thread_state", [])
+    if thread_states:
+        ts_lines = ["## 线程状态分析 (Running/Sleeping/DiskSleep)\n"]
+        ts_lines.append("区分\"代码慢\"(Running)和\"被阻塞\"(Sleeping/DiskSleep)：")
+        for ts in thread_states[:10]:
+            name = ts.get("slice_name", "?")
+            dur = ts.get("dur_ms", 0)
+            dominant = ts.get("dominant_state", "?")
+            dist = ts.get("state_distribution", {})
+            dist_str = ", ".join(f"{k} {v:.0f}%" for k, v in dist.items())
+            short = name.replace("SI$", "") if name.startswith("SI$") else name
+            ts_lines.append(f"- {short} ({dur:.1f}ms): {dist_str} [主导: {dominant}]")
+        user_parts.append("\n".join(ts_lines))
+
     return user_parts
 
 

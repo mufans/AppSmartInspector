@@ -183,6 +183,7 @@ def _deterministic_search(group: list[dict], file_cache: _FileCache) -> list[dic
 
         cn = issue["class_name"]
         mn = issue["method_name"]
+        context_method = issue.get("context_method", "")
         source_dir = get_source_dir()
 
         # Step 1: Glob to find the file
@@ -208,6 +209,7 @@ def _deterministic_search(group: list[dict], file_cache: _FileCache) -> list[dic
                     file_cache.put("glob", glob_args_java, glob_result)
 
         if glob_result.startswith("No files") or glob_result.startswith("Error"):
+            debug_log("attributor", f"  [fast-path] {cn}.{mn} -> system_class (glob: {glob_result[:60]})")
             result["reason"] = "system_class"
             results.append(result)
             continue
@@ -233,8 +235,13 @@ def _deterministic_search(group: list[dict], file_cache: _FileCache) -> list[dic
         result["file_path"] = file_path
 
         # Step 2: Grep for method signature
+        # When context_method is set (anonymous inner class like Runnable.run inside
+        # startMainThreadWork), search for the context_method to locate the enclosing
+        # method — the actual performance-relevant code is inside it, not in a generic
+        # method like "run".
+        search_method = context_method if context_method else mn
         grep_args = {
-            "pattern": mn,
+            "pattern": search_method,
             "path": file_path,
             "output_mode": "content",
             "head_limit": 5,
@@ -242,10 +249,15 @@ def _deterministic_search(group: list[dict], file_cache: _FileCache) -> list[dic
         grep_result = grep.invoke(grep_args)
 
         if grep_result.startswith("No matches") or grep_result.startswith("Error"):
-            # Method not found in file — still mark file as found but method as not_found
-            result["reason"] = "found_file_only"
-            results.append(result)
-            continue
+            # If context_method search failed, try the original method name
+            if context_method:
+                grep_args["pattern"] = mn
+                grep_result = grep.invoke(grep_args)
+            if grep_result.startswith("No matches") or grep_result.startswith("Error"):
+                # Method not found in file — still mark file as found but method as not_found
+                result["reason"] = "found_file_only"
+                results.append(result)
+                continue
 
         # Parse first matching line number
         line_start = None
@@ -293,6 +305,10 @@ def _deterministic_search(group: list[dict], file_cache: _FileCache) -> list[dic
 
         snippet = "\n".join(snippet_lines[:40])
 
+        # Store context_method in result for downstream consumers
+        if context_method:
+            result["context_method"] = context_method
+
         result.update({
             "attributable": True,
             "reason": "found",
@@ -300,11 +316,82 @@ def _deterministic_search(group: list[dict], file_cache: _FileCache) -> list[dic
             "line_start": line_start,
             "line_end": end_line,
             "source_snippet": snippet,
+            "_fast_path": True,
         })
-        print(f"    [fast-path] {cn}.{mn} -> {file_path}:{line_start}", flush=True)
+        search_desc = f"{cn}.{mn}"
+        if context_method:
+            search_desc += f" (via context_method={context_method})"
+        debug_log("attributor", f"  [fast-path] {search_desc} -> {file_path}:{line_start}")
         results.append(result)
 
     return results
+
+
+def _analyze_snippets(results: list[dict]) -> None:
+    """Run lightweight LLM analysis on fast-path results that have raw source_snippet.
+
+    Replaces source_snippet (raw code) with LLM-generated analysis text,
+    matching the behavior of the full LLM path where source_snippet stores
+    the finding/analysis, not raw code.
+
+    Fails gracefully: on any error, keeps the original raw snippet.
+    """
+    to_analyze = [(i, r) for i, r in enumerate(results)
+                  if r.get("attributable") and r.get("source_snippet") and r.get("_fast_path")]
+    if not to_analyze:
+        return
+
+    prompt_parts = []
+    for _, r in to_analyze:
+        snippet = r["source_snippet"]
+        # Truncate very long snippets to keep token usage reasonable
+        if len(snippet) > 2000:
+            snippet = snippet[:2000] + "\n... (truncated)"
+        cm = f"{r['class_name']}.{r['method_name']}"
+        ctx = ""
+        if r.get("context_method"):
+            ctx = f" (匿名类定义在 {r['context_method']} 内)"
+        prompt_parts.append(
+            f"## {cm} ({r['dur_ms']:.2f}ms){ctx}\n"
+            f"文件: {r['file_path']}:{r['line_start']}-{r['line_end']}\n"
+            f"```\n{snippet}\n```"
+        )
+
+    user_msg = (
+        "分析以下 Android 源码片段，找出性能问题和潜在瓶颈。"
+        "对每个方法输出一行，格式严格如下:\n"
+        "FINDING: ClassName.methodName | 关键发现描述\n\n"
+        + "\n\n".join(prompt_parts)
+    )
+
+    try:
+        llm = ChatOpenAI(**get_llm_kwargs(role="attributor", temperature=0))
+        response = llm.invoke([HumanMessage(content=user_msg)])
+        get_tracker().record_from_message("attributor", response)
+
+        # Parse FINDING lines from response
+        findings: dict[str, str] = {}
+        for line in response.content.split("\n"):
+            line = line.strip()
+            if not line.startswith("FINDING:"):
+                continue
+            parts = line[8:].split("|", 1)
+            if len(parts) == 2:
+                cm_key = parts[0].strip()
+                finding_text = parts[1].strip()
+                findings[cm_key] = finding_text
+
+        # Match findings to results and replace source_snippet
+        for _, r in to_analyze:
+            cm = f"{r['class_name']}.{r['method_name']}"
+            if cm in findings:
+                r["source_snippet"] = findings[cm]
+                debug_log("attributor", f"  [fast-path] LLM analysis for {cm}: {findings[cm][:80]}")
+            else:
+                debug_log("attributor", f"  [fast-path] no FINDING match for {cm}, keeping raw snippet")
+
+    except Exception as e:
+        debug_log("attributor", f"  [fast-path] LLM analysis failed: {e}, keeping raw snippets")
 
 
 def run_attribution(attributable: list[dict], on_progress=None) -> list[dict]:
@@ -342,13 +429,18 @@ def run_attribution(attributable: list[dict], on_progress=None) -> list[dict]:
     results: list[dict] = []
 
     for group in groups:
+        group_label = ", ".join(f"{g['class_name']}.{g['method_name']}" for g in group)
         # Fast path: deterministic search for straightforward cases
         if _can_use_fast_path(group):
+            debug_log("attributor", f"fast path: searching {group_label}")
             fast_results = _deterministic_search(group, file_cache)
+            found_count = sum(1 for r in fast_results if r.get("reason") == "found")
             if all(r.get("reason") == "found" for r in fast_results):
                 results.extend(fast_results)
+                debug_log("attributor", f"fast path: all {found_count} found for {group_label}")
                 continue
             # Partial success: merge found results, fall back to LLM for rest
+            debug_log("attributor", f"fast path: {found_count}/{len(fast_results)} found, rest falls back to LLM for {group_label}")
             failed_issues = []
             for r, issue in zip(fast_results, group):
                 if r.get("reason") == "found":
@@ -362,6 +454,16 @@ def run_attribution(attributable: list[dict], on_progress=None) -> list[dict]:
 
         group_results = _search_group(group, file_cache, on_progress)
         results.extend(group_results)
+
+    # Analyze fast-path results with lightweight LLM call
+    fast_path_results = [r for r in results if r.get("_fast_path")]
+    if fast_path_results:
+        debug_log("attributor", f"analyzing {len(fast_path_results)} fast-path snippets with LLM")
+        _analyze_snippets(results)
+
+    # Clean up internal markers before returning
+    for r in results:
+        r.pop("_fast_path", None)
 
     # Sort by dur_ms descending
     results.sort(key=lambda x: -x.get("dur_ms", 0))
@@ -609,6 +711,10 @@ def _build_group_prompt(group: list[dict]) -> str:
             outer = cn.split("$")[0]
             line += f", 内部类:用Glob搜索外部类 {outer}"
             line += f", RESULT行请用完整类名: {cn}.{issue['method_name']}"
+        # When context_method is set (anonymous inner class), hint to search
+        # for the enclosing method first — the actual code is inside it
+        if issue.get("context_method"):
+            line += f", 匿名类在方法 {issue['context_method']}() 中定义,请先Grep {issue['context_method']} 定位外层方法,然后在其中找 {issue['method_name']} 的实现"
         # Append BlockMonitor stack trace if available
         if issue.get("stack_trace"):
             line += f", 堆栈:{issue['stack_trace'][0]}"
