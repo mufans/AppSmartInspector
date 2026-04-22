@@ -1095,16 +1095,27 @@ class PerfettoCollector:
             if dur_ms < 1.0:
                 continue
 
-            # Query thread_state for this slice's time window on main thread
+            # Query thread_state overlapping the slice window on main thread.
+            # Use overlap-based calculation: find all thread_state entries that
+            # overlap with the slice and compute exact overlap duration per state.
+            # This handles entries that straddle slice boundaries (very common for
+            # long Running states during active execution).
+            slice_end = slice_ts + slice_dur
             try:
                 state_rows = tp.query(f"""
                     SELECT
                       state,
-                      SUM(dur) AS state_dur_ns
+                      SUM(
+                        MIN(
+                          CASE WHEN dur < 0 THEN {slice_end} ELSE ts + dur END,
+                          {slice_end}
+                        ) -
+                        MAX(ts, {slice_ts})
+                      ) AS state_dur_ns
                     FROM thread_state
                     WHERE utid = {main_utid}
-                      AND ts >= {slice_ts}
-                      AND ts + dur <= {slice_ts} + {slice_dur}
+                      AND ts < {slice_end}
+                      AND (dur < 0 OR ts + dur > {slice_ts})
                     GROUP BY state
                     ORDER BY state_dur_ns DESC
                 """)
@@ -1278,6 +1289,22 @@ class PerfettoCollector:
         # Thread state analysis (Running/S/D per SI$ slice)
         try:
             summary.thread_state = self.collect_thread_state()
+            logger.debug("thread_state: collected %d entries", len(summary.thread_state))
+            if not summary.thread_state:
+                # Diagnose why thread_state is empty
+                try:
+                    tp = self._open()
+                    ts_count = 0
+                    for r in tp.query("SELECT COUNT(*) as c FROM thread_state"):
+                        ts_count = r.c
+                        break
+                    ts_main = 0
+                    for r in tp.query("SELECT COUNT(*) as c FROM thread_state WHERE utid IN (SELECT utid FROM thread WHERE name = 'main')"):
+                        ts_main = r.c
+                        break
+                    logger.debug("thread_state diagnosis: total=%d, main_thread=%d", ts_count, ts_main)
+                except Exception as e2:
+                    logger.debug("thread_state diagnosis failed: %s", e2)
         except Exception as e:
             logger.debug("thread_state collection failed: %s", e)
 
