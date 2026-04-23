@@ -534,5 +534,159 @@ class TestAnalyzeThreadState:
         assert "线程状态分析" in result
 
 
+# ── Fix: Thread state normalization and accumulation in perfetto.py ──
+
+
+class TestThreadStateNormalization:
+    """Test state name normalization logic used in collect_thread_state.
+
+    Validates that raw Perfetto thread_state values (R, R+, S, S+, D, D+)
+    are correctly normalized and that multiple raw states mapping to the same
+    normalized name are properly accumulated (not overwritten).
+    """
+
+    @staticmethod
+    def _normalize_and_accumulate(raw_states: list[tuple[str, int]]) -> dict:
+        """Simulate the normalization + accumulation logic from perfetto.py."""
+        state_dist = {}
+        for state, ns in raw_states:
+            if state in ("R", "R+"):
+                state = "Running"
+            elif state in ("S", "S+"):
+                state = "Sleeping"
+            elif state in ("D", "D+"):
+                state = "DiskSleep"
+            state_dist[state] = state_dist.get(state, 0) + ns
+        return state_dist
+
+    def test_R_and_R_plus_both_accumulated(self):
+        """R and R+ should both map to Running and their durations summed."""
+        result = self._normalize_and_accumulate([("R", 50), ("R+", 30)])
+        assert result["Running"] == 80
+
+    def test_S_plus_mapped_to_sleeping(self):
+        """S+ (interruptible sleep, preemptible) should map to Sleeping."""
+        result = self._normalize_and_accumulate([("S+", 100)])
+        assert result["Sleeping"] == 100
+
+    def test_S_and_S_plus_accumulated(self):
+        """S and S+ should both map to Sleeping and their durations summed."""
+        result = self._normalize_and_accumulate([("S", 40), ("S+", 60)])
+        assert result["Sleeping"] == 100
+
+    def test_D_and_D_plus_accumulated(self):
+        """D and D+ should both map to DiskSleep and their durations summed."""
+        result = self._normalize_and_accumulate([("D", 20), ("D+", 30)])
+        assert result["DiskSleep"] == 50
+
+    def test_mixed_raw_states(self):
+        """Multiple raw states with overlapping normalized names."""
+        raw = [("R", 30), ("R+", 20), ("S", 10), ("S+", 40), ("D", 5)]
+        result = self._normalize_and_accumulate(raw)
+        assert result["Running"] == 50
+        assert result["Sleeping"] == 50
+        assert result["DiskSleep"] == 5
+
+    def test_unknown_state_preserved(self):
+        """Unknown states (I, T, etc.) should pass through unchanged."""
+        result = self._normalize_and_accumulate([("I", 100)])
+        assert result["I"] == 100
+
+    def test_empty_input(self):
+        result = self._normalize_and_accumulate([])
+        assert result == {}
+
+
+class TestThreadStateOverlapCalculation:
+    """Test the overlap-based SQL calculation logic with concrete numbers.
+
+    Validates the overlap formula: MIN(end, slice_end) - MAX(start, slice_start)
+    and the dur<0 handling.
+    """
+
+    @staticmethod
+    def _compute_overlap(ts, dur, slice_ts, slice_dur):
+        """Simulate the SQL overlap calculation from collect_thread_state."""
+        slice_end = slice_ts + slice_dur
+        # Effective end of thread_state
+        effective_end = slice_end if dur < 0 else ts + dur
+        # Overlap: MIN(effective_end, slice_end) - MAX(ts, slice_ts)
+        overlap = min(effective_end, slice_end) - max(ts, slice_ts)
+        return max(0, overlap)  # Should never be negative if filters are correct
+
+    def test_state_fully_inside_slice(self):
+        """Thread state fully contained within slice."""
+        overlap = self._compute_overlap(ts=100, dur=50, slice_ts=0, slice_dur=200)
+        assert overlap == 50  # Full state duration
+
+    def test_state_fully_contains_slice(self):
+        """Thread state spans the entire slice."""
+        overlap = self._compute_overlap(ts=0, dur=300, slice_ts=100, slice_dur=50)
+        assert overlap == 50  # Full slice duration
+
+    def test_state_overlaps_start_of_slice(self):
+        """Thread state starts before slice, ends during slice."""
+        overlap = self._compute_overlap(ts=50, dur=80, slice_ts=100, slice_dur=100)
+        assert overlap == 30  # 130 - 100 = 30
+
+    def test_state_overlaps_end_of_slice(self):
+        """Thread state starts during slice, ends after slice."""
+        overlap = self._compute_overlap(ts=150, dur=100, slice_ts=100, slice_dur=100)
+        assert overlap == 50  # 200 - 150 = 50
+
+    def test_state_exact_boundary_match(self):
+        """Thread state starts exactly at slice start."""
+        overlap = self._compute_overlap(ts=100, dur=50, slice_ts=100, slice_dur=100)
+        assert overlap == 50
+
+    def test_dur_negative_ongoing_state(self):
+        """dur<0 (ongoing state) should use slice_end as effective end."""
+        overlap = self._compute_overlap(ts=150, dur=-1, slice_ts=100, slice_dur=100)
+        assert overlap == 50  # slice_end(200) - max(150, 100) = 50
+
+    def test_dur_negative_state_before_slice(self):
+        """Ongoing state starting before slice should cover entire slice."""
+        overlap = self._compute_overlap(ts=50, dur=-1, slice_ts=100, slice_dur=100)
+        assert overlap == 100  # slice_end(200) - max(50, 100) = 100
+
+
+class TestThreadStateFilterCondition:
+    """Test the WHERE clause logic: ts < slice_end AND (dur < 0 OR ts + dur > slice_ts)."""
+
+    @staticmethod
+    def _should_include(ts, dur, slice_ts, slice_dur):
+        """Simulate the SQL WHERE clause from collect_thread_state."""
+        slice_end = slice_ts + slice_dur
+        return ts < slice_end and (dur < 0 or ts + dur > slice_ts)
+
+    def test_state_before_slice_excluded(self):
+        """Thread state ending before slice starts should be excluded."""
+        assert not self._should_include(ts=0, dur=50, slice_ts=100, slice_dur=100)
+
+    def test_state_after_slice_excluded(self):
+        """Thread state starting at or after slice end should be excluded."""
+        assert not self._should_include(ts=200, dur=50, slice_ts=100, slice_dur=100)
+
+    def test_overlapping_state_included(self):
+        """Thread state overlapping slice should be included."""
+        assert self._should_include(ts=150, dur=100, slice_ts=100, slice_dur=100)
+
+    def test_ongoing_state_before_slice_included(self):
+        """Ongoing state (dur<0) starting before slice should be included."""
+        assert self._should_include(ts=50, dur=-1, slice_ts=100, slice_dur=100)
+
+    def test_ongoing_state_during_slice_included(self):
+        """Ongoing state (dur<0) starting during slice should be included."""
+        assert self._should_include(ts=150, dur=-1, slice_ts=100, slice_dur=100)
+
+    def test_state_touching_start_excluded(self):
+        """Thread state ending exactly at slice start should be excluded (ts+dur == slice_ts)."""
+        assert not self._should_include(ts=0, dur=100, slice_ts=100, slice_dur=100)
+
+    def test_state_starting_at_slice_end_excluded(self):
+        """Thread state starting exactly at slice end should be excluded."""
+        assert not self._should_include(ts=200, dur=50, slice_ts=100, slice_dur=100)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

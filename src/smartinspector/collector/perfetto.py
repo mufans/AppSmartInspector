@@ -1127,15 +1127,13 @@ class PerfettoCollector:
                     total_state_ns += ns
                     # Normalize state names
                     state_name = st.state
-                    if state_name == "R" or state_name == "R+":
+                    if state_name in ("R", "R+"):
                         state_name = "Running"
-                    elif state_name == "S":
+                    elif state_name in ("S", "S+"):
                         state_name = "Sleeping"
-                    elif state_name == "D":
+                    elif state_name in ("D", "D+"):
                         state_name = "DiskSleep"
-                    elif state_name == "D+":
-                        state_name = "DiskSleep"
-                    state_dist[state_name] = ns
+                    state_dist[state_name] = state_dist.get(state_name, 0) + ns
 
                 # Convert to percentages
                 if total_state_ns > 0:
