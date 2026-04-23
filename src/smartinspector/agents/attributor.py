@@ -327,6 +327,195 @@ def _deterministic_search(group: list[dict], file_cache: _FileCache) -> list[dic
     return results
 
 
+# ---------------------------------------------------------------------------
+# P1-4: Dependency reference search — enrich context with related files
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+# Patterns for extracting dependency references from source files
+_IMPORT_RE = _re.compile(r'^\s*import\s+([\w.]+)\s*;', _re.MULTILINE)
+_R_LAYOUT_RE = _re.compile(r'R\.(?:layout)\.(\w+)')
+_R_ID_RE = _re.compile(r'R\.id\.(\w+)')
+_SET_CONTENT_VIEW_RE = _re.compile(r'setContentView\s*\(\s*R\.layout\.(\w+)')
+
+
+def _extract_project_imports(source: str, source_dir: str) -> list[str]:
+    """Extract import statements that refer to project-internal classes.
+
+    Filters out android.*, java.*, kotlin.*, androidx.*, com.google.*
+    and other standard library imports.
+    """
+    std_prefixes = (
+        "android.", "androidx.", "java.", "javax.", "kotlin.",
+        "kotlinx.", "com.google.", "com.android.", "dalvik.",
+        "org.intellij.", "org.jetbrains.",
+    )
+    project_classes: list[str] = []
+    for m in _IMPORT_RE.finditer(source):
+        fqn = m.group(1)
+        if fqn.startswith(std_prefixes):
+            continue
+        # Extract simple class name from FQN
+        simple_name = fqn.rsplit(".", 1)[-1]
+        # Skip inner class references ($)
+        if "$" in simple_name:
+            simple_name = simple_name.split("$")[0]
+        project_classes.append(simple_name)
+    return project_classes
+
+
+def _extract_layout_refs(source: str) -> list[str]:
+    """Extract XML layout file names referenced via R.layout.xxx."""
+    layouts: list[str] = []
+    seen: set[str] = set()
+    for m in _R_LAYOUT_RE.finditer(source):
+        name = m.group(1)
+        if name not in seen:
+            seen.add(name)
+            layouts.append(name)
+    return layouts
+
+
+def _enrich_with_dependencies(results: list[dict], file_cache: _FileCache) -> None:
+    """Enrich found results with dependency context: project imports and XML layouts.
+
+    For each result with a found file, reads the full file, extracts:
+      - Project-internal imports → search for those class files → read relevant snippets
+      - R.layout.xxx references → search for XML layout files → read relevant content
+
+    Appends the dependency context to each result's ``dependency_context`` field.
+    """
+    from smartinspector.config import get_source_dir as _get_source_dir
+
+    source_dir = _get_source_dir()
+    if not source_dir or not os.path.isdir(source_dir):
+        return
+
+    # Process each found result (limit to top 10 to avoid excessive reads)
+    found_results = [r for r in results if r.get("attributable") and r.get("file_path")]
+    for r in found_results[:10]:
+        file_path = r["file_path"]
+        if not os.path.isabs(file_path):
+            file_path = os.path.join(source_dir, file_path)
+
+        # Read the full source file to extract imports and layout refs
+        full_read_args = {"file_path": file_path, "offset": 1, "limit": 200}
+        cached = file_cache.get("read", full_read_args)
+        if cached is not None:
+            full_source = cached
+        else:
+            full_source = read.invoke(full_read_args)
+            if str(full_source).startswith("Error"):
+                continue
+            file_cache.put("read", full_read_args, str(full_source))
+
+        full_source_str = str(full_source)
+
+        # Extract dependency references
+        project_imports = _extract_project_imports(full_source_str, source_dir)
+        layout_refs = _extract_layout_refs(full_source_str)
+
+        dep_parts: list[str] = []
+
+        # Resolve project imports — glob for each class and read first few lines
+        for class_name in project_imports[:5]:  # limit to 5 imports
+            for ext in (".java", ".kt"):
+                glob_args = {"pattern": f"**/{class_name}{ext}", "path": source_dir}
+                glob_result = file_cache.get("glob", glob_args)
+                if glob_result is None:
+                    glob_result = glob.invoke(glob_args)
+                    if not glob_result.startswith("No files") and not glob_result.startswith("Error"):
+                        file_cache.put("glob", glob_args, glob_result)
+                if glob_result.startswith("No files") or glob_result.startswith("Error"):
+                    continue
+
+                # Parse first file path
+                dep_file = None
+                for line in glob_result.split("\n"):
+                    line = line.strip()
+                    if not line or line.startswith("Found") or line.startswith("(") or line.startswith("["):
+                        continue
+                    if not line.startswith("/"):
+                        line = os.path.join(source_dir, line)
+                    dep_file = line
+                    break
+
+                if dep_file:
+                    # Read first 30 lines (class declaration + key fields)
+                    dep_read_args = {"file_path": dep_file, "offset": 1, "limit": 30}
+                    dep_content = file_cache.get("read", dep_read_args)
+                    if dep_content is None:
+                        dep_content = read.invoke(dep_read_args)
+                        if not str(dep_content).startswith("Error"):
+                            file_cache.put("read", dep_read_args, str(dep_content))
+                    if not str(dep_content).startswith("Error"):
+                        # Extract clean lines
+                        clean_lines = []
+                        for ln in str(dep_content).split("\n"):
+                            ln = ln.strip()
+                            if ln.startswith("(") or not ln:
+                                continue
+                            colon_idx = ln.find(": ")
+                            if colon_idx >= 0:
+                                clean_lines.append(ln[colon_idx + 2:])
+                        if clean_lines:
+                            short_path = dep_file
+                            if short_path.startswith(source_dir):
+                                short_path = short_path[len(source_dir):].lstrip("/")
+                            dep_parts.append(f"[关联类] {class_name} -> {short_path}\n" + "\n".join(clean_lines[:20]))
+                    break  # found .java or .kt, no need to try other extension
+
+        # Resolve XML layout references
+        for layout_name in layout_refs[:3]:  # limit to 3 layouts
+            glob_args = {"pattern": f"**/{layout_name}.xml", "path": source_dir}
+            glob_result = file_cache.get("glob", glob_args)
+            if glob_result is None:
+                glob_result = glob.invoke(glob_args)
+                if not glob_result.startswith("No files") and not glob_result.startswith("Error"):
+                    file_cache.put("glob", glob_args, glob_result)
+            if glob_result.startswith("No files") or glob_result.startswith("Error"):
+                continue
+
+            xml_file = None
+            for line in glob_result.split("\n"):
+                line = line.strip()
+                if not line or line.startswith("Found") or line.startswith("(") or line.startswith("["):
+                    continue
+                if not line.startswith("/"):
+                    line = os.path.join(source_dir, line)
+                xml_file = line
+                break
+
+            if xml_file:
+                xml_read_args = {"file_path": xml_file, "offset": 1, "limit": 60}
+                xml_content = file_cache.get("read", xml_read_args)
+                if xml_content is None:
+                    xml_content = read.invoke(xml_read_args)
+                    if not str(xml_content).startswith("Error"):
+                        file_cache.put("read", xml_read_args, str(xml_content))
+                if not str(xml_content).startswith("Error"):
+                    clean_lines = []
+                    for ln in str(xml_content).split("\n"):
+                        ln = ln.strip()
+                        if ln.startswith("(") or not ln:
+                            continue
+                        colon_idx = ln.find(": ")
+                        if colon_idx >= 0:
+                            clean_lines.append(ln[colon_idx + 2:])
+                    if clean_lines:
+                        short_path = xml_file
+                        if short_path.startswith(source_dir):
+                            short_path = short_path[len(source_dir):].lstrip("/")
+                        dep_parts.append(f"[关联布局] {layout_name} -> {short_path}\n" + "\n".join(clean_lines[:40]))
+
+        if dep_parts:
+            r["dependency_context"] = "\n\n".join(dep_parts)
+            debug_log("attributor", f"  [dep-search] {r['class_name']}.{r['method_name']}: "
+                      f"{len(project_imports)} imports, {len(layout_refs)} layouts, "
+                      f"resolved {len(dep_parts)} deps")
+
+
 def _analyze_snippets(results: list[dict]) -> None:
     """Run lightweight LLM analysis on fast-path results that have raw source_snippet.
 
@@ -351,14 +540,19 @@ def _analyze_snippets(results: list[dict]) -> None:
         ctx = ""
         if r.get("context_method"):
             ctx = f" (匿名类定义在 {r['context_method']} 内)"
+        dep_ctx = ""
+        if r.get("dependency_context"):
+            dep_ctx = f"\n\n### 关联依赖上下文\n{r['dependency_context']}"
         prompt_parts.append(
             f"## {cm} ({r['dur_ms']:.2f}ms){ctx}\n"
             f"文件: {r['file_path']}:{r['line_start']}-{r['line_end']}\n"
             f"```\n{snippet}\n```"
+            f"{dep_ctx}"
         )
 
     user_msg = (
         "分析以下 Android 源码片段，找出性能问题和潜在瓶颈。"
+        "同时参考关联依赖上下文（import的类、XML布局）辅助分析。"
         "对每个方法输出一行，格式严格如下:\n"
         "FINDING: ClassName.methodName | 关键发现描述\n\n"
         + "\n\n".join(prompt_parts)
@@ -460,6 +654,12 @@ def run_attribution(attributable: list[dict], on_progress=None) -> list[dict]:
     if fast_path_results:
         debug_log("attributor", f"analyzing {len(fast_path_results)} fast-path snippets with LLM")
         _analyze_snippets(results)
+
+    # P1-4: Enrich found results with dependency context (imports + XML layouts)
+    found_results = [r for r in results if r.get("attributable") and r.get("file_path")]
+    if found_results:
+        debug_log("attributor", f"enriching {len(found_results)} results with dependency context")
+        _enrich_with_dependencies(results, file_cache)
 
     # Clean up internal markers before returning
     for r in results:

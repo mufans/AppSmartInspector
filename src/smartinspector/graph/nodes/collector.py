@@ -178,7 +178,7 @@ def collector_node(state: AgentState) -> dict:
         print(f"  [collector] Trace saved to {trace_path}", flush=True)
         debug_log("collector", f"trace_path: {trace_path}")
 
-        collector = PerfettoCollector(trace_path)
+        collector = PerfettoCollector(trace_path, target_process=target_process)
         summary = collector.summarize()
 
         # Request block events from app via WS (structured JSON, more reliable

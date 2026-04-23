@@ -66,10 +66,18 @@ class PerfSummary:
 class PerfettoCollector:
     """Collect and analyze Android Perfetto traces."""
 
-    def __init__(self, trace_path: str, shell_path: str | None = None):
+    def __init__(self, trace_path: str, shell_path: str | None = None,
+                 target_process: str | None = None):
         self.trace_path = trace_path
         self.shell_path = shell_path or str(SHELL_BIN)
         self._tp: TraceProcessor | None = None
+        self._target_process_cache: dict | None = None  # cached resolve result
+        if target_process:
+            # Pre-populate cache with package name so resolve can be triggered lazily
+            self._target_process_cache = {
+                "upid": None, "pid": None, "uid": None,
+                "name": target_process, "source": "",
+            }
 
     def _open(self) -> TraceProcessor:
         if self._tp is not None:
@@ -80,6 +88,89 @@ class PerfettoCollector:
         )
         self._tp = TraceProcessor(trace=self.trace_path, config=config)
         return self._tp
+
+    def _resolve_target_process(self, package_name: str) -> dict:
+        """Resolve target process info (upid, pid, uid) from package name.
+
+        Tries ``process`` table first, falls back to ``package_list`` table
+        for cold-start scenarios where the process table may be empty.
+
+        Args:
+            package_name: Android package name, e.g. "com.example.app"
+
+        Returns:
+            Dict with keys: upid, pid, uid, name, source ("process"|"package_list"|"")
+        """
+        if self._target_process_cache is not None:
+            return self._target_process_cache
+
+        result = {"upid": None, "pid": None, "uid": None, "name": package_name, "source": ""}
+        tp = self._open()
+
+        # Strategy 1: direct lookup in process table
+        try:
+            rows = tp.query(f"""
+                SELECT upid, pid, uid
+                FROM process
+                WHERE name = '{package_name}'
+                LIMIT 1
+            """)
+            for r in rows:
+                result["upid"] = r.upid
+                result["pid"] = r.pid
+                result["uid"] = r.uid
+                result["source"] = "process"
+                break
+        except Exception as e:
+            logger.debug("process table lookup failed: %s", e)
+
+        # Strategy 2: fallback to package_list -> uid -> process
+        if not result["upid"]:
+            try:
+                uid = None
+                pl_rows = tp.query(f"""
+                    SELECT uid
+                    FROM package_list
+                    WHERE package_name = '{package_name}'
+                    LIMIT 1
+                """)
+                for r in pl_rows:
+                    uid = r.uid
+                    break
+
+                if uid is not None:
+                    result["uid"] = uid
+                    # Find process by uid
+                    proc_rows = tp.query(f"""
+                        SELECT upid, pid, name
+                        FROM process
+                        WHERE uid = {uid}
+                        LIMIT 1
+                    """)
+                    for r in proc_rows:
+                        result["upid"] = r.upid
+                        result["pid"] = r.pid
+                        result["name"] = r.name
+                        result["source"] = "package_list"
+                        break
+
+                    if not result["upid"]:
+                        # package_list found UID but process not in process table yet
+                        # (cold start: process hasn't started during trace)
+                        result["source"] = "package_list_uid_only"
+                        logger.debug("package_list fallback: found uid=%d for %s but no process entry",
+                                     uid, package_name)
+            except Exception as e:
+                logger.debug("package_list fallback failed: %s", e)
+
+        if result["source"]:
+            logger.debug("resolved target process: %s -> upid=%s, pid=%s, uid=%s (via %s)",
+                         package_name, result["upid"], result["pid"], result["uid"], result["source"])
+        else:
+            logger.debug("could not resolve target process: %s", package_name)
+
+        self._target_process_cache = result
+        return result
 
     def close(self):
         if self._tp:
@@ -821,12 +912,67 @@ class PerfettoCollector:
                 "breakdown": breakdown,
             })
 
-        return {
+        # ---- P1-5: Annotate slices with target process info ----
+        target_process_info = {}
+        # Extract target process from metadata if available
+        target_pkg = self._target_process_cache.get("name", "") if self._target_process_cache else ""
+        if target_pkg:
+            target_process_info = self._resolve_target_process(target_pkg)
+        elif self._target_process_cache is None:
+            # Try to detect target process from slowest slices
+            # SI$ slices contain class names that include the package name
+            for s in slowest[:3]:
+                name = s.get("name", "")
+                if name.startswith("SI$"):
+                    # e.g. SI$com.example.app.Class.method
+                    body = name[3:]
+                    # Extract potential package from class name
+                    parts = body.split(".")
+                    if len(parts) >= 3:
+                        candidate_pkg = ".".join(parts[:3])
+                        info = self._resolve_target_process(candidate_pkg)
+                        if info.get("upid"):
+                            target_process_info = info
+                            break
+
+        # Annotate slowest slices with their process name (via track_id)
+        if target_process_info.get("upid"):
+            target_upid = target_process_info["upid"]
+            try:
+                # Build track_id -> upid mapping for the slowest slices
+                track_ids = set(s.get("track_id") for s in slowest if s.get("track_id"))
+                if track_ids:
+                    id_list = ",".join(str(tid) for tid in track_ids)
+                    track_proc_map = {}
+                    for r in tp.query(f"""
+                        SELECT t.id AS track_id, p.upid, p.name AS process_name
+                        FROM thread_track t
+                        JOIN thread th ON t.utid = th.utid
+                        JOIN process p ON th.upid = p.upid
+                        WHERE t.id IN ({id_list})
+                    """):
+                        track_proc_map[r.track_id] = {"upid": r.upid, "name": r.process_name}
+
+                    for s in slowest:
+                        proc_info = track_proc_map.get(s.get("track_id"))
+                        if proc_info:
+                            s["process_name"] = proc_info["name"]
+                            s["is_target"] = proc_info["upid"] == target_upid
+            except Exception as e:
+                logger.debug("track-process annotation failed: %s", e)
+
+        result = {
             "summary": sorted(name_stats.values(), key=lambda x: -x["total_ms"]),
             "slowest_slices": slowest,
             "rv_instances": rv_sorted,
             "call_chains": call_chains,
         }
+
+        # Include target process resolution info for downstream consumers
+        if target_process_info:
+            result["target_process"] = target_process_info
+
+        return result
 
     def collect_io_slices(self) -> dict:
         """Collect IO slices (SI$net#/SI$db#/SI$img#) from all threads.
@@ -1171,6 +1317,7 @@ class PerfettoCollector:
             "heap_graph_object": "SELECT COUNT(*) as c FROM heap_graph_object",
             "actual_frame_timeline_slice": "SELECT COUNT(*) as c FROM actual_frame_timeline_slice",
             "sched": "SELECT COUNT(*) as c FROM sched",
+            "package_list": "SELECT COUNT(*) as c FROM package_list",
         }
         result = {}
         for table, sql in checks.items():
@@ -1211,10 +1358,19 @@ class PerfettoCollector:
                 notes.append("Java heap (android.java_hprof): no data. Need target_process for heap dump.")
             if diag.get("actual_frame_timeline_slice", -1) <= 0:
                 notes.append("Frame timeline: no data. Device may not support SurfaceFlinger jank tracking.")
+            if diag.get("package_list", -1) < 0:
+                notes.append("package_list table not available. Cold-start process resolution disabled.")
             if notes:
                 summary.metadata["diagnosis"] = notes
         except Exception as e:
             logger.debug("Table diagnosis failed: %s", e)
+
+        # P1-5: Resolve target process with package_list fallback for cold-start support
+        if self._target_process_cache and self._target_process_cache.get("name"):
+            resolved = self._resolve_target_process(self._target_process_cache["name"])
+            if resolved.get("source"):
+                summary.metadata["target_process"] = resolved
+                logger.debug("target process resolved via %s: %s", resolved["source"], resolved)
 
         # Scheduling
         try:
@@ -1462,18 +1618,89 @@ class PerfettoCollector:
 
         config_text = "\n".join(config_lines)
 
-        # Run perfetto via stdin pipe — no file push to device needed
+        # --- P1-6 + P1-7: Trace collection with SELinux fallback and auto-degradation ---
+        timeout_sec = duration_ms // 1000 + 30
+        collection_error = None
+
+        # Strategy 1: Config mode via stdin pipe (preferred)
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
                 input=config_text,
                 check=True, capture_output=True, text=True,
-                timeout=duration_ms // 1000 + 30,
+                timeout=timeout_sec,
             )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"perfetto failed (exit {e.returncode}): {e.stderr.strip() or e.stdout.strip() or 'no output'}"
-            ) from e
+            collection_error = None
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            err_msg = ""
+            if isinstance(e, subprocess.CalledProcessError):
+                err_msg = e.stderr.strip() or e.stdout.strip() or f"exit {e.returncode}"
+            else:
+                err_msg = "timeout"
+            logger.debug("config mode (stdin pipe) failed: %s", err_msg)
+            collection_error = f"stdin-pipe: {err_msg}"
+
+            # Strategy 2: P1-6 SELinux fallback — push config file, use cat pipe
+            try:
+                config_device_path = "/data/local/tmp/si_perfetto_config.pbtx"
+                # Push config text to device
+                subprocess.run(
+                    ["adb", "push", "/dev/stdin", config_device_path],
+                    input=config_text,
+                    check=True, capture_output=True, text=True,
+                    timeout=10,
+                )
+                # Use cat pipe to bypass SELinux restrictions
+                subprocess.run(
+                    ["adb", "shell", f"cat {config_device_path} | perfetto -c - --txt -o {device_path}"],
+                    check=True, capture_output=True, text=True,
+                    timeout=timeout_sec,
+                )
+                collection_error = None
+                logger.debug("SELinux fallback (cat pipe) succeeded")
+                # Cleanup config file
+                subprocess.run(
+                    ["adb", "shell", "rm", config_device_path],
+                    capture_output=True, text=True,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e2:
+                err_msg2 = ""
+                if isinstance(e2, subprocess.CalledProcessError):
+                    err_msg2 = e2.stderr.strip() or e2.stdout.strip() or f"exit {e2.returncode}"
+                else:
+                    err_msg2 = str(e2)
+                logger.debug("SELinux fallback (cat pipe) failed: %s", err_msg2)
+                collection_error = f"stdin-pipe + cat-pipe: {err_msg} / {err_msg2}"
+
+                # Strategy 3: P1-7 Auto-degradation — command-line mode
+                # Simpler perfetto invocation without config file,
+                # using inline -t and atrace categories only
+                try:
+                    duration_sec = duration_ms // 1000
+                    cmdline = (
+                        f"perfetto -o {device_path} -t {duration_sec}s "
+                        f"--atrace-categories={cats}"
+                    )
+                    if target_process:
+                        cmdline += f" --target-cmdline={target_process}"
+                    subprocess.run(
+                        ["adb", "shell", cmdline],
+                        check=True, capture_output=True, text=True,
+                        timeout=timeout_sec,
+                    )
+                    collection_error = None
+                    logger.debug("auto-degradation to cmdline mode succeeded")
+                    print("  [collector] Degraded to cmdline mode (no config)", flush=True)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e3:
+                    err_msg3 = ""
+                    if isinstance(e3, subprocess.CalledProcessError):
+                        err_msg3 = e3.stderr.strip() or e3.stdout.strip() or f"exit {e3.returncode}"
+                    else:
+                        err_msg3 = str(e3)
+                    collection_error = f"all modes failed: stdin({err_msg}) / cat-pipe({err_msg2}) / cmdline({err_msg3})"
+
+        if collection_error:
+            raise RuntimeError(f"perfetto collection failed: {collection_error}")
 
         # Pull trace from device
         subprocess.run(
