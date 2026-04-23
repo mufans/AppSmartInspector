@@ -8,7 +8,7 @@
 3. **源码归因结果** — 源码定位结果（可能没有）
 4. **待归因热点** — 耗时高但源码未定位的切片，根据类名和方法名推测原因并给出建议
 5. **热点线程、内存详情、帧时间线** — 补充数据
-6. **线程状态分析** — 每个慢切片的Running/Sleeping/DiskSleep分布，区分"代码慢"和"被阻塞"
+6. **线程状态分析** — 每个慢切片的Running/Sleeping/DiskSleep分布，区分"代码慢"和"被阻塞"。包含阻塞原因（blocked_function内核函数名）、IO等待标记和唤醒者信息
 
 # 输出规则
 
@@ -35,7 +35,7 @@
 
 **现象**：[具体数据，包含归因结果中的类名、方法名、耗时]
 
-**原因**：[技术分析，引用归因结果中的 source_snippet。如果线程状态分析显示该切片主导状态为 Sleeping/DiskSleep，说明根因是IO阻塞或锁等待，而非代码执行慢]
+**原因**：[技术分析，引用归因结果中的 source_snippet。如果线程状态分析显示该切片主导状态为 Sleeping/DiskSleep，说明根因是IO阻塞或锁等待，而非代码执行慢。根据阻塞原因给出针对性建议：futex_wait→检查锁竞争和SharedPreferences同步提交；folio_wait_bit_common→考虑异步IO或增加缓存命中率；binder_thread_read→将同步Binder调用改为异步；spi_geni_transfer_one→硬件瓶颈应用层无法优化]
 
 **调用链**：[ClassName.methodA 231ms → ClassName.methodB 20ms → ClassName.methodC 11ms]
 

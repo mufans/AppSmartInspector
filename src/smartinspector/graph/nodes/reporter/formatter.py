@@ -58,19 +58,48 @@ def format_perf_sections(perf_json: str) -> list[str]:
             if len(vs_lines) > 1:
                 user_parts.append("\n".join(vs_lines))
 
-    # Thread state analysis — Running vs Sleeping vs DiskSleep
+    # Thread state analysis — Running vs Sleeping vs DiskSleep with blocking details
     thread_states = perf_data.get("thread_state", [])
     if thread_states:
-        ts_lines = ["## 线程状态分析 (Running/Sleeping/DiskSleep)\n"]
+        ts_lines = ["## 线程状态分析\n"]
         ts_lines.append("区分\"代码慢\"(Running)和\"被阻塞\"(Sleeping/DiskSleep)：")
-        for ts in thread_states[:10]:
-            name = ts.get("slice_name", "?")
-            dur = ts.get("dur_ms", 0)
-            dominant = ts.get("dominant_state", "?")
-            dist = ts.get("state_distribution", {})
-            dist_str = ", ".join(f"{k} {v:.0f}%" for k, v in dist.items())
-            short = name.replace("SI$", "") if name.startswith("SI$") else name
-            ts_lines.append(f"- {short} ({dur:.1f}ms): {dist_str} [主导: {dominant}]")
+
+        # Split into blocked and running groups
+        blocked = [ts for ts in thread_states
+                   if ts.get("dominant_state") in ("Sleeping", "DiskSleep")]
+        running = [ts for ts in thread_states
+                   if ts.get("dominant_state") == "Running"]
+
+        if blocked:
+            ts_lines.append("")
+            ts_lines.append("**阻塞切片**（线程被IO/锁挂起，优化方向不是代码本身）：")
+            for ts in blocked[:5]:
+                short = ts["slice_name"].replace("SI$", "") if ts["slice_name"].startswith("SI$") else ts["slice_name"]
+                dur = ts.get("dur_ms", 0)
+                dist = ts.get("state_distribution", {})
+                dist_str = ", ".join(f"{k} {v:.0f}%" for k, v in dist.items())
+                ts_lines.append(f"- {short} ({dur:.1f}ms): {dist_str}")
+                # Blocking reason
+                bf = ts.get("blocked_function")
+                if bf:
+                    from smartinspector.agents.deterministic import BLOCKED_FN_MEANING
+                    meaning = BLOCKED_FN_MEANING.get(bf, bf)
+                    ts_lines.append(f"  阻塞原因: {meaning}")
+                if ts.get("io_wait"):
+                    ts_lines.append("  类型: IO等待")
+                if ts.get("waker_name"):
+                    ts_lines.append(f"  唤醒者: {ts['waker_name']}")
+
+        if running:
+            ts_lines.append("")
+            ts_lines.append("**Running切片**（代码执行慢，需优化算法或异步化）：")
+            for ts in running[:5]:
+                short = ts["slice_name"].replace("SI$", "") if ts["slice_name"].startswith("SI$") else ts["slice_name"]
+                dur = ts.get("dur_ms", 0)
+                dist = ts.get("state_distribution", {})
+                running_pct = dist.get("Running", 100)
+                ts_lines.append(f"- {short} ({dur:.1f}ms): Running {running_pct:.0f}%")
+
         user_parts.append("\n".join(ts_lines))
 
     return user_parts

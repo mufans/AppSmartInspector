@@ -42,6 +42,24 @@ def _parse_siblock_msg(msg: str) -> list[str]:
     return frames
 
 
+def _map_state_label(raw_state: str) -> str:
+    """Map kernel thread state to human-readable label."""
+    mapping = {
+        "Running": "Running",
+        "R": "Running",
+        "R+": "Running",
+        "S": "Sleeping",
+        "S+": "Sleeping",
+        "D": "DiskSleep",
+        "D+": "DiskSleep",
+        "T": "Stopped",
+        "t": "Traced",
+        "X": "Dead",
+        "Z": "Zombie",
+    }
+    return mapping.get(raw_state, raw_state)
+
+
 @dataclass
 class PerfSummary:
     """Unified performance summary (~2KB JSON)."""
@@ -1183,34 +1201,28 @@ class PerfettoCollector:
         return block_slices
 
     def collect_thread_state(self) -> list[dict]:
-        """Analyze per-slice thread state distribution (Running/S/D).
+        """Analyze per-slice thread state distribution with blocking details.
 
-        For each SI$ slow slice, queries the thread_state table to determine
-        how much time the thread spent in each state (Running, S, D, etc.)
-        during the slice's execution window. This helps distinguish "code is
-        slow" (Running) from "thread is blocked/suspended" (S/D).
+        For each SI$ slow slice, queries the __intrinsic_thread_state table
+        to determine how much time the thread spent in each state during the
+        slice's execution window, along with blocking context (blocked_function,
+        io_wait, waker_name). Falls back to legacy thread_state table when
+        __intrinsic_thread_state is not available.
 
         Returns a list of dicts with:
           - slice_name: the SI$ slice name
           - dur_ms: total slice duration
-          - state_distribution: {state: percentage} e.g. {"Running": 85.2, "S": 14.8}
+          - state_distribution: {state: percentage} e.g. {"Running": 85.2, "Sleeping": 14.8}
           - dominant_state: the state with the highest percentage
+          - blocked_function: kernel function where thread was blocked (or None)
+          - io_wait: whether the thread was waiting for IO (bool)
+          - waker_name: name of the thread that woke this one (or None)
         """
         tp = self._open()
 
-        # First, get main thread utid
-        try:
-            main_thread_rows = tp.query("""
-                SELECT utid FROM thread WHERE name = 'main' LIMIT 1
-            """)
-            main_utid = None
-            for r in main_thread_rows:
-                main_utid = r.utid
-                break
-            if main_utid is None:
-                return []
-        except Exception as e:
-            logger.debug("thread_state: main thread query failed: %s", e)
+        # Resolve main thread utid
+        main_utid = self._resolve_main_utid(tp)
+        if main_utid is None:
             return []
 
         # Get SI$ slow slices (top 20 by duration)
@@ -1231,6 +1243,123 @@ class PerfettoCollector:
             logger.debug("thread_state: slice query failed: %s", e)
             return []
 
+        # Check if __intrinsic_thread_state table is available
+        has_intrinsic_ts = self._check_intrinsic_thread_state(tp)
+
+        if not has_intrinsic_ts:
+            logger.debug("thread_state: __intrinsic_thread_state not available, using fallback")
+            return self._collect_thread_state_fallback(tp, main_utid, slice_rows)
+
+        # --- Primary path: __intrinsic_thread_state ---
+        results = []
+        for sr in slice_rows:
+            slice_ts = sr.ts
+            slice_end = sr.ts + sr.dur
+            slice_name = sr.name
+            dur_ms = round(sr.dur / 1e6, 2)
+
+            if dur_ms < 1.0:
+                continue
+
+            try:
+                state_rows = tp.query(f"""
+                    SELECT
+                        state,
+                        SUM(dur) AS total_ns,
+                        blocked_function,
+                        io_wait,
+                        waker_utid
+                    FROM __intrinsic_thread_state
+                    WHERE utid = {main_utid}
+                      AND ts < {slice_end}
+                      AND ts + dur > {slice_ts}
+                    GROUP BY state, blocked_function, io_wait, waker_utid
+                    ORDER BY total_ns DESC
+                """)
+            except Exception as e:
+                logger.debug("thread_state: __intrinsic_thread_state query failed for %s: %s", slice_name, e)
+                # Fall back to single-slice legacy query
+                results.append(self._query_thread_state_legacy(tp, main_utid, slice_name, slice_ts, sr.dur, dur_ms))
+                continue
+
+            # Collect waker names in a separate step (subquery in GROUP BY is unreliable)
+            state_entries = list(state_rows)
+            if not state_entries:
+                # No thread_state coverage — sleeping threads can't produce slices
+                results.append({
+                    "slice_name": slice_name,
+                    "dur_ms": dur_ms,
+                    "state_distribution": {"Running": 100.0},
+                    "dominant_state": "Running",
+                    "blocked_function": None,
+                    "io_wait": False,
+                    "waker_name": None,
+                })
+                continue
+
+            total_ns = sum(r.total_ns for r in state_entries)
+            pct_dist: dict[str, float] = {}
+            blocked_fn = None
+            io_wait = False
+            waker_name = None
+
+            for r in state_entries:
+                state_label = _map_state_label(r.state)
+                pct = round(r.total_ns / total_ns * 100, 1)
+                pct_dist[state_label] = pct_dist.get(state_label, 0) + pct
+
+                # Record blocking details from first non-Running entry
+                if state_label != "Running" and blocked_fn is None:
+                    blocked_fn = r.blocked_function
+                    io_wait = bool(r.io_wait) if r.io_wait is not None else False
+                    # Resolve waker name
+                    if r.waker_utid is not None:
+                        try:
+                            waker_rows = tp.query(f"""
+                                SELECT name FROM thread WHERE utid = {r.waker_utid} LIMIT 1
+                            """)
+                            for wr in waker_rows:
+                                waker_name = wr.name
+                                break
+                        except Exception:
+                            pass
+
+            dominant = max(pct_dist, key=pct_dist.get) if pct_dist else "unknown"
+            results.append({
+                "slice_name": slice_name,
+                "dur_ms": dur_ms,
+                "state_distribution": pct_dist,
+                "dominant_state": dominant,
+                "blocked_function": blocked_fn,
+                "io_wait": io_wait,
+                "waker_name": waker_name,
+            })
+
+        return results
+
+    def _resolve_main_utid(self, tp) -> int | None:
+        """Resolve the main thread's utid from the thread table."""
+        try:
+            rows = tp.query("SELECT utid FROM thread WHERE name = 'main' LIMIT 1")
+            for r in rows:
+                return r.utid
+        except Exception as e:
+            logger.debug("thread_state: main thread query failed: %s", e)
+        return None
+
+    def _check_intrinsic_thread_state(self, tp) -> bool:
+        """Check if __intrinsic_thread_state table is available."""
+        try:
+            tp.query("SELECT 1 FROM __intrinsic_thread_state LIMIT 1")
+            return True
+        except Exception:
+            return False
+
+    def _collect_thread_state_fallback(self, tp, main_utid: int, slice_rows) -> list[dict]:
+        """Fallback: use legacy thread_state table (sched-based) when __intrinsic_thread_state is unavailable.
+
+        Preserves the original overlap-based calculation logic.
+        """
         results = []
         for sr in slice_rows:
             slice_ts = sr.ts
@@ -1241,73 +1370,72 @@ class PerfettoCollector:
             if dur_ms < 1.0:
                 continue
 
-            # Query thread_state overlapping the slice window on main thread.
-            # Use overlap-based calculation: find all thread_state entries that
-            # overlap with the slice and compute exact overlap duration per state.
-            # This handles entries that straddle slice boundaries (very common for
-            # long Running states during active execution).
-            slice_end = slice_ts + slice_dur
-            try:
-                state_rows = tp.query(f"""
-                    SELECT
-                      state,
-                      SUM(
-                        MIN(
-                          CASE WHEN dur < 0 THEN {slice_end} ELSE ts + dur END,
-                          {slice_end}
-                        ) -
-                        MAX(ts, {slice_ts})
-                      ) AS state_dur_ns
-                    FROM thread_state
-                    WHERE utid = {main_utid}
-                      AND ts < {slice_end}
-                      AND (dur < 0 OR ts + dur > {slice_ts})
-                    GROUP BY state
-                    ORDER BY state_dur_ns DESC
-                """)
-
-                state_dist = {}
-                total_state_ns = 0
-                for st in state_rows:
-                    ns = st.state_dur_ns or 0
-                    total_state_ns += ns
-                    # Normalize state names
-                    state_name = st.state
-                    if state_name in ("R", "R+"):
-                        state_name = "Running"
-                    elif state_name in ("S", "S+"):
-                        state_name = "Sleeping"
-                    elif state_name in ("D", "D+"):
-                        state_name = "DiskSleep"
-                    state_dist[state_name] = state_dist.get(state_name, 0) + ns
-
-                # Convert to percentages
-                if total_state_ns > 0:
-                    pct_dist = {
-                        k: round(v / total_state_ns * 100, 1)
-                        for k, v in state_dist.items()
-                    }
-                else:
-                    pct_dist = state_dist
-
-                dominant = max(pct_dist, key=pct_dist.get) if pct_dist else "unknown"
-
-                results.append({
-                    "slice_name": slice_name,
-                    "dur_ms": dur_ms,
-                    "state_distribution": pct_dist,
-                    "dominant_state": dominant,
-                })
-            except Exception as e:
-                logger.debug("thread_state: state query failed for %s: %s", slice_name, e)
-                results.append({
-                    "slice_name": slice_name,
-                    "dur_ms": dur_ms,
-                    "state_distribution": {},
-                    "dominant_state": "unknown",
-                })
+            result = self._query_thread_state_legacy(tp, main_utid, slice_name, slice_ts, slice_dur, dur_ms)
+            results.append(result)
 
         return results
+
+    def _query_thread_state_legacy(self, tp, main_utid: int, slice_name: str,
+                                    slice_ts: int, slice_dur: int, dur_ms: float) -> dict:
+        """Query single slice using legacy thread_state table."""
+        slice_end = slice_ts + slice_dur
+        try:
+            state_rows = tp.query(f"""
+                SELECT
+                  state,
+                  SUM(
+                    MIN(
+                      CASE WHEN dur < 0 THEN {slice_end} ELSE ts + dur END,
+                      {slice_end}
+                    ) -
+                    MAX(ts, {slice_ts})
+                  ) AS state_dur_ns
+                FROM thread_state
+                WHERE utid = {main_utid}
+                  AND ts < {slice_end}
+                  AND (dur < 0 OR ts + dur > {slice_ts})
+                GROUP BY state
+                ORDER BY state_dur_ns DESC
+            """)
+
+            state_dist = {}
+            total_state_ns = 0
+            for st in state_rows:
+                ns = st.state_dur_ns or 0
+                total_state_ns += ns
+                state_name = _map_state_label(st.state)
+                state_dist[state_name] = state_dist.get(state_name, 0) + ns
+
+            if total_state_ns > 0:
+                pct_dist = {
+                    k: round(v / total_state_ns * 100, 1)
+                    for k, v in state_dist.items()
+                }
+            else:
+                pct_dist = state_dist
+
+            dominant = max(pct_dist, key=pct_dist.get) if pct_dist else "unknown"
+
+            return {
+                "slice_name": slice_name,
+                "dur_ms": dur_ms,
+                "state_distribution": pct_dist,
+                "dominant_state": dominant,
+                "blocked_function": None,
+                "io_wait": False,
+                "waker_name": None,
+            }
+        except Exception as e:
+            logger.debug("thread_state: legacy query failed for %s: %s", slice_name, e)
+            return {
+                "slice_name": slice_name,
+                "dur_ms": dur_ms,
+                "state_distribution": {},
+                "dominant_state": "unknown",
+                "blocked_function": None,
+                "io_wait": False,
+                "waker_name": None,
+            }
 
     def _diagnose_tables(self) -> dict:
         """Check which key tables have data, for diagnosing empty results."""

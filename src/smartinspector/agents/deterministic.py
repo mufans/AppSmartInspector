@@ -326,11 +326,33 @@ def _identify_cpu_hotspots(data: dict) -> str:
 # Helper 6: Thread state analysis (Running vs Sleeping vs DiskSleep)
 # ---------------------------------------------------------------------------
 
+# blocked_function to human-readable meaning mapping
+BLOCKED_FN_MEANING: dict[str, str] = {
+    "futex_wait_queue_me": "等待锁释放 (futex)",
+    "futex_wait": "等待锁释放 (futex)",
+    "folio_wait_bit_common": "等待磁盘IO (页缓存)",
+    "wait_woken": "等待被唤醒",
+    "msleep": "内核主动睡眠",
+    "rpmh_write_batch": "等待硬件资源电源管理",
+    "sde_encoder_helper_wait_for_irq": "等待显示硬件中断",
+    "spi_geni_transfer_one": "等待SPI总线传输 (通常为触控IC)",
+    "do_writepages": "等待磁盘写入",
+    "journal_commit": "等待文件系统日志提交",
+    "bio_wait": "等待块IO完成",
+    "pipe_wait": "等待管道数据",
+    "unix_stream_recvmsg": "等待Unix Socket数据",
+    "binder_thread_read": "等待Binder IPC回复",
+    "worker_thread": "工作线程等待",
+    "rcu_gp_fqs_loop": "RCU内核周期",
+}
+
+
 def _analyze_thread_state(data: dict) -> str:
     """Analyze per-slice thread state distribution to distinguish code-slow vs blocked.
 
     For each SI$ slice with thread_state data, reports whether the thread was
     primarily Running (code is slow) or Sleeping/DiskSleep (blocked by IO/lock).
+    When blocked_function data is available, provides human-readable blocking reasons.
     """
     thread_states = data.get("thread_state") or []
     if not thread_states:
@@ -349,21 +371,30 @@ def _analyze_thread_state(data: dict) -> str:
         dist = ts.get("state_distribution", {})
 
         if dominant in ("Sleeping", "DiskSleep"):
-            blocked_slices.append((name, dominant, dur, dist))
+            blocked_slices.append((name, dominant, dur, dist, ts))
         elif dominant == "Running" and dur > 5:
-            running_slices.append((name, dur, dist))
+            running_slices.append((name, dur, dist, ts))
 
     if blocked_slices:
         lines.append("  以下切片主要处于阻塞状态（非代码慢，而是被IO/锁挂起）：")
-        for name, state, dur, dist in sorted(blocked_slices, key=lambda x: -x[2]):
+        for name, state, dur, dist, ts in sorted(blocked_slices, key=lambda x: -x[2]):
             dist_str = ", ".join(f"{k} {v:.0f}%" for k, v in dist.items())
             # Shorten slice name for readability
             short = name.replace("SI$", "").split("#")[0] if "#" in name else name.replace("SI$", "")
             lines.append(f"    {short} ({dur:.1f}ms): {dist_str}")
+            # Show blocking reason if available
+            bf = ts.get("blocked_function")
+            if bf:
+                meaning = BLOCKED_FN_MEANING.get(bf, bf)
+                lines.append(f"      阻塞原因: {meaning}")
+            if ts.get("io_wait"):
+                lines.append("      类型: IO等待")
+            if ts.get("waker_name"):
+                lines.append(f"      唤醒者: {ts['waker_name']}")
 
     if running_slices:
-        lines.append("  以下切片主要在执行用户代码（Running状态）：")
-        for name, dur, dist in sorted(running_slices, key=lambda x: -x[1])[:5]:
+        lines.append("  以下切片主要在执行用户代码（无IO/锁阻塞）：")
+        for name, dur, dist, ts in sorted(running_slices, key=lambda x: -x[1])[:5]:
             running_pct = dist.get("Running", 0)
             short = name.replace("SI$", "").split("#")[0] if "#" in name else name.replace("SI$", "")
             lines.append(f"    {short} ({dur:.1f}ms): Running {running_pct:.0f}%")
