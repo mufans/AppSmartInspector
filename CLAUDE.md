@@ -390,3 +390,62 @@ Perfetto UI Plugin (WS client)
 - WASM build requires emscripten (auto-installed by `tools/install-build-deps`)
 - For proxy: set `http_proxy`/`https_proxy` before running build
 - `~/.curlrc` with `--http1.1` needed if proxy causes HTTP/2 errors
+
+---
+
+## Logging Standard
+
+### 规则
+
+1. **统一使用标准 `logging` 模块**，禁止使用 `print()` 输出日志
+2. 每个模块文件顶部初始化：`logger = logging.getLogger(__name__)`
+3. 日志级别规范：
+   - `logger.debug()` — 调试信息（SQL查询失败、fallback触发、内部状态变化）
+   - `logger.info()` — 关键流程节点（采集开始/完成、报告生成完成、设备连接）
+   - `logger.warning()` — 可恢复的异常（API降级、fallback、重试）
+   - `logger.error()` — 严重错误（采集失败、报告生成失败）
+4. **日志格式统一**：`[模块名] 消息内容`，通过 logging formatter 配置，不要在消息中手动加 `[tag]`
+5. **用户面向的进度输出**（流式token、进度条等）可以继续用 `print()`，但必须标注 `# noqa: LOG` 注释说明原因
+6. **禁止裸 `print()`**：所有 print 必须改为 logger 调用，除非有明确注释说明原因
+
+### 当前需要改造的文件
+
+- `src/smartinspector/graph/nodes/collector.py` — 多处 `print("  [collector] ...")`
+- `src/smartinspector/graph/nodes/analyzer.py` — `print("  [analyzer] ...")`
+- `src/smartinspector/graph/nodes/reporter/__init__.py` — 多处 `print("  [reporter] ...")`
+- `src/smartinspector/graph/nodes/reporter/persistence.py` — `print("  [reporter] ...")`
+- `src/smartinspector/graph/nodes/reporter/generator.py` — `print("  [reporter] ...")`（流式输出除外）
+
+### logging 配置
+
+在 CLI 入口（`cli.py`）统一配置 logging：
+
+```python
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S',
+)
+# debug 模式通过 --debug 参数降低到 DEBUG 级别
+```
+
+### 示例
+
+```python
+# ✅ 正确
+import logging
+logger = logging.getLogger(__name__)
+
+logger.info("Starting trace collection")
+logger.debug("process table lookup failed: %s", e)
+logger.warning("__intrinsic_thread_state not available, falling back to sched")
+
+# ❌ 错误
+print("  [collector] Starting trace collection...")  # 改用 logger.info()
+print(f"  [reporter] Failed to save report: {e}")     # 改用 logger.error()
+
+# ✅ 允许的 print（用户面向的流式输出）
+print(token, end="", flush=True)  # noqa: LOG — streaming LLM tokens to user
+```
