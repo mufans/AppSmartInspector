@@ -1,8 +1,12 @@
 """Reporter sub-module: LLM report generation with streaming."""
 
+import logging
+
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from smartinspector.token_tracker import get_tracker
+
+logger = logging.getLogger(__name__)
 
 
 def generate_report(report_prompt: str, user_content: str) -> str:
@@ -26,26 +30,26 @@ def generate_report(report_prompt: str, user_content: str) -> str:
         for chunk in llm.stream(messages):
             token = chunk.content
             if token:
-                print(token, end="", flush=True)  # Stream token-by-token to user
+                print(token, end="", flush=True)  # noqa: LOG — streaming LLM tokens to user
                 full_content += token
             um = getattr(chunk, "usage_metadata", None)
             if um:
                 input_tokens = um.get("input_tokens", 0)
     except Exception as e:
         # Stream failed (network error, API disconnect) — retry with invoke
-        print(f"\n  [reporter] Stream interrupted ({e}), retrying...", flush=True)
+        logger.warning("Stream interrupted (%s), retrying...", e)
         try:
             response = llm.invoke(messages)
             full_content = response.content
             get_tracker().record_from_message("reporter", response)
         except Exception as e2:
             full_content = full_content or f"[reporter] Report generation failed: {e2}"
-            print(f"  [reporter] Retry also failed: {e2}", flush=True)
+            logger.error("Retry also failed: %s", e2)
 
     # Record token usage (estimate output from content length if metadata incomplete)
     output_tokens = len(full_content) // 3  # rough estimate for CJK text
     get_tracker().record("reporter", {"input_tokens": input_tokens, "output_tokens": output_tokens})
 
-    print("\n  [reporter] Report generated", flush=True)
+    print("\n  [reporter] Report generated", flush=True)  # noqa: LOG — user-facing progress
 
     return full_content

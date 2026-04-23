@@ -1,5 +1,7 @@
 """CLI entry: main() REPL loop."""
 
+import logging
+
 from smartinspector.commands import handle_slash_command
 from smartinspector.graph.builder import create_graph
 from smartinspector.graph.streaming import _stream_run
@@ -14,6 +16,13 @@ def main():
     from smartinspector.config import get_source_dir, set_source_dir, get_ws_port, get_api_key
     from smartinspector.ws.server import SIServer
 
+    # Configure standard logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S',
+    )
+
     parser = argparse.ArgumentParser(description="SmartInspector CLI")
     parser.add_argument("--source-dir", default="", help="Source code directory for attribution search")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to reports/debug_*.log")
@@ -25,6 +34,7 @@ def main():
     if args.debug:
         import os
         os.environ["SI_DEBUG"] = "1"
+        logging.getLogger().setLevel(logging.DEBUG)
         from smartinspector.debug_log import debug_log
         debug_log("cli", "Debug logging enabled via --debug flag")
 

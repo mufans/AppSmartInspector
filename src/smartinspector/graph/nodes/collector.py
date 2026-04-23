@@ -1,11 +1,14 @@
 """Collector node: trace collection (first step of full pipeline)."""
 
 import json
+import logging
 
 from langchain_core.messages import AIMessage
 
 from smartinspector.debug_log import debug_log
 from smartinspector.graph.state import AgentState
+
+logger = logging.getLogger(__name__)
 
 
 def _read_perfetto_config() -> dict:
@@ -110,38 +113,38 @@ def collector_node(state: AgentState) -> dict:
     from smartinspector.collector.perfetto import PerfettoCollector
 
     skip_wait = state.get("skip_wait", False)
-    print("  [collector] Starting trace collection...", flush=True)
+    logger.info("Starting trace collection...")
 
     # Notify app to ensure hooks are ready before collecting
     if skip_wait:
-        print("  [collector] --no-wait: skipping app connection wait, starting trace immediately", flush=True)
+        logger.info("--no-wait: skipping app connection wait, starting trace immediately")
     else:
         try:
             from smartinspector.ws.server import SIServer
             server = SIServer.get()
             if server.has_connections():
-                print("  [collector] Sending start_trace, waiting for hook ACK...", flush=True)
+                logger.info("Sending start_trace, waiting for hook ACK...")
                 ack_ok = server.send_start_trace(timeout=5.0)
                 if ack_ok:
-                    print("  [collector] Hook ACK received, hooks ready", flush=True)
+                    logger.info("Hook ACK received, hooks ready")
                 else:
-                    print("  [collector] Hook ACK timeout, proceeding anyway", flush=True)
+                    logger.warning("Hook ACK timeout, proceeding anyway")
             elif server.is_running():
-                print("  [collector] No app connected, waiting for app to connect...", flush=True)
+                logger.info("No app connected, waiting for app to connect...")
                 connected = server.wait_for_connection(timeout=30.0)
                 if connected:
-                    print("  [collector] App connected, sending start_trace...", flush=True)
+                    logger.info("App connected, sending start_trace...")
                     ack_ok = server.send_start_trace(timeout=5.0)
                     if ack_ok:
-                        print("  [collector] Hook ACK received, hooks ready", flush=True)
+                        logger.info("Hook ACK received, hooks ready")
                     else:
-                        print("  [collector] Hook ACK timeout, proceeding anyway", flush=True)
+                        logger.warning("Hook ACK timeout, proceeding anyway")
                 else:
-                    print("  [collector] App connection timeout, proceeding without hook readiness check", flush=True)
+                    logger.warning("App connection timeout, proceeding without hook readiness check")
             else:
-                print("  [collector] WS server not running, proceeding without hook readiness check", flush=True)
+                logger.info("WS server not running, proceeding without hook readiness check")
         except Exception as e:
-            print(f"  [collector] start_trace ACK failed: {e}", flush=True)
+            logger.warning("start_trace ACK failed: %s", e)
 
     try:
         # Read perfetto params: CLI args override WS config
@@ -164,7 +167,7 @@ def collector_node(state: AgentState) -> dict:
         collect_cpu_callstacks = pc.get("collectCpuCallstacks", True)
         collect_java_heap = pc.get("collectJavaHeap", True)
 
-        print(f"  [collector] Config: duration={duration_ms}ms, buffer={buffer_size_kb}KB", flush=True)
+        logger.info("Config: duration=%dms, buffer=%dKB", duration_ms, buffer_size_kb)
 
         trace_path = PerfettoCollector.pull_trace_from_device(
             duration_ms=duration_ms,
@@ -175,7 +178,7 @@ def collector_node(state: AgentState) -> dict:
             collect_cpu_callstacks=collect_cpu_callstacks if target_process else False,
             collect_java_heap=collect_java_heap if target_process else False,
         )
-        print(f"  [collector] Trace saved to {trace_path}", flush=True)
+        logger.info("Trace saved to %s", trace_path)
         debug_log("collector", f"trace_path: {trace_path}")
 
         collector = PerfettoCollector(trace_path, target_process=target_process)
@@ -187,7 +190,7 @@ def collector_node(state: AgentState) -> dict:
             from smartinspector.ws.server import SIServer
             server = SIServer.get()
             if server.has_connections():
-                print("  [collector] Requesting block events from app...", flush=True)
+                logger.info("Requesting block events from app...")
                 ws_events = server.request_block_events(timeout=5.0)
                 if ws_events:
                     # Merge: SQL data as primary (has precise ts_ns), WS supplements stack_trace
@@ -202,15 +205,15 @@ def collector_node(state: AgentState) -> dict:
 
                     merged = _merge_block_events(sql_events, ws_list)
                     summary.block_events = merged
-                    print(f"  [collector] Merged {len(sql_events)} SQL + {len(ws_list)} WS block events -> {len(merged)} total", flush=True)
+                    logger.info("Merged %d SQL + %d WS block events -> %d total", len(sql_events), len(ws_list), len(merged))
                 else:
-                    print("  [collector] No block events from app", flush=True)
+                    logger.info("No block events from app")
         except Exception as e:
-            print(f"  [collector] Block events request failed: {e}", flush=True)
+            logger.warning("Block events request failed: %s", e)
 
         perf_json = summary.to_json()
 
-        print(f"  [collector] Analysis complete ({len(perf_json)} bytes)", flush=True)
+        logger.info("Analysis complete (%d bytes)", len(perf_json))
 
         return {
             "messages": [AIMessage(content="[trace collected and analyzed]")],
@@ -228,7 +231,7 @@ def collector_node(state: AgentState) -> dict:
             "2. Run `/trace` with a pre-existing trace file\n"
             "3. Use `/config` to check device connection status"
         )
-        print(f"  [collector] ERROR: {error_msg}", flush=True)
+        logger.error(error_msg)
         return {
             "messages": [AIMessage(content=error_msg)],
             "perf_summary": "",

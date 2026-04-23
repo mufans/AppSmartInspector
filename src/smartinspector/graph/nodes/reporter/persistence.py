@@ -1,7 +1,10 @@
 """Reporter sub-module: report file saving."""
 
+import logging
 import os
 import datetime
+
+logger = logging.getLogger(__name__)
 
 
 def save_report(content: str) -> str | None:
@@ -17,8 +20,8 @@ def save_report(content: str) -> str | None:
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(content)
         size_kb = len(content.encode("utf-8")) / 1024
-        print(f"  [reporter] Report saved to {report_path} ({size_kb:.1f}KB)", flush=True)
+        logger.info("Report saved to %s (%.1fKB)", report_path, size_kb)
         return report_path
     except OSError as e:
-        print(f"  [reporter] Failed to save report: {e}", flush=True)
+        logger.error("Failed to save report: %s", e)
         return None

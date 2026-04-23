@@ -1,5 +1,7 @@
 """Reporter node: generate final report (pipeline step 4)."""
 
+import logging
+
 from langchain_core.messages import AIMessage
 
 from smartinspector.config import get_report_max_tokens
@@ -12,6 +14,8 @@ from smartinspector.graph.nodes.reporter.formatter import (
 )
 from smartinspector.graph.nodes.reporter.generator import generate_report
 from smartinspector.graph.nodes.reporter.persistence import save_report
+
+logger = logging.getLogger(__name__)
 
 
 def reporter_node(state: AgentState) -> dict:
@@ -40,7 +44,7 @@ def reporter_node(state: AgentState) -> dict:
 
         # Pre-generate report header tables
         trace_path = state.get("_trace_path", "")
-        print(f"  [reporter] trace_path from state: '{trace_path}'", flush=True)
+        logger.debug("trace_path from state: '%s'", trace_path)
 
         header_md = _build_report_header(perf_json, trace_path)
         # Insert header after attribution and perf sections
@@ -58,11 +62,11 @@ def reporter_node(state: AgentState) -> dict:
             "attribution_result": attribution_result,
         }
 
-    print("\n  [reporter] Generating report...", flush=True)
+    print("\n  [reporter] Generating report...", flush=True)  # noqa: LOG — user-facing progress
     if state.get("_trace_path"):
-        print(f"  [reporter] Trace file: {state['_trace_path']}", flush=True)
+        logger.info("Trace file: %s", state['_trace_path'])
     else:
-        print("  [reporter] WARNING: no trace_path in state", flush=True)
+        logger.warning("no trace_path in state")
 
     user_content = "\n\n".join(user_parts)
 
