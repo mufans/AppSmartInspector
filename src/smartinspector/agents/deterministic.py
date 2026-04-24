@@ -57,6 +57,7 @@ def compute_hints(perf_json: str) -> str:
         _identify_cpu_hotspots(data),
         _analyze_thread_state(data),
         _analyze_io_slices(data),
+        _analyze_compose_slices(data),
     ]
 
     return "\n\n".join(s for s in sections if s)
@@ -479,5 +480,63 @@ def _analyze_io_slices(data: dict) -> str:
     total_count = io_slices.get("total_count", 0)
     if total_count > 0:
         lines.append(f"  IO操作总计: {total_count}次")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 8: Compose recomposition analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_compose_slices(data: dict) -> str:
+    """Analyze Jetpack Compose recomposition data.
+
+    Reports composables with excessive recompositions and high duration,
+    highlighting first-composition vs recomposition counts.
+    """
+    compose_slices = data.get("compose_slices") or {}
+    if not compose_slices:
+        return ""
+
+    composables = compose_slices.get("composables") or []
+    if not composables:
+        return ""
+
+    lines = ["[Compose重组分析]"]
+
+    # Filter to composables with significant recompositions or duration
+    significant = [
+        c for c in composables
+        if c.get("recompose_count", 0) > 0 or c.get("total_ms", 0) > 1.0
+    ]
+
+    if not significant:
+        return ""
+
+    # Sort by total_ms descending
+    significant.sort(key=lambda x: -x.get("total_ms", 0))
+
+    for c in significant[:10]:
+        name = c.get("name", "?")
+        first = c.get("first_count", 0)
+        recompose = c.get("recompose_count", 0)
+        total_ms = c.get("total_ms", 0)
+        max_ms = c.get("max_ms", 0)
+
+        parts = [f"  {name}:"]
+        parts.append(f"首次组合{first}次")
+        if recompose > 0:
+            parts.append(f"重组{recompose}次")
+        parts.append(f"总耗时{total_ms:.1f}ms")
+        parts.append(f"最大{max_ms:.1f}ms")
+        lines.append(" ".join(parts))
+
+        # Flag excessive recompositions (more than 3 recompositions per first composition)
+        if first > 0 and recompose / first > 3:
+            lines.append(f"    ⚠ 重组率过高: {recompose}/{first} = {recompose/first:.1f}x, 建议检查state稳定性")
+
+    total_count = compose_slices.get("total_count", 0)
+    if total_count > 0:
+        lines.append(f"  Compose操作总计: {total_count}次")
 
     return "\n".join(lines)

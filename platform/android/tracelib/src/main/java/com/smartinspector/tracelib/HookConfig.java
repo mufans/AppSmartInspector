@@ -29,6 +29,7 @@ public class HookConfig {
     public boolean databaseIo = true;
     public boolean imageLoad = true;
     public boolean inputEvent = true;           // dispatchTouchEvent tracing
+    public boolean composeTracking = false;      // Jetpack Compose recomposition tracking
 
     // ── Block monitor params ──────────────────────────────────
     public long blockThresholdMs = 100;
@@ -85,6 +86,7 @@ public class HookConfig {
             root.put("database_io", databaseIo);
             root.put("image_load", imageLoad);
             root.put("input_event", inputEvent);
+            root.put("compose_tracking", composeTracking);
 
             // Block monitor params
             root.put("block_threshold_ms", blockThresholdMs);
@@ -152,6 +154,7 @@ public class HookConfig {
             config.databaseIo = root.optBoolean("database_io", false);
             config.imageLoad = root.optBoolean("image_load", false);
             config.inputEvent = root.optBoolean("input_event", true);
+            config.composeTracking = root.optBoolean("compose_tracking", false);
 
             // Block monitor params
             config.blockThresholdMs = root.optLong("block_threshold_ms", 100);

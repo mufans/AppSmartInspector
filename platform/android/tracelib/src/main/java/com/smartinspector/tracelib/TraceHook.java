@@ -186,6 +186,14 @@ public class TraceHook {
             }
         }
 
+        if (HookConfigManager.isEnabled("compose_tracking")) {
+            try {
+                ComposeHook.hook();
+            } catch (Exception e) {
+                Log.e(TAG, "Compose hook failed", e);
+            }
+        }
+
         try {
             hookExtraClasses();
         } catch (Exception e) {

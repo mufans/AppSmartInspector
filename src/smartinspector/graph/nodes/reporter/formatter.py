@@ -142,6 +142,27 @@ def format_perf_sections(perf_json: str) -> list[str]:
             io_lines.append(f"\nIO操作总计: {io_slices.get('total_count', 0)}次")
             user_parts.append("\n".join(io_lines))
 
+    # Compose recomposition analysis
+    compose_slices = perf_data.get("compose_slices", {})
+    if compose_slices:
+        composables = compose_slices.get("composables", [])
+        if composables:
+            compose_lines = ["## Compose重组分析\n"]
+            for c in composables[:10]:
+                name = c.get("name", "?")
+                first = c.get("first_count", 0)
+                recompose = c.get("recompose_count", 0)
+                total_ms = c.get("total_ms", 0)
+                max_ms = c.get("max_ms", 0)
+                compose_lines.append(
+                    f"- **{name}**: 首次{first}次, 重组{recompose}次, "
+                    f"总{total_ms:.1f}ms, 最大{max_ms:.1f}ms"
+                )
+                if first > 0 and recompose / first > 3:
+                    compose_lines.append(f"  ⚠ 重组率过高 ({recompose/first:.1f}x), 检查state稳定性")
+            compose_lines.append(f"\nCompose总计: {compose_slices.get('total_count', 0)}次")
+            user_parts.append("\n".join(compose_lines))
+
     return user_parts
 
 

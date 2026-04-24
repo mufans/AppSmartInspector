@@ -74,6 +74,7 @@ class PerfSummary:
     metadata: dict = field(default_factory=dict)
     block_events: list[dict] = field(default_factory=list)
     input_events: list[dict] = field(default_factory=list)
+    compose_slices: dict = field(default_factory=dict)
     sys_stats: dict = field(default_factory=dict)
     thread_state: list[dict] = field(default_factory=list)
 
@@ -1461,6 +1462,82 @@ class PerfettoCollector:
                 result[table] = -1  # table doesn't exist
         return result
 
+    def collect_compose_slices(self) -> dict:
+        """Collect Jetpack Compose recomposition slices (SI$compose#).
+
+        Tag format from ComposeHook.kt:
+          SI$compose#ComposableName#first     — first composition
+          SI$compose#ComposableName#recompose — recomposition
+
+        Returns aggregated recomposition stats per composable.
+        """
+        tp = self._open()
+        try:
+            rows = tp.query("""
+                SELECT name, ts, dur, depth, track_id
+                FROM slice
+                WHERE name LIKE 'SI$compose#%'
+                ORDER BY ts ASC
+            """)
+        except Exception as e:
+            logger.debug("Compose slices query failed: %s", e)
+            return {}
+
+        slices = []
+        # Aggregate per-composable: {name: {first_count, recompose_count, total_ms, max_ms}}
+        composable_stats: dict[str, dict] = {}
+
+        for r in rows:
+            dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
+            name = r.name
+            slices.append({
+                "name": name,
+                "ts_ns": r.ts,
+                "dur_ms": dur_ms,
+                "depth": r.depth,
+            })
+
+            # Parse: SI$compose#ComposableName#first/recompose
+            body = name[len("SI$compose#"):]
+            last_hash = body.rfind("#")
+            if last_hash >= 0:
+                composable_name = body[:last_hash]
+                compose_type = body[last_hash + 1:]  # "first" or "recompose"
+            else:
+                composable_name = body
+                compose_type = "unknown"
+
+            if composable_name not in composable_stats:
+                composable_stats[composable_name] = {
+                    "name": composable_name,
+                    "first_count": 0,
+                    "recompose_count": 0,
+                    "total_ms": 0.0,
+                    "max_ms": 0.0,
+                }
+            stats = composable_stats[composable_name]
+            if compose_type == "first":
+                stats["first_count"] += 1
+            elif compose_type == "recompose":
+                stats["recompose_count"] += 1
+            stats["total_ms"] += dur_ms
+            stats["max_ms"] = max(stats["max_ms"], dur_ms)
+
+        if not slices:
+            return {}
+
+        # Sort composables by total recomposition time (descending)
+        sorted_stats = sorted(
+            composable_stats.values(),
+            key=lambda x: -x["total_ms"],
+        )
+
+        return {
+            "total_count": len(slices),
+            "composables": sorted_stats,
+            "slowest": sorted(slices, key=lambda x: -x["dur_ms"])[:20],
+        }
+
     def summarize(self) -> PerfSummary:
         """Run all analyses and return a unified summary."""
         summary = PerfSummary()
@@ -1559,6 +1636,12 @@ class PerfettoCollector:
             summary.input_events = self.collect_input_events()
         except Exception as e:
             summary.input_events = [{"error": str(e)}]
+
+        # Compose slices (SI$compose# — recomposition tracking)
+        try:
+            summary.compose_slices = self.collect_compose_slices()
+        except Exception as e:
+            summary.compose_slices = {"error": str(e)}
 
         # System-level stats (CPU idle, frequency, fork rate)
         try:
