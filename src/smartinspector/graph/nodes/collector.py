@@ -42,27 +42,83 @@ def _adb_force_stop(package: str) -> bool:
         return False
 
 
-def _adb_launch_app(package: str) -> bool:
-    """Launch an app via adb am start. Returns True on success."""
+def _adb_resolve_activity(package: str) -> str | None:
+    """Resolve the default launchable activity for a package via adb.
+
+    Uses ``cmd package resolve-activity --brief`` to discover the launcher
+    activity dynamically, avoiding hardcoded activity names.
+
+    Returns:
+        Fully qualified activity component name (e.g. ``com.example/.HomeActivity``),
+        or ``None`` if resolution fails.
+    """
     try:
         result = subprocess.run(
-            ["adb", "shell", "am", "start", "-n", f"{package}/.MainActivity"],
+            ["adb", "shell", "cmd", "package", "resolve-activity",
+             "--brief", "-c", "android.intent.category.LAUNCHER", package],
             capture_output=True, text=True, timeout=10,
         )
-        if result.returncode == 0:
-            logger.info("adb am start %s succeeded", package)
-            return True
-        # Fallback: try launch by package only (monkey command)
-        result2 = subprocess.run(
+        if result.returncode != 0:
+            logger.debug("resolve-activity failed for %s: %s", package, result.stderr.strip())
+            return None
+
+        # Output format:
+        #   line 0: package URI or header
+        #   line 1+: fully qualified component name (last line is the activity)
+        lines = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
+        if not lines:
+            logger.debug("resolve-activity returned empty output for %s", package)
+            return None
+
+        activity = lines[-1]
+        logger.info("resolve-activity for %s: %s", package, activity)
+        return activity
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.debug("resolve-activity unavailable: %s", e)
+        return None
+
+
+def _adb_launch_monkey(package: str) -> bool:
+    """Launch an app via monkey command (fallback). Returns True on success."""
+    try:
+        result = subprocess.run(
             ["adb", "shell", "monkey", "-p", package, "-c",
              "android.intent.category.LAUNCHER", "1"],
             capture_output=True, text=True, timeout=10,
         )
-        if result2.returncode == 0:
+        if result.returncode == 0:
             logger.info("adb monkey launch %s succeeded", package)
             return True
-        logger.warning("adb launch failed: %s", result.stderr.strip())
+        logger.warning("adb monkey launch failed: %s", result.stderr.strip())
         return False
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.warning("adb monkey launch unavailable: %s", e)
+        return False
+
+
+def _adb_launch_app(package: str) -> bool:
+    """Launch an app via adb. Returns True on success.
+
+    Strategy:
+        1. Resolve the launchable activity via ``resolve-activity``.
+        2. Use the resolved component with ``am start -n``.
+        3. Fallback to ``monkey`` command if resolution or start fails.
+    """
+    try:
+        activity = _adb_resolve_activity(package)
+
+        if activity:
+            result = subprocess.run(
+                ["adb", "shell", "am", "start", "-n", activity],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                logger.info("adb am start %s/%s succeeded", package, activity)
+                return True
+            logger.warning("adb am start failed: %s", result.stderr.strip())
+
+        # Fallback: monkey command
+        return _adb_launch_monkey(package)
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         logger.warning("adb launch unavailable: %s", e)
         return False
