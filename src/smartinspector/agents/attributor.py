@@ -180,6 +180,8 @@ def _deterministic_search(group: list[dict], file_cache: _FileCache) -> list[dic
             result["count"] = issue["count"]
         if issue.get("total_ms"):
             result["total_ms"] = issue["total_ms"]
+        if issue.get("io_type"):
+            result["io_type"] = issue["io_type"]
 
         cn = issue["class_name"]
         mn = issue["method_name"]
@@ -540,6 +542,10 @@ def _analyze_snippets(results: list[dict]) -> None:
         ctx = ""
         if r.get("context_method"):
             ctx = f" (匿名类定义在 {r['context_method']} 内)"
+        io_type = r.get("io_type")
+        if io_type:
+            _IO_LABELS = {"network": "网络IO", "database": "数据库IO", "image": "图片加载"}
+            ctx += f" [{_IO_LABELS.get(io_type, 'IO')}]"
         dep_ctx = ""
         if r.get("dependency_context"):
             dep_ctx = f"\n\n### 关联依赖上下文\n{r['dependency_context']}"
@@ -705,6 +711,8 @@ def _search_group(group: list[dict], file_cache: _FileCache, on_progress=None) -
             result["total_ms"] = issue["total_ms"]
         if issue.get("context_method"):
             result["context_method"] = issue["context_method"]
+        if issue.get("io_type"):
+            result["io_type"] = issue["io_type"]
         results.append(result)
 
     # Validate source_dir exists before entering expensive LLM loop
@@ -921,6 +929,16 @@ def _build_group_prompt(group: list[dict]) -> str:
         # Hint for XML layout files — search .xml directly, not .java/.kt
         if search_type == "xml":
             line += f", xml布局:Glob **/{cn}.xml → Read完整文件, RESULT行请用: {cn}.{issue['method_name']}"
+        # IO slice type hint — helps LLM focus on IO-specific patterns
+        io_type = issue.get("io_type")
+        if io_type:
+            _IO_HINTS = {
+                "network": "网络IO操作",
+                "database": "数据库IO操作",
+                "image": "图片加载操作",
+            }
+            io_label = _IO_HINTS.get(io_type, "IO操作")
+            line += f", {io_label}:重点关注同步调用、缺少缓存、大对象分配"
         line += ")"
         lines.append(line)
 

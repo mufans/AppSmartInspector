@@ -657,6 +657,16 @@ def _summarize_si_tag(tag: str) -> str:
         cls = fqn.rsplit(".", 1)[-1] if fqn else fqn_part
         return f"handler({cls}.{method or '?'})"
 
+    # IO tags
+    for prefix, label in (("net#", "网络IO"), ("db#", "数据库IO"), ("img#", "图片加载")):
+        if body.startswith(prefix):
+            rest = body[len(prefix):]
+            parts = rest.split("#")
+            fqn_method = parts[0]
+            fqn, method = _split_fqn_method(fqn_method)
+            cls = fqn.rsplit(".", 1)[-1] if fqn else fqn_method
+            return f"{label}({cls}.{method or '?'})"
+
     if body.startswith("Activity.lifecycle"):
         return "Activity生命周期"
 
