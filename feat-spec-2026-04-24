@@ -123,6 +123,8 @@
 | P2-3 | **实时监控模式** | streaming adb logcat + 持续分析 |
 | P2-4 | **ANR 自动捕获与分析** | ANR trace 文件解析 + 归因 |
 | P2-5 | **网络瀑布图** | OkHttp 事件追踪 + 时间线可视化 |
+| P2-6 | **源码归因增强（借鉴claude-context）** | .gitignore过滤、函数级分块搜索、轻量BM25索引 |
+| P2-7 | **Coroutine追踪** | 协程线程切换和挂起追踪 |
 
 ---
 
@@ -748,3 +750,70 @@ Slash Commands:
 | Bridge → CLI | `frame_selected` | Perfetto UI 插件选帧事件 |
 | CLI → Bridge | `analysis_result` | 帧分析结果 |
 | CLI → Bridge | `analysis_progress` | 分析进度 |
+
+## 4. P2-6 详细设计：源码归因增强（借鉴 claude-context）
+
+### 背景
+参考 [zilliztech/claude-context](https://github.com/zilliztech/claude-context) 的设计，提升SI项目源码归因的搜索效率和精度。
+
+### 当前问题
+1. **无文件过滤**：搜索全目录，包含build/vendor/node_modules等无关文件
+2. **按文件搜索**：搜索结果粒度为整个文件，无法精确到函数/类级别
+3. **大项目慢**：grep在100+文件项目中效率低
+4. **无模糊匹配**：方法名不完全匹配时（如混淆代码）搜索失败
+
+### 改进方案
+
+#### 1. .gitignore 文件过滤
+```python
+# commands/attribution.py 或新建 source_search.py
+import pathspec
+
+def load_gitignore(source_dir: str) -> pathspec.PathSpec:
+    gitignore_path = os.path.join(source_dir, '.gitignore')
+    if os.path.exists(gitignore_path):
+        with open(gitignore_path) as f:
+            return pathspec.PathSpec.from_lines('gitwildmatch', f)
+    return pathspec.PathSpec.from_lines('gitwildmatch', [])
+
+def should_ignore(path: str, spec: pathspec.PathSpec) -> bool:
+    return spec.match_file(path)
+```
+
+#### 2. 函数级分块
+```python
+# 基于 AST 或正则的轻量分块
+import re
+
+def chunk_by_function(source: str) -> list[dict]:
+    \"\"\"将源码按函数/类切分为块，每块带行号范围。\"\"\"
+    chunks = []
+    # 匹配函数/类定义
+    pattern = re.compile(r'^(class |def |public |private |protected |@\\w+).*$', re.MULTILINE)
+    ...
+    return chunks
+```
+
+#### 3. 轻量BM25索引（可选）
+```python
+# 对大项目（>100文件）预建索引
+from rank_bm25 import BM25Okapi
+
+class SourceIndex:
+    def __init__(self, source_dir: str):
+        self.chunks = self._index_source(source_dir)
+        self.bm25 = BM25Okapi([c['tokens'] for c in self.chunks])
+    
+    def search(self, query: str, top_k: int = 5) -> list[dict]:
+        scores = self.bm25.get_scores(query.split())
+        return sorted(zip(self.chunks, scores), key=lambda x: -x[1])[:top_k]
+```
+
+### 变更文件
+- `src/smartinspector/commands/attribution.py` — 添加文件过滤和函数级分块
+- `src/smartinspector/agents/attributor.py` — 使用增强搜索替代现有grep
+- `requirements.txt` — 可选：添加 `pathspec`, `rank_bm25`
+
+### 不引入的
+- ❌ 向量数据库（Milvus/Zilliz）— 太重，CLI工具不应依赖外部服务
+- ❌ Embedding模型 — 增加延迟和成本，方法名匹配场景不需要语义搜索
