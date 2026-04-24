@@ -201,7 +201,9 @@ smartinspector/
 │   │
 │   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU, context manager)
 │   ├── collector/startup.py        #   冷启动分析器 (启动阶段切分, 关键路径提取, 瓶颈识别)
+│   ├── collector/memory.py         #   内存分配分析器 (heap_graph, 泄漏检测, 内存趋势)
 │   ├── headless.py                 #   Headless/CI 非交互式运行器 (全量流水线, JSON/Markdown 输出)
+│   ├── storage/store.py            #   报告存储层 (基线管理, 历史查询, 对比数据源)
 │   ├── commands/                   #   Slash 命令 (注册表模式)
 │   │   ├── __init__.py             #     命令注册表 (handle_slash_command)
 │   │   ├── attribution.py          #     SI$ tag 解析 + 归因提取
@@ -224,6 +226,7 @@ smartinspector/
 │   └── android/tracelib/           #   Android SDK (AAR)
 │       └── src/main/java/.../tracelib/
 │           ├── TraceHook.java          # Pine AOP 方法 hook (深度保护, Tag截断, 系统widget过滤)
+│           ├── ComposeHook.kt          # Compose 重组追踪 (TracerImpl hook, API 31+)
 │           ├── BlockMonitor.java       # 主线程卡顿检测 (容量限制防OOM, Fragment泄漏修复)
 │           ├── SIClient.java           # WebSocket 客户端
 │           ├── HookConfig.java         # 配置模型 (JSON 序列化, BuildConfig.DEBUG守卫)
@@ -259,6 +262,7 @@ SDK 通过 Pine AOP 框架 hook 框架方法，用 `SI$` 前缀的 `Trace.beginS
 | Network IO         | ON  | `SI$net#[Class].execute`                       | OkHttp / HttpURLConnection     |
 | Database IO        | ON  | `SI$db#[Class].query#[table]`                  | SQLiteDatabase / Room          |
 | Image Load         | ON  | `SI$img#[Class].into`                          | Glide / Coil                   |
+| Compose Recomposition | ON | `SI$compose#[Composable]#recompose`          | Compose 重组追踪 (API 31+)        |
 
 
 **IO Hook 说明**：Network/DB/Image hook 在所有线程执行，使用独立前缀 (`SI$net#`/`SI$db#`/`SI$img#`)，Python 端单独收集到 `io_slices`，不污染主线程 `view_slices` 分析。
@@ -299,6 +303,8 @@ uv run smartinspector --ci [选项]
 | 命令                            | 说明                                                       |
 | ----------------------------- | -------------------------------------------------------- |
 | `/full [--no-wait]`           | 全量分析流水线 (采集→分析→归因→报告)。`--no-wait` 跳过等待 App 连接，适用于冷启动耗时分析 |
+| `/quick`                      | 快速分析（纯确定性，不调用 LLM，秒级完成）。无 API Key 时自动降级 |
+| `/compare <r1> <r2>`          | 对比两份报告，生成 before/after 趋势报告 |
 | `/trace [duration_ms] [pkg]`  | 采集 + 自动分析 Perfetto trace                                 |
 | `/record [duration_ms] [pkg]` | 只采集不分析，返回 .pb 文件路径                                       |
 | `/analyze [path]`             | 分析 trace 文件（无参数时分析上次采集结果）                                |
@@ -510,15 +516,15 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 
 ## 路线图
 
-### P1 — 规划中
+### P1 — 已完成 (2026-04-24)
 
 | # | 项目 | 说明 | 状态 |
 |---|------|------|------|
-| P1-1 | Compose 重组追踪 | 追踪 Jetpack Compose 重组次数和耗时，定位不必要的 recomposition | 规划中 |
-| P1-2 | 内存分配分析 | 基于 `android.java_hprof` 数据源分析内存分配热点，定位内存抖动和泄漏 | 规划中 |
-| P1-3 | 历史对比与趋势 | 多次分析结果对比，生成 before/after 报告和性能趋势图 | 规划中 |
-| P1-4 | 智能一键分析 | 基于历史数据和 device profile 自动选择最佳分析策略 | 规划中 |
-| P1-5 | ExtraHook 参数自动推断 | 分析代码结构自动推荐 Hook 配置，减少手动配置 | 规划中 |
+| P1-1 | Compose 重组追踪 | 追踪 Jetpack Compose 重组次数和耗时，定位不必要的 recomposition | ✅ 已完成 |
+| P1-2 | 内存分配分析 | 基于 `heap_graph` 数据源分析内存分配热点，定位内存抖动和泄漏 | ✅ 已完成 |
+| P1-3 | 历史对比与趋势 | 多次分析结果对比，生成 before/after 报告和性能趋势图 | ✅ 已完成 |
+| P1-4 | 智能一键分析 | 纯确定性快速分析，不调用 LLM，30 秒内完成轻量分析 | ✅ 已完成 |
+| P1-5 | ExtraHook 参数自动推断 | 自动推断所有重载签名，无需手动配置方法参数 | ✅ 已完成 |
 
 ### 平台扩展
 
@@ -533,8 +539,39 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 - RV Instance 区分 create vs bind 开销
 - Perfetto `android.surfaceflinger.frame` 维度 (CPU vs GPU 瓶颈)
 - 自适应阈值 (基于设备能力动态调整)
-- thread_state N+1 查询优化 (批量 CTE 替代逐行查询)
+- ~~thread_state N+1 查询优化~~ → 已完成：重写为 `__intrinsic_thread_state` 表，支持 `blocked_function`/`io_wait`/`waker_utid`
 - LLM 实例统一管理 (LLMFactory)
+
+### ✅ 已完成 (2026-04-24 P1 改进)
+
+**P1-1: Compose 重组追踪**
+
+- `ComposeHook.kt`: Hook Compose Runtime 的 `TracerImpl` 和 `startRestartGroup/endRestartGroup`
+- 切片前缀 `SI$compose#`，Tag 格式：`SI$compose#ComposableName#recompose` / `SI$compose#ComposableName#first`
+- Python 端新增 `collect_compose_slices()` 查询和重组分析
+
+**P1-2: 内存分配分析**
+
+- `collector/memory.py`: `MemoryAnalyzer` 基于 `heap_graph` 表分析 Java 堆内存
+- 按类名聚合对象数量和总大小，检测 Activity/Fragment 泄漏嫌疑
+- 内存增长趋势追踪（RSS / anon 随时间变化）
+
+**P1-3: 历史对比与趋势**
+
+- `commands/compare.py`: `/compare` 命令，多次分析结果对比
+- `storage/store.py`: 报告存储层，支持基线管理和历史查询
+- 生成 before/after 报告，自动标注回归项和改善项
+
+**P1-4: 智能一键分析**
+
+- `commands/quick.py`: `/quick` 命令，纯确定性快速分析（不调用 LLM）
+- 仅运行 fast-path 归因 + `compute_hints`，秒级完成
+- 无 API Key 时自动降级为 quick 模式
+
+**P1-5: ExtraHook 参数自动推断**
+
+- `TraceHook.java` 改进 `hookExtraClasses()`：自动推断所有重载签名
+- 遍历 `getDeclaredMethods()` 匹配方法名，替代原先的只尝试无参签名
 
 ### ✅ 已完成 (2026-04-24 P0 改进)
 

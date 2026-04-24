@@ -62,20 +62,20 @@
 
 #### A. Android Hook 层差距
 
-1. **IO hooks 虽已实现但未启用且未经测试**：`hookNetworkIo()` / `hookDatabaseIo()` / `hookImageLoad()` 代码存在（`TraceHook.java:632-728`），但 `HookConfig` 中默认 `false`，且 Python 端 `collect_io_slices()` 已有对应查询。缺的是真实场景验证。
+1. **IO hooks 虽已实现但未启用且未经测试** ~~→ ✅ P0-1 已修复：默认开启，Python 端 IO 切片收集和归因已实现~~
 2. **无 Compose 支持**：Jetpack Compose 的重组(recomposition)追踪完全缺失，而 Compose 已是 Android UI 主流。
 3. **无 Coroutine 追踪**：协程的线程切换和挂起无法追踪。
-4. **无冷启动专项分析**：`skip_wait` 机制存在（`orchestrator.py:104-113`），但缺少从 Application.onCreate 到第一帧的完整链路追踪。
+4. **无冷启动专项分析** ~~→ ✅ P0-2 已修复：`collector/startup.py` + `graph/nodes/startup.py` 已实现~~
 5. **ExtraHook 参数推断简陋**：`hookExtraClasses()` 只尝试无参签名（`TraceHook.java:782-783`），无法精确匹配方法参数。
 6. **无 GPU 渲染分析**：`HookConfig.collectGpuMem` 默认关闭，无 GPU pipeline 追踪。
 
 #### B. Python 分析管线差距
 
 7. **无内存分配追踪**：`PerfSummary` 有 `memory` 字段但 `summarize()` 中未实现 `collect_memory()` — 只采集了 RSS 计数器，无对象级分配分析。
-8. **IO slices 未纳入归因**：`collect_io_slices()` 查询独立于 `view_slices`，归因管线不处理 IO 类型切片。
+8. **IO slices 未纳入归因** ~~→ ✅ P0-5 已修复：IO 切片归因已实现，`commands/attribution.py` 支持 SI$net#/SI$db#/SI$img# 解析~~
 9. **无跨进程分析**：`_resolve_target_process()` 只关注单进程（`perfetto.py:92-173`），无法分析多进程交互。
-10. **headless/CI 模式缺失**：整个管线依赖交互式 REPL，无 `--json` 或 `--ci` 输出模式。
-11. **报告仅 Markdown**：无 JSON 机器可读格式。
+10. **headless/CI 模式缺失** ~~→ ✅ P0-3 已修复：`headless.py` + `--ci` CLI 参数已实现~~
+11. **报告仅 Markdown** ~~→ ✅ P0-4 已修复：`json_formatter.py` 已实现 JSON 格式输出~~
 12. **无历史对比**：多次分析结果无法对比趋势。
 
 #### C. 开发者体验差距
@@ -92,39 +92,39 @@
 
 > 目标：让现有功能真正好用，解决"能用但不好用"的问题
 
-| # | 任务 | 影响文件 | 优先级理由 |
-|---|------|----------|-----------|
-| P0-1 | **IO hooks 验证与启用** | `TraceHook.java`, `HookConfig.java`, `collector/perfetto.py` | 代码已写好，只需测试+默认开启 |
-| P0-2 | **冷启动专项分析模式** | `orchestrator.py`, `collector_node`, `TraceHook.java`, 新增 `collect_startup.py` | 移动端最高频优化场景 |
-| P0-3 | **Headless/CI 模式** | `cli.py`, 新增 `headless.py`, `reporter/formatter.py` | 开源贡献者基本需求 |
-| P0-4 | **JSON 报告格式** | `reporter/`, 新增 `json_formatter.py` | CI 集成 + 自动化 |
-| P0-5 | **IO slices 归因** | `commands/attribution.py`, `agents/attributor.py` | 将已有数据纳入完整分析 |
+| # | 任务 | 影响文件 | 优先级理由 | 状态 |
+|---|------|----------|-----------|------|
+| P0-1 | **IO hooks 验证与启用** | `TraceHook.java`, `HookConfig.java`, `collector/perfetto.py` | 代码已写好，只需测试+默认开启 | ✅ 已完成 |
+| P0-2 | **冷启动专项分析模式** | `orchestrator.py`, `collector_node`, `TraceHook.java`, 新增 `collect_startup.py` | 移动端最高频优化场景 | ✅ 已完成 |
+| P0-3 | **Headless/CI 模式** | `cli.py`, 新增 `headless.py`, `reporter/formatter.py` | 开源贡献者基本需求 | ✅ 已完成 |
+| P0-4 | **JSON 报告格式** | `reporter/`, 新增 `json_formatter.py` | CI 集成 + 自动化 | ✅ 已完成 |
+| P0-5 | **IO slices 归因** | `commands/attribution.py`, `agents/attributor.py` | 将已有数据纳入完整分析 | ✅ 已完成 |
 
 ### P1: 分析能力扩展（第 3-4 周）
 
 > 目标：扩展分析深度，覆盖更多 Android 性能场景
 
-| # | 任务 | 影响文件 | 优先级理由 |
-|---|------|----------|-----------|
-| P1-1 | **Compose 重组追踪** | 新增 `ComposeHook.kt`, `collector/perfetto.py` | Android UI 现代化需求 |
-| P1-2 | **内存分配分析** | `collector/perfetto.py` (heap_graph), 新增 `collect_memory.py` | OOM 和内存泄漏是第二大类问题 |
-| P1-3 | **历史对比与趋势** | 新增 `storage/`, `commands/compare.py` | 持续性能监控 |
-| P1-4 | **智能一键分析** | `cli.py`, `commands/quick.py` | 降低使用门槛 |
-| P1-5 | **ExtraHook 参数自动推断** | `TraceHook.java` | 自定义 hook 可用性 |
+| # | 任务 | 影响文件 | 优先级理由 | 状态 |
+|---|------|----------|-----------|------|
+| P1-1 | **Compose 重组追踪** | 新增 `ComposeHook.kt`, `collector/perfetto.py` | Android UI 现代化需求 | ✅ 已完成 |
+| P1-2 | **内存分配分析** | `collector/perfetto.py` (heap_graph), 新增 `collect_memory.py` | OOM 和内存泄漏是第二大类问题 | ✅ 已完成 |
+| P1-3 | **历史对比与趋势** | 新增 `storage/`, `commands/compare.py` | 持续性能监控 | ✅ 已完成 |
+| P1-4 | **智能一键分析** | `cli.py`, `commands/quick.py` | 降低使用门槛 | ✅ 已完成 |
+| P1-5 | **ExtraHook 参数自动推断** | `TraceHook.java` | 自定义 hook 可用性 | ✅ 已完成 |
 
 ### P2: 生态扩展（后续）
 
 > 目标：多平台支持 + 高级分析能力
 
-| # | 任务 | 说明 |
-|---|------|------|
-| P2-1 | **HarmonyOS 平台支持** | hdc + hiperf/hitrace，已有设计文档 |
-| P2-2 | **iOS Instruments 集成** | instruments CLI + .trace 文件解析 |
-| P2-3 | **实时监控模式** | streaming adb logcat + 持续分析 |
-| P2-4 | **ANR 自动捕获与分析** | ANR trace 文件解析 + 归因 |
-| P2-5 | **网络瀑布图** | OkHttp 事件追踪 + 时间线可视化 |
-| P2-6 | **源码归因增强（借鉴claude-context）** | .gitignore过滤、函数级分块搜索、轻量BM25索引 |
-| P2-7 | **Coroutine追踪** | 协程线程切换和挂起追踪 |
+| # | 任务 | 说明 | 状态 |
+|---|------|------|------|
+| P2-1 | **HarmonyOS 平台支持** | hdc + hiperf/hitrace，已有设计文档 | 规划中 |
+| P2-2 | **iOS Instruments 集成** | instruments CLI + .trace 文件解析 | 规划中 |
+| P2-3 | **实时监控模式** | streaming adb logcat + 持续分析 | 规划中 |
+| P2-4 | **ANR 自动捕获与分析** | ANR trace 文件解析 + 归因 | 规划中 |
+| P2-5 | **网络瀑布图** | OkHttp 事件追踪 + 时间线可视化 | 规划中 |
+| P2-6 | **源码归因增强（借鉴claude-context）** | .gitignore过滤、函数级分块搜索、轻量BM25索引 | 规划中 |
+| P2-7 | **Coroutine追踪** | 协程线程切换和挂起追踪 | 规划中 |
 
 ---
 

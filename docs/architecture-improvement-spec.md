@@ -45,16 +45,16 @@
 
 ### 1.4 关键技术债务清单
 
-| # | 技术债 | 影响 | 严重度 |
-|---|--------|------|--------|
-| T1 | SQL 注入风险: f-string 拼接 SQL | 安全隐患 | 高 |
-| T2 | thread_state N+1 查询 | 性能瓶颈 | 高 |
-| T3 | `_structured_ok` 全局可变状态竞态 | 可靠性 | 中 |
-| T4 | TraceProcessor 未在所有路径 close | 资源泄漏 | 高 |
-| T5 | LLM 实例管理碎片化 | 维护性 | 中 |
-| T6 | bridge_server 全局状态管理 | 可维护性 | 中 |
-| T7 | 部分节点缺少 `@node_error_handler` | 可靠性 | 中 |
-| T8 | `_walk_call_chain` 逐行查询 | 性能 | 中 |
+| # | 技术债 | 影响 | 严重度 | 状态 |
+|---|--------|------|--------|------|
+| T1 | SQL 注入风险: f-string 拼接 SQL | 安全隐患 | 高 | 待修复 |
+| T2 | thread_state N+1 查询 | 性能瓶颈 | 高 | ✅ 已修复 — 重写为 `__intrinsic_thread_state` 表 |
+| T3 | `_structured_ok` 全局可变状态竞态 | 可靠性 | 中 | 待修复 |
+| T4 | TraceProcessor 未在所有路径 close | 资源泄漏 | 高 | ✅ 已修复 — collector_node 使用 context manager |
+| T5 | LLM 实例管理碎片化 | 维护性 | 中 | 待修复 |
+| T6 | bridge_server 全局状态管理 | 可维护性 | 中 | 待修复 |
+| T7 | 部分节点缺少 `@node_error_handler` | 可靠性 | 中 | ✅ 已修复 — attributor/reporter 已添加 |
+| T8 | `_walk_call_chain` 逐行查询 | 性能 | 中 | ✅ 已修复 — 预加载 slice map |
 
 ---
 
@@ -521,15 +521,15 @@ def get_tool_timeout() -> int:
 
 ### P1（重要）— 架构层面的改进
 
-| # | 项目 | 涉及文件 | 说明 |
-|---|------|----------|------|
-| P1-1 | SQL 注入风险修复 | `collector/perfetto.py` 多处 | 输入验证 + 参数化 |
-| P1-2 | thread_state N+1 查询 | `collector/perfetto.py:1203-1338` | 批量 CTE 查询 |
-| P1-3 | 统一 LLM 实例管理 | 多文件 | 创建 LLMFactory |
-| P1-4 | reporter 重复调用 compute_hints | `formatter.py:17`, `perf_analyzer.py:43` | state 中缓存 hints |
-| P1-5 | block stack 关联代码重复 | `collector/perfetto.py` | 提取公共函数 |
-| P1-6 | SI$ tag 统一解析 | `commands/attribution.py` | 创建 `parse_si_tag()` |
-| P1-7 | node_error_handler print → logger | `graph/state.py:78` | 改用 logger.error |
+| # | 项目 | 涉及文件 | 说明 | 状态 |
+|---|------|----------|------|------|
+| P1-1 | SQL 注入风险修复 | `collector/perfetto.py` 多处 | 输入验证 + 参数化 | 待修复 |
+| P1-2 | thread_state N+1 查询 | `collector/perfetto.py:1203-1338` | 批量 CTE 查询 | ✅ 已完成 — 重写为 `__intrinsic_thread_state` 表 |
+| P1-3 | 统一 LLM 实例管理 | 多文件 | 创建 LLMFactory | 待修复 |
+| P1-4 | reporter 重复调用 compute_hints | `formatter.py:17`, `perf_analyzer.py:43` | state 中缓存 hints | 待修复 |
+| P1-5 | block stack 关联代码重复 | `collector/perfetto.py` | 提取公共函数 | 待修复 |
+| P1-6 | SI$ tag 统一解析 | `commands/attribution.py` | 创建 `parse_si_tag()` | 待修复 |
+| P1-7 | node_error_handler print → logger | `graph/state.py:78` | 改用 logger.error | ✅ 已完成 — 全链路 logging 改造 |
 
 ### P2（优化）— 性能和代码质量提升
 
@@ -543,15 +543,15 @@ def get_tool_timeout() -> int:
 | P2-6 | _structured_ok 竞态 | `agents/attributor.py:55` | Lock 保护 |
 | P2-7 | WS 连接断开清理 | `ws/server.py:278-283` | 清理 pending_acks |
 
-### P1 Feature Roadmap — 规划中的功能改进
+### P1 Feature Roadmap — 功能改进
 
-| # | 项目 | 说明 | 涉及模块 |
-|---|------|------|----------|
-| P1-1 | Compose 重组追踪 | 追踪 Jetpack Compose 重组次数和耗时，定位不必要的 recomposition | Android SDK + collector |
-| P1-2 | 内存分配分析 | 基于 `android.java_hprof` 数据源分析内存分配热点，定位内存抖动和泄漏 | collector + 新 agent |
-| P1-3 | 历史对比与趋势 | 多次分析结果对比，生成 before/after 报告和性能趋势图 | reporter + persistence |
-| P1-4 | 智能一键分析 | 基于历史数据和 device profile 自动选择最佳分析策略 | orchestrator |
-| P1-5 | ExtraHook 参数自动推断 | 分析代码结构自动推荐 Hook 配置，减少手动配置 | agents + commands |
+| # | 项目 | 说明 | 涉及模块 | 状态 |
+|---|------|------|----------|------|
+| P1-1 | Compose 重组追踪 | 追踪 Jetpack Compose 重组次数和耗时，定位不必要的 recomposition | Android SDK + collector | ✅ 已完成 |
+| P1-2 | 内存分配分析 | 基于 `android.java_hprof` 数据源分析内存分配热点，定位内存抖动和泄漏 | collector + 新 agent | ✅ 已完成 |
+| P1-3 | 历史对比与趋势 | 多次分析结果对比，生成 before/after 报告和性能趋势图 | reporter + persistence | ✅ 已完成 |
+| P1-4 | 智能一键分析 | 基于历史数据和 device profile 自动选择最佳分析策略 | orchestrator | ✅ 已完成 |
+| P1-5 | ExtraHook 参数自动推断 | 分析代码结构自动推荐 Hook 配置，减少手动配置 | agents + commands | ✅ 已完成 |
 
 ### P3（可选）— 长期演进方向
 
@@ -568,23 +568,23 @@ def get_tool_timeout() -> int:
 
 ## 附录: 文件级问题索引
 
-| 文件 | 行号 | 问题 | 严重度 |
-|------|------|------|--------|
-| `collector/perfetto.py` | 100-108 | TraceProcessor 超时不可配置 | P1 |
-| `collector/perfetto.py` | 130 | SQL f-string 拼接 | P1 |
-| `collector/perfetto.py` | 743 | SQL IN clause f-string | P1 |
-| `collector/perfetto.py` | 1264-1278 | N+1 SQL 查询 | P1 |
-| `collector/perfetto.py` | 1877-1919 | TraceServer 无 atexit 清理 | P2 |
-| `collector/perfetto.py` | 2104-2133 | 逐行查询 call chain | P0 |
-| `graph/state.py` | 78 | print 而非 logger | P1 |
-| `graph/nodes/collector.py` | 184 | 缺少 `with` context manager | P0 |
-| `graph/nodes/attributor.py` | 33 | 缺少 `@node_error_handler` | P0 |
-| `graph/nodes/reporter/__init__.py` | 21 | 缺少 `@node_error_handler` | P0 |
-| `graph/nodes/reporter/formatter.py` | 17 | 函数内部 import | P2 |
-| `graph/nodes/reporter/generator.py` | 19 | 复用 orchestrator 的 `_get_route_llm()` | P1 |
-| `agents/attributor.py` | 55 | `_structured_ok` 全局可变状态 | P2 |
-| `agents/perf_analyzer.py` | 49 | 武断截断 perf_json[:3000] | P2 |
-| `commands/attribution.py` | 全文件 | 重复的 tag 解析逻辑 | P1 |
-| `ws/server.py` | 278-283 | 连接断开未清理 pending_acks | P2 |
-| `ws/bridge_server.py` | 314-317 | 模块级全局状态 | P2 |
-| `config.py` | 122-170 | 重复的 get_* 函数模式 | P2 |
+| 文件 | 行号 | 问题 | 严重度 | 状态 |
+|------|------|------|--------|------|
+| `collector/perfetto.py` | 100-108 | TraceProcessor 超时不可配置 | P1 | 待修复 |
+| `collector/perfetto.py` | 130 | SQL f-string 拼接 | P1 | 待修复 |
+| `collector/perfetto.py` | 743 | SQL IN clause f-string | P1 | 待修复 |
+| `collector/perfetto.py` | 1264-1278 | N+1 SQL 查询 | P1 | ✅ 已修复 — 重写为 `__intrinsic_thread_state` |
+| `collector/perfetto.py` | 1877-1919 | TraceServer 无 atexit 清理 | P2 | 待修复 |
+| `collector/perfetto.py` | 2104-2133 | 逐行查询 call chain | P0 | ✅ 已修复 — 预加载 slice map |
+| `graph/state.py` | 78 | print 而非 logger | P1 | ✅ 已修复 — 全链路 logging 改造 |
+| `graph/nodes/collector.py` | 184 | 缺少 `with` context manager | P0 | ✅ 已修复 |
+| `graph/nodes/attributor.py` | 33 | 缺少 `@node_error_handler` | P0 | ✅ 已修复 |
+| `graph/nodes/reporter/__init__.py` | 21 | 缺少 `@node_error_handler` | P0 | ✅ 已修复 |
+| `graph/nodes/reporter/formatter.py` | 17 | 函数内部 import | P2 | 待修复 |
+| `graph/nodes/reporter/generator.py` | 19 | 复用 orchestrator 的 `_get_route_llm()` | P1 | 待修复 |
+| `agents/attributor.py` | 55 | `_structured_ok` 全局可变状态 | P2 | 待修复 |
+| `agents/perf_analyzer.py` | 49 | 武断截断 perf_json[:3000] | P2 | 待修复 |
+| `commands/attribution.py` | 全文件 | 重复的 tag 解析逻辑 | P1 | 待修复 |
+| `ws/server.py` | 278-283 | 连接断开未清理 pending_acks | P2 | 待修复 |
+| `ws/bridge_server.py` | 314-317 | 模块级全局状态 | P2 | 待修复 |
+| `config.py` | 122-170 | 重复的 get_* 函数模式 | P2 | 待修复 |
