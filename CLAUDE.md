@@ -181,6 +181,13 @@ end            → END
 ### ⚠️ 文档更新规则
 **新增命令或功能时必须同步更新此章节**，包括：命令名、参数说明、使用示例。禁止只改代码不更新文档。
 
+### ⚠️ Prompt 管理规则
+**所有复杂的LLM提示词必须保存到 `prompts/` 目录下的 `.txt` 文件中，通过 `prompts.py` loader 加载。**
+- 禁止在 Python 代码中内联大段 prompt 字符串
+- 简单的单行分类 prompt（如 `max_tokens=5` 的意图路由）可以内联
+- 超过3行的 prompt 必须抽取到 `prompts/` 目录
+- Prompt 文件命名：`{功能名}.txt`（如 `report-generator.txt`、`attributor.txt`）
+
 ### CLI Mode (Headless/CI)
 
 ```
