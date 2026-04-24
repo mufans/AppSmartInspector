@@ -16,14 +16,17 @@ from smartinspector.graph.nodes.explorer import explorer_node
 from smartinspector.graph.nodes.collector import collector_node
 from smartinspector.graph.nodes.attributor import attributor_node
 from smartinspector.graph.nodes.reporter import reporter_node
+from smartinspector.graph.nodes.startup import startup_node
 
 
 
 def _route_from_analyzer(state: AgentState) -> str:
-    """After analyzer: TRACE route → END; FULL_ANALYSIS → attributor."""
+    """After analyzer: TRACE → END; STARTUP → startup; FULL_ANALYSIS → attributor."""
     route = state.get("_route", "")
     if route == RouteDecision.TRACE or route == RouteDecision.TRACE.value:
         return "end"
+    if route == RouteDecision.STARTUP or route == RouteDecision.STARTUP.value:
+        return "startup"
     return "attributor"
 
 
@@ -37,6 +40,7 @@ def create_graph():
     builder.add_node("perf_analyzer", perf_analyzer_node)
     builder.add_node("explorer", explorer_node)
     builder.add_node("fallback", fallback_node)
+    builder.add_node("startup", startup_node)
     # Pipeline nodes
     builder.add_node("collector", collector_node)
     builder.add_node("analyzer", analyzer_node)
@@ -63,6 +67,7 @@ def create_graph():
     builder.add_edge("perf_analyzer", END)
     builder.add_edge("explorer", END)
     builder.add_edge("fallback", END)
+    builder.add_edge("startup", END)
 
     # Android expert: if perf_summary detected → continue pipeline, else END
     builder.add_conditional_edges(
@@ -77,12 +82,13 @@ def create_graph():
     # collector → analyzer (always)
     builder.add_edge("collector", "analyzer")
 
-    # analyzer → END (trace) or attributor (full_analysis)
+    # analyzer → END (trace) / startup / attributor
     builder.add_conditional_edges(
         "analyzer",
         _route_from_analyzer,
         path_map={
             "attributor": "attributor",
+            "startup": "startup",
             "end": END,
         },
     )

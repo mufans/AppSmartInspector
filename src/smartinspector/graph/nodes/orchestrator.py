@@ -6,6 +6,9 @@ from langchain_openai import ChatOpenAI
 from smartinspector.config import get_llm_kwargs
 from smartinspector.token_tracker import get_tracker
 from smartinspector.graph.state import AgentState, RouteDecision, _pass_through, node_error_handler
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 _ROUTE_PROMPT = """Classify this user message. Reply with ONE word only.
@@ -94,11 +97,12 @@ def orchestrator_node(state: AgentState) -> dict:
     if decision != RouteDecision.END:
         _ROUTE_LABELS = {
             RouteDecision.FULL_ANALYSIS: "正在启动全量性能分析...",
+            RouteDecision.STARTUP: "正在启动冷启动分析...",
             RouteDecision.ANDROID: "正在采集设备性能数据...",
             RouteDecision.ANALYZE: "正在分析性能数据...",
             RouteDecision.EXPLORER: "正在搜索源码...",
         }
-        print(f"  {_ROUTE_LABELS.get(decision, '处理中...')}", flush=True)
+        print(f"  {_ROUTE_LABELS.get(decision, '处理中...')}", flush=True)  # noqa: LOG — user-facing progress
 
     # Detect cold-start / startup profiling intent for skip_wait
     skip_wait = False
@@ -110,7 +114,9 @@ def orchestrator_node(state: AgentState) -> dict:
         user_msg_lower = user_msg.lower()
         skip_wait = any(kw in user_msg_lower for kw in _STARTUP_KEYWORDS)
         if skip_wait:
-            print("  [orchestrator] 检测到启动分析意图，将跳过等待 App 连接", flush=True)
+            # Re-route to dedicated startup analysis pipeline
+            decision = RouteDecision.STARTUP
+            logger.info("Detected startup analysis intent, routing to startup analyzer")
 
     return {"messages": [], "_route": decision, "skip_wait": skip_wait, **_pass_through(state)}
 
@@ -168,6 +174,8 @@ def route_from_orchestrator(state: AgentState) -> str:
     mapping = {
         RouteDecision.FULL_ANALYSIS: "collector",
         RouteDecision.FULL_ANALYSIS.value: "collector",
+        RouteDecision.STARTUP: "collector",
+        RouteDecision.STARTUP.value: "collector",
         RouteDecision.ANDROID: "android_expert",
         RouteDecision.ANDROID.value: "android_expert",
         RouteDecision.ANALYZE: "perf_analyzer",

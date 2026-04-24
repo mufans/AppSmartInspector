@@ -14,6 +14,7 @@ class RouteDecision(str, Enum):
     continue to work without any ``.value`` conversion.
     """
     FULL_ANALYSIS = "full_analysis"
+    STARTUP = "startup"          # cold start analysis: collector → startup_analyzer
     ANDROID = "android"
     ANALYZE = "analyze"
     EXPLORER = "explorer"
