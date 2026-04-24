@@ -468,3 +468,40 @@ print(f"  [reporter] Failed to save report: {e}")     # 改用 logger.error()
 # ✅ 允许的 print（用户面向的流式输出）
 print(token, end="", flush=True)  # noqa: LOG — streaming LLM tokens to user
 ```
+
+## Pipeline Architecture Rule
+
+### 核心原则
+**所有新功能必须复用 LangGraph pipeline 链路，禁止单独创建独立执行路径。**
+
+### 规则
+1. **统一的执行入口**：所有分析功能（full/quick/startup/headless）都必须通过 LangGraph graph 执行，不允许绕过 graph 直接调用 collector/analyzer/attributor
+2. **命令即节点**：新增功能通过添加 graph node 实现，通过 orchestrator 路由到对应 node
+3. **状态驱动**：所有功能通过 `AgentState` 传递数据，不允许在 node 外部维护独立的执行逻辑
+4. **headless/CI 模式**：headless 模式复用 LangGraph graph，通过 cmd 参数选择执行路径（如 `/full`、`/quick`、`/startup`），而不是单独维护一套执行逻辑
+5. **新增 node 规范**：
+   - 必须使用 `@node_error_handler("node_name")` 装饰器
+   - 必须返回 dict 且包含 `messages` 字段
+   - 必须使用 `_pass_through(state)` 透传其他状态字段
+   - 必须使用标准 logging（参见 Logging Standard 章节）
+
+### 反例（禁止）
+```python
+# ❌ 禁止：headless 模式单独维护执行逻辑
+async def headless_run():
+    collector = PerfettoCollector(trace_path)
+    data = collector.collect()
+    analyzer = DeterministicAnalyzer(data)
+    result = analyzer.analyze()
+    # 绕过了 LangGraph，状态无法共享，错误处理不一致
+```
+
+### 正例（推荐）
+```python
+# ✅ 推荐：headless 复用 LangGraph
+async def headless_run(cmd: str, **kwargs):
+    graph = create_graph()
+    initial_state = {"messages": [HumanMessage(content=cmd)], **kwargs}
+    result = await graph.ainvoke(initial_state)
+    return result
+```
