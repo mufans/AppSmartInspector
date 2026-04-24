@@ -1,18 +1,18 @@
-"""Headless runner: non-interactive analysis pipeline for CI/automation."""
+"""Headless runner: non-interactive analysis pipeline via LangGraph."""
 
 import json
 import logging
-import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 class HeadlessRunner:
-    """Non-interactive analysis runner that bypasses the REPL.
+    """Non-interactive analysis runner using the LangGraph pipeline.
 
-    Executes the full analysis pipeline (collect → analyze → attribute → report)
-    and writes results to a file.
+    Executes the full analysis pipeline (collect -> analyze -> attribute -> report)
+    through the LangGraph graph, following the Pipeline Architecture Rule.
+    Supports cmd parameter to select execution path (full_analysis, startup, etc.).
     """
 
     def __init__(
@@ -24,6 +24,7 @@ class HeadlessRunner:
         fmt: str = "markdown",
         duration: int = 10000,
         debug: bool = False,
+        cmd: str = "full_analysis",
     ) -> None:
         self.source_dir = source_dir
         self.target = target
@@ -32,16 +33,16 @@ class HeadlessRunner:
         self.fmt = fmt
         self.duration = duration
         self.debug = debug
+        self.cmd = cmd
 
     def run(self) -> str:
-        """Execute the analysis pipeline and return the report.
+        """Execute the analysis pipeline via LangGraph and return the report.
 
-        Returns the report content as a string.
+        Builds initial state and invokes the graph with the selected cmd route.
         """
         from smartinspector.config import set_source_dir
-        from smartinspector.collector.perfetto import PerfettoCollector
-        from smartinspector.agents.deterministic import compute_hints
-        from smartinspector.commands.attribution import extract_attributable_slices
+        from smartinspector.graph import create_graph
+        from smartinspector.graph.state import RouteDecision
 
         set_source_dir(self.source_dir)
 
@@ -49,150 +50,117 @@ class HeadlessRunner:
             import os
             os.environ["SI_DEBUG"] = "1"
 
-        # Phase 1: Get trace
-        if self.trace_path:
-            # Analyze existing trace file
-            trace_path = self.trace_path
-            logger.info("Analyzing existing trace: %s", trace_path)
-        else:
-            # Collect new trace from device
-            logger.info("Collecting trace from device (duration=%dms, target=%s)", self.duration, self.target)
-            try:
-                trace_path = PerfettoCollector.pull_trace_from_device(
-                    duration_ms=self.duration,
-                    target_process=self.target,
-                )
-                logger.info("Trace saved to %s", trace_path)
-            except Exception as e:
-                error_msg = f"Trace collection failed: {e}"
-                logger.error(error_msg)
-                return self._format_error(error_msg)
+        # Determine route based on cmd parameter
+        route = self._resolve_route(self.cmd)
 
-        # Phase 2: Analyze trace
+        # Build initial state for the graph
+        initial_state = {
+            "messages": [],
+            "perf_summary": "",
+            "perf_analysis": "",
+            "attribution_data": "",
+            "attribution_result": "",
+            "trace_duration_ms": self.duration,
+            "trace_target_process": self.target or "",
+            "skip_wait": route in (RouteDecision.STARTUP, RouteDecision.STARTUP.value),
+            "_route": route,
+            "_trace_path": self.trace_path or "",
+        }
+
+        logger.info("Headless run: cmd=%s, route=%s, target=%s, trace=%s",
+                     self.cmd, route, self.target, self.trace_path)
+
+        graph = create_graph()
+        config = {"configurable": {"thread_id": "headless"}}
+
         try:
-            collector = PerfettoCollector(trace_path, target_process=self.target)
-            summary = collector.summarize()
-            perf_json = summary.to_json()
+            # Invoke the graph (non-streaming for headless/CI)
+            result_state = graph.invoke(initial_state, config=config)
         except Exception as e:
-            error_msg = f"Trace analysis failed: {e}"
+            error_msg = f"Pipeline execution failed: {e}"
             logger.error(error_msg)
             return self._format_error(error_msg)
 
-        logger.info("Perf summary: %d bytes", len(perf_json))
+        # Extract final state values
+        final = result_state
+        perf_analysis = final.get("perf_analysis", "")
+        perf_summary = final.get("perf_summary", "")
+        attribution_result = final.get("attribution_result", "")
 
-        # Phase 3: Deterministic analysis
-        hints = compute_hints(perf_json)
+        # Extract the report from messages (last AI message)
+        report = ""
+        messages = final.get("messages", [])
+        for msg in reversed(messages):
+            content = getattr(msg, "content", "") if not isinstance(msg, dict) else msg.get("content", "")
+            if content and not content.startswith("["):
+                report = content
+                break
 
-        # Phase 4: Attribution
-        attributable = extract_attributable_slices(perf_json)
-        logger.info("Found %d attributable slices", len(attributable))
-
-        # Phase 5: LLM analysis (if API key available)
-        perf_analysis = ""
-        from smartinspector.config import get_api_key
-        if get_api_key():
-            perf_analysis = self._run_llm_analysis(perf_json)
-        else:
-            logger.warning("No API key configured, skipping LLM analysis")
-            perf_analysis = hints
-
-        # Phase 6: Generate report
+        # Generate output based on format
         if self.fmt == "json":
-            report = self._generate_json_report(perf_json, perf_analysis, attributable)
+            output = self._format_json_output(
+                perf_summary, perf_analysis, attribution_result, report,
+            )
         else:
-            report = self._generate_markdown_report(perf_json, perf_analysis, hints, attributable)
+            output = report or perf_analysis or self._format_error("No analysis result produced")
 
         # Write to file if output specified
         if self.output:
             try:
                 output_path = Path(self.output)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_text(report, encoding="utf-8")
+                output_path.write_text(output, encoding="utf-8")
                 logger.info("Report saved to %s", self.output)
             except OSError as e:
                 logger.error("Failed to write report: %s", e)
 
-        return report
+        return output
 
-    def _run_llm_analysis(self, perf_json: str) -> str:
-        """Run LLM-based performance analysis."""
-        try:
-            from smartinspector.graph.nodes.analyzer import perf_analyzer_node
-            from smartinspector.graph.state import AgentState
+    def _resolve_route(self, cmd: str) -> str:
+        """Map cmd parameter to RouteDecision value."""
+        from smartinspector.graph.state import RouteDecision
 
-            # Create minimal state for the analyzer
-            state: AgentState = {
-                "messages": [],
-                "perf_summary": perf_json,
-                "perf_analysis": "",
-                "attribution_data": "",
-                "attribution_result": "",
-                "trace_duration_ms": self.duration,
-                "trace_target_process": self.target or "",
-                "skip_wait": True,
-                "_route": "full_analysis",
-                "_trace_path": self.trace_path or "",
-            }
+        cmd_to_route = {
+            "full_analysis": RouteDecision.FULL_ANALYSIS,
+            "full": RouteDecision.FULL_ANALYSIS,
+            "startup": RouteDecision.STARTUP,
+            "analyze": RouteDecision.ANALYZE,
+            "trace": RouteDecision.TRACE,
+        }
+        decision = cmd_to_route.get(cmd, RouteDecision.FULL_ANALYSIS)
+        return decision if isinstance(decision, str) else decision.value
 
-            result = perf_analyzer_node(state)
-            return result.get("perf_analysis", "")
-        except Exception as e:
-            logger.warning("LLM analysis failed: %s", e)
-            return ""
-
-    def _generate_json_report(
+    def _format_json_output(
         self,
-        perf_json: str,
+        perf_summary: str,
         perf_analysis: str,
-        attributable: list[dict],
+        attribution_result: str,
+        report: str,
     ) -> str:
-        """Generate a structured JSON report."""
-        from smartinspector.graph.nodes.reporter.json_formatter import format_json_report
-        report = format_json_report(
-            perf_json=perf_json,
-            perf_analysis=perf_analysis,
-            attributable=attributable,
-            trace_path=self.trace_path or "",
-            target=self.target or "",
-        )
-        return json.dumps(report, indent=2, ensure_ascii=False)
+        """Format output as structured JSON."""
+        result = {
+            "report": report,
+            "perf_analysis": perf_analysis,
+        }
 
-    def _generate_markdown_report(
-        self,
-        perf_json: str,
-        perf_analysis: str,
-        hints: str,
-        attributable: list[dict],
-    ) -> str:
-        """Generate a markdown report."""
-        import datetime
-        from smartinspector.graph.nodes.reporter.formatter import (
-            format_perf_sections,
-            format_attribution_section,
-        )
+        if perf_summary:
+            try:
+                result["perf_summary"] = json.loads(perf_summary)
+            except (json.JSONDecodeError, TypeError):
+                result["perf_summary"] = perf_summary
 
-        parts = []
-        parts.append(f"# SmartInspector Performance Report\n")
-        parts.append(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if attribution_result:
+            try:
+                result["attribution"] = json.loads(attribution_result)
+            except (json.JSONDecodeError, TypeError):
+                result["attribution"] = attribution_result
+
         if self.target:
-            parts.append(f"Target: {self.target}")
+            result["target"] = self.target
         if self.trace_path:
-            parts.append(f"Trace: {self.trace_path}")
+            result["trace_path"] = self.trace_path
 
-        # Perf sections
-        sections = format_perf_sections(perf_json)
-        parts.extend(sections)
-
-        # Attribution
-        attr_json = json.dumps(attributable, ensure_ascii=False)
-        attr_sections = format_attribution_section(attr_json)
-        parts.extend(attr_sections)
-
-        # Analysis
-        if perf_analysis:
-            parts.append(f"\n## 性能分析\n{perf_analysis}")
-
-        return "\n\n".join(parts)
+        return json.dumps(result, indent=2, ensure_ascii=False)
 
     def _format_error(self, message: str) -> str:
         """Format error for output."""

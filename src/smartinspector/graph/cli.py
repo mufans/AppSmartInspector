@@ -33,6 +33,9 @@ def main():
     parser.add_argument("--output", default="", help="Output file path (CI mode)")
     parser.add_argument("--format", choices=["markdown", "json"], default="markdown",
                         help="Report format (CI mode, default: markdown)")
+    parser.add_argument("--cmd", default="full_analysis",
+                        choices=["full_analysis", "full", "startup", "analyze", "trace"],
+                        help="Pipeline command to execute (CI mode, default: full_analysis)")
     args, _ = parser.parse_known_args()
 
     if args.source_dir:
@@ -56,6 +59,7 @@ def main():
             fmt=args.format,
             duration=args.duration,
             debug=args.debug,
+            cmd=args.cmd,
         )
         report = runner.run()
         # In CI mode, print report to stdout if no output file specified

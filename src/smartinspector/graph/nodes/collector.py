@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import subprocess
 
 from langchain_core.messages import AIMessage
@@ -227,52 +228,59 @@ def collector_node(state: AgentState) -> dict:
             logger.warning("start_trace ACK failed: %s", e)
 
     try:
-        # Read perfetto params: CLI args override WS config
-        pc = _read_perfetto_config()
-        duration_ms = state.get("trace_duration_ms") or int(pc.get("trace_duration_ms", 10000))
-        buffer_size_kb = state.get("trace_buffer_size_kb") or int(pc.get("buffer_size_kb", 65536))
-        target_process = state.get("trace_target_process") or pc.get("target_process", "") or None
-
-        # Pass through full config from HookConfig
-        cpu_sampling_interval_ms = int(pc.get("cpu_sampling_interval_ms", 1))
-
-        categories_cfg = pc.get("categories")
-        if isinstance(categories_cfg, str) and categories_cfg:
-            categories = [c.strip() for c in categories_cfg.split(",") if c.strip()]
-        elif isinstance(categories_cfg, list) and categories_cfg:
-            categories = categories_cfg
+        # Check for pre-existing trace file (skip device collection)
+        preloaded_trace = state.get("_trace_path", "")
+        if preloaded_trace and os.path.isfile(preloaded_trace):
+            logger.info("Pre-loaded trace file: %s (skipping device collection)", preloaded_trace)
+            trace_path = preloaded_trace
+            target_process = state.get("trace_target_process") or None
         else:
-            categories = None
+            # Read perfetto params: CLI args override WS config
+            pc = _read_perfetto_config()
+            duration_ms = state.get("trace_duration_ms") or int(pc.get("trace_duration_ms", 10000))
+            buffer_size_kb = state.get("trace_buffer_size_kb") or int(pc.get("buffer_size_kb", 65536))
+            target_process = state.get("trace_target_process") or pc.get("target_process", "") or None
 
-        collect_cpu_callstacks = pc.get("collectCpuCallstacks", True)
-        collect_java_heap = pc.get("collectJavaHeap", True)
+            # Pass through full config from HookConfig
+            cpu_sampling_interval_ms = int(pc.get("cpu_sampling_interval_ms", 1))
 
-        logger.info("Config: duration=%dms, buffer=%dKB", duration_ms, buffer_size_kb)
+            categories_cfg = pc.get("categories")
+            if isinstance(categories_cfg, str) and categories_cfg:
+                categories = [c.strip() for c in categories_cfg.split(",") if c.strip()]
+            elif isinstance(categories_cfg, list) and categories_cfg:
+                categories = categories_cfg
+            else:
+                categories = None
 
-        # Cold start: ensure target_process is set in state for downstream nodes
-        if is_startup and cold_start_target and not target_process:
-            target_process = cold_start_target
+            collect_cpu_callstacks = pc.get("collectCpuCallstacks", True)
+            collect_java_heap = pc.get("collectJavaHeap", True)
 
-        # Build on_record_start callback for cold start: launch app while Perfetto records
-        on_record_start = None
-        if cold_start_target:
-            _launch_target = cold_start_target
-            def on_record_start():
-                logger.info("Cold start mode: launching %s (during trace recording)", _launch_target)
-                _adb_launch_app(_launch_target)
+            logger.info("Config: duration=%dms, buffer=%dKB", duration_ms, buffer_size_kb)
 
-        trace_path = PerfettoCollector.pull_trace_from_device(
-            duration_ms=duration_ms,
-            target_process=target_process,
-            buffer_size_kb=buffer_size_kb,
-            categories=categories,
-            cpu_sampling_interval_ms=cpu_sampling_interval_ms,
-            collect_cpu_callstacks=collect_cpu_callstacks if target_process else False,
-            collect_java_heap=collect_java_heap if target_process else False,
-            on_record_start=on_record_start,
-        )
-        logger.info("Trace saved to %s", trace_path)
-        debug_log("collector", f"trace_path: {trace_path}")
+            # Cold start: ensure target_process is set in state for downstream nodes
+            if is_startup and cold_start_target and not target_process:
+                target_process = cold_start_target
+
+            # Build on_record_start callback for cold start: launch app while Perfetto records
+            on_record_start = None
+            if cold_start_target:
+                _launch_target = cold_start_target
+                def on_record_start():
+                    logger.info("Cold start mode: launching %s (during trace recording)", _launch_target)
+                    _adb_launch_app(_launch_target)
+
+            trace_path = PerfettoCollector.pull_trace_from_device(
+                duration_ms=duration_ms,
+                target_process=target_process,
+                buffer_size_kb=buffer_size_kb,
+                categories=categories,
+                cpu_sampling_interval_ms=cpu_sampling_interval_ms,
+                collect_cpu_callstacks=collect_cpu_callstacks if target_process else False,
+                collect_java_heap=collect_java_heap if target_process else False,
+                on_record_start=on_record_start,
+            )
+            logger.info("Trace saved to %s", trace_path)
+            debug_log("collector", f"trace_path: {trace_path}")
 
         collector = PerfettoCollector(trace_path, target_process=target_process)
         summary = collector.summarize()
