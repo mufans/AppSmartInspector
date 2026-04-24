@@ -20,6 +20,7 @@ class RouteDecision(str, Enum):
     EXPLORER = "explorer"
     END = "end"
     TRACE = "trace"              # /trace command: collector → analyzer
+    QUICK = "quick"              # /quick command: deterministic, no LLM
 
 
 class AgentState(TypedDict):

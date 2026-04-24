@@ -6,6 +6,7 @@ from smartinspector.commands.hook import cmd_config, cmd_hooks, cmd_hook, cmd_de
 from smartinspector.commands.session import cmd_help, cmd_clear, cmd_summary, cmd_tokens
 from smartinspector.commands.orchestrate import cmd_full, cmd_report
 from smartinspector.commands.compare import cmd_compare
+from smartinspector.commands.quick import cmd_quick
 
 # Command registry: name → handler function
 SLASH_COMMANDS = {
@@ -30,6 +31,7 @@ SLASH_COMMANDS = {
     "/full": cmd_full,
     "/report": cmd_report,
     "/compare": cmd_compare,
+    "/quick": cmd_quick,
 }
 
 
