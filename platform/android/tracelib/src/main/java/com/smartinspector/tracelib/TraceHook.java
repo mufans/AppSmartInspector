@@ -781,25 +781,148 @@ public class TraceHook {
     // Extra hooks (user-specified classes/methods)
     // ═══════════════════════════════════════════════════════════
 
+    /**
+     * Common Android method parameter signatures to try when the exact
+     * parameter types are unknown. Ordered by likelihood:
+     * 1. No-arg (getters, lifecycle callbacks)
+     * 2. Single-arg (Bundle, View, int, Context)
+     * 3. Multi-arg (common pairs)
+     */
+    private static final Class<?>[][] COMMON_SIGNATURES = {
+        new Class<?>[0],                                              // no-arg
+        new Class<?>[]{Bundle.class},                                 // onCreate(state)
+        new Class<?>[]{View.class},                                   // onClick(view)
+        new Class<?>[]{int.class},                                    // onItemSelected(pos)
+        new Class<?>[]{boolean.class},                                // onCheckedChanged(isChecked)
+        new Class<?>[]{String.class},                                 // onTextChanged(text)
+        new Class<?>[]{Context.class},                                 // init(context)
+        new Class<?>[]{android.graphics.Canvas.class},                // onDraw(canvas)
+        new Class<?>[]{View.class, Bundle.class},                     // onViewCreated(view, state)
+        new Class<?>[]{LayoutInflater.class, ViewGroup.class, Bundle.class}, // onCreateView
+        new Class<?>[]{int.class, int.class},                         // onMeasure(w, h)
+        new Class<?>[]{int.class, int.class, int.class, int.class},   // onLayout(l, t, r, b)
+        new Class<?>[]{ViewGroup.class, int.class},                   // onCreateViewHolder(parent, viewType)
+        new Class<?>[]{View.class, int.class},                        // onBindViewHolder(holder, pos) -- rough match
+        new Class<?>[]{String.class, Bundle.class},                   // onRestoreInstanceState(key, state)
+        new Class<?>[]{android.os.Message.class},                     // handleMessage(msg)
+    };
+
     private static void hookExtraClasses() {
         List<HookConfig.ExtraHook> extras = HookConfigManager.getExtraHooks();
         for (HookConfig.ExtraHook eh : extras) {
+            if (!eh.enabled) continue;
             try {
                 Class<?> clazz = Class.forName(eh.className);
                 for (String methodName : eh.methods) {
-                    // Try hooking with no-arg signature first, then with Bundle arg
-                    try {
-                        safeHookMethod(clazz, methodName, new Class<?>[0], null);
-                    } catch (Exception ignored) {
+                    int hookedCount = hookMethodWithInferredParams(clazz, methodName);
+                    if (hookedCount == 0) {
+                        Log.w(TAG, "No matching overload found for extra hook: "
+                                + eh.className + "." + methodName);
                     }
-                    // Best-effort: we don't know the exact parameter types,
-                    // so we try the most common signatures.
                 }
-                Log.d(TAG, "Hooked extra: " + eh.className);
+                Log.d(TAG, "Hooked extra: " + eh.className + " (" + eh.methods.size() + " methods)");
             } catch (ClassNotFoundException e) {
                 Log.w(TAG, "Extra hook class not found: " + eh.className);
             }
         }
+    }
+
+    /**
+     * Try to hook a method by inferring parameter types.
+     *
+     * Strategy:
+     * 1. First, enumerate ALL declared methods matching the name via reflection
+     *    and hook each one directly (handles custom parameter types).
+     * 2. If no declared methods found, try COMMON_SIGNATURES as fallback.
+     *
+     * This approach handles arbitrary parameter types (not just common ones)
+     * and correctly hooks overloaded methods.
+     *
+     * @return number of method overloads successfully hooked.
+     */
+    private static int hookMethodWithInferredParams(Class<?> clazz, String methodName) {
+        int hooked = 0;
+
+        // Strategy 1: Reflect all declared methods and hook matching names
+        // This handles ANY parameter types, including custom classes.
+        for (Method m : clazz.getDeclaredMethods()) {
+            if (!m.getName().equals(methodName)) continue;
+            try {
+                hookMethodDirect(m, clazz);
+                hooked++;
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to hook " + clazz.getSimpleName() + "." + methodName
+                        + "(" + paramTypesStr(m.getParameterTypes()) + "): " + e.getMessage());
+            }
+        }
+
+        // Strategy 2: If reflection found nothing, try walking up the class hierarchy
+        // (declaredMethods only returns methods declared in this class, not inherited)
+        if (hooked == 0) {
+            Class<?> current = clazz.getSuperclass();
+            while (current != null && current != Object.class) {
+                for (Method m : current.getDeclaredMethods()) {
+                    if (!m.getName().equals(methodName)) continue;
+                    try {
+                        hookMethodDirect(m, clazz);
+                        hooked++;
+                    } catch (Exception e) {
+                        Log.d(TAG, "Inherited method hook failed: " + m + ": " + e.getMessage());
+                    }
+                }
+                current = current.getSuperclass();
+            }
+        }
+
+        // Strategy 3: Fallback to common signatures if nothing matched
+        if (hooked == 0) {
+            for (Class<?>[] sig : COMMON_SIGNATURES) {
+                try {
+                    safeHookMethod(clazz, methodName, sig, null);
+                    hooked++;
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        return hooked;
+    }
+
+    /**
+     * Hook a specific Method object directly with SI$ tracing.
+     * This is the core hooking mechanism for extra hooks — it hooks the
+     * exact method with its actual parameter types.
+     */
+    private static void hookMethodDirect(Method method, Class<?> clazz) {
+        String methodName = method.getName();
+        Pine.hook(method, new MethodHook() {
+            @Override
+            public void beforeCall(Pine.CallFrame cf) {
+                String tag = autoTag(cf, methodName);
+                if (!enterTrace()) return;
+                Trace.beginSection(tag);
+            }
+
+            @Override
+            public void afterCall(Pine.CallFrame cf) {
+                exitTrace();
+            }
+        });
+        Log.d(TAG, "[hook-ok] " + clazz.getSimpleName() + "." + methodName
+                + "(" + paramTypesStr(method.getParameterTypes()) + ")");
+    }
+
+    /**
+     * Format parameter types array for logging.
+     */
+    private static String paramTypesStr(Class<?>[] params) {
+        if (params == null || params.length == 0) return "";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < params.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(params[i].getSimpleName());
+        }
+        return sb.toString();
     }
 
     // ═══════════════════════════════════════════════════════════
