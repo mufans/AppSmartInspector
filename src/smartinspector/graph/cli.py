@@ -26,6 +26,13 @@ def main():
     parser = argparse.ArgumentParser(description="SmartInspector CLI")
     parser.add_argument("--source-dir", default="", help="Source code directory for attribution search")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to reports/debug_*.log")
+    parser.add_argument("--ci", action="store_true", help="Non-interactive CI mode: run pipeline and exit")
+    parser.add_argument("--target", default="", help="Target process package name (CI mode)")
+    parser.add_argument("--trace", default="", help="Path to existing trace file (CI mode)")
+    parser.add_argument("--duration", type=int, default=10000, help="Trace duration in ms (CI mode, default: 10000)")
+    parser.add_argument("--output", default="", help="Output file path (CI mode)")
+    parser.add_argument("--format", choices=["markdown", "json"], default="markdown",
+                        help="Report format (CI mode, default: markdown)")
     args, _ = parser.parse_known_args()
 
     if args.source_dir:
@@ -37,6 +44,24 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
         from smartinspector.debug_log import debug_log
         debug_log("cli", "Debug logging enabled via --debug flag")
+
+    # ── CI / headless mode ──
+    if args.ci:
+        from smartinspector.headless import HeadlessRunner
+        runner = HeadlessRunner(
+            source_dir=args.source_dir or ".",
+            target=args.target or None,
+            trace_path=args.trace or None,
+            output=args.output or None,
+            fmt=args.format,
+            duration=args.duration,
+            debug=args.debug,
+        )
+        report = runner.run()
+        # In CI mode, print report to stdout if no output file specified
+        if not args.output:
+            print(report)
+        return
 
     from importlib.metadata import version as pkg_version
     try:
