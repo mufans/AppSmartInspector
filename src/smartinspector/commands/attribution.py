@@ -878,6 +878,46 @@ def extract_attributable_slices(perf_summary_json: str, min_dur_ms: float = 1.0)
     if block_events:
         _attach_block_stacks(attributable, block_events)
 
+    # ── IO slices: extract from io_slices (SI$net#/SI$db#/SI$img#) ──
+    io_slices_data = data.get("io_slices", {})
+    io_summary = io_slices_data.get("summary", []) if io_slices_data else []
+    for s in io_summary:
+        name = s.get("name", "")
+        if not name.startswith("SI$"):
+            continue
+        if classify_search_type(name) == "system":
+            continue
+
+        class_name = extract_class(name)
+        method_name = extract_method(name)
+        dur_ms = s.get("max_ms", 0)
+        count = s.get("count", 0)
+        total_ms = s.get("total_ms", 0)
+
+        # Determine IO type for tagging
+        body = name[3:]
+        io_type = "unknown"
+        if body.startswith("net#"):
+            io_type = "network"
+        elif body.startswith("db#"):
+            io_type = "database"
+        elif body.startswith("img#"):
+            io_type = "image"
+
+        entry = {
+            "raw_name": name,
+            "class_name": class_name,
+            "method_name": method_name,
+            "dur_ms": dur_ms,
+            "type": "io_slice",
+            "search_type": "java",
+            "instance": None,
+            "io_type": io_type,
+            "count": count,
+            "total_ms": total_ms,
+        }
+        attributable.append(entry)
+
     # Remove entries marked as system classes by block event matching
     attributable = [e for e in attributable if not e.get("_system")]
 

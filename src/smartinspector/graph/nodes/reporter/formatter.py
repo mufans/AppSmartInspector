@@ -102,6 +102,46 @@ def format_perf_sections(perf_json: str) -> list[str]:
 
         user_parts.append("\n".join(ts_lines))
 
+    # IO slices summary (network / database / image)
+    io_slices = perf_data.get("io_slices", {})
+    if io_slices:
+        io_summary = io_slices.get("summary", [])
+        if io_summary:
+            io_lines = ["## IO操作分析\n"]
+
+            # Aggregate by IO type
+            by_type: dict[str, list] = {}
+            for s in io_summary:
+                io_type = s.get("io_type", "unknown")
+                if io_type not in by_type:
+                    by_type[io_type] = []
+                by_type[io_type].append(s)
+
+            _IO_LABELS = {"network": "网络IO", "database": "数据库IO", "image": "图片加载"}
+            for io_type, items in sorted(by_type.items(), key=lambda x: -sum(s.get("total_ms", 0) for s in x[1])):
+                label = _IO_LABELS.get(io_type, io_type)
+                total_count = sum(s.get("count", 0) for s in items)
+                total_ms = sum(s.get("total_ms", 0) for s in items)
+                max_ms = max(s.get("max_ms", 0) for s in items)
+                io_lines.append(f"**{label}**: {total_count}次, 总耗时{total_ms:.1f}ms, 最大{max_ms:.1f}ms")
+
+                # Top 5 slowest
+                for s in sorted(items, key=lambda x: -x.get("max_ms", 0))[:5]:
+                    name = s.get("name", "?")
+                    short = name.replace("SI$", "")
+                    for prefix in ("net#", "db#", "img#"):
+                        if short.startswith(prefix):
+                            short = short[len(prefix):]
+                            break
+                    io_lines.append(
+                        f"  - {short}: {s.get('count', 0)}次, "
+                        f"最大{s.get('max_ms', 0):.1f}ms, "
+                        f"总{s.get('total_ms', 0):.1f}ms"
+                    )
+
+            io_lines.append(f"\nIO操作总计: {io_slices.get('total_count', 0)}次")
+            user_parts.append("\n".join(io_lines))
+
     return user_parts
 
 
@@ -147,6 +187,12 @@ def format_attribution_section(attribution_result: str) -> list[str]:
             raw_name = r.get("raw_name", "")
             if raw_name.startswith("SI$block#"):
                 type_tag = " [主线程卡顿]"
+            elif raw_name.startswith("SI$net#"):
+                type_tag = " [网络IO]"
+            elif raw_name.startswith("SI$db#"):
+                type_tag = " [数据库IO]"
+            elif raw_name.startswith("SI$img#"):
+                type_tag = " [图片加载]"
             elif r.get("method_name") == "inflate":
                 type_tag = " [XML布局]"
             if r.get("count", 0) > 1:

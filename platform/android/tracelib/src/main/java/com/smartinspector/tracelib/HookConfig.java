@@ -25,9 +25,9 @@ public class HookConfig {
     public boolean viewTraverse = false;
     public boolean handlerDispatch = false;
     public boolean blockMonitor = true;
-    public boolean networkIo = false;
-    public boolean databaseIo = false;
-    public boolean imageLoad = false;
+    public boolean networkIo = true;
+    public boolean databaseIo = true;
+    public boolean imageLoad = true;
     public boolean inputEvent = true;           // dispatchTouchEvent tracing
 
     // ── Block monitor params ──────────────────────────────────

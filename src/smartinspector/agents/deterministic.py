@@ -56,6 +56,7 @@ def compute_hints(perf_json: str) -> str:
         _correlate_jank_frames(data, frame_budget_ms),
         _identify_cpu_hotspots(data),
         _analyze_thread_state(data),
+        _analyze_io_slices(data),
     ]
 
     return "\n\n".join(s for s in sections if s)
@@ -401,5 +402,82 @@ def _analyze_thread_state(data: dict) -> str:
 
     if not blocked_slices and not running_slices:
         return ""
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 7: IO slices analysis (network / database / image)
+# ---------------------------------------------------------------------------
+
+_IO_TYPE_LABELS: dict[str, str] = {
+    "network": "网络IO",
+    "database": "数据库IO",
+    "image": "图片加载",
+}
+
+
+def _analyze_io_slices(data: dict) -> str:
+    """Analyze IO slices: aggregate by type, flag main-thread IO.
+
+    Collects SI$net#/SI$db#/SI$img# slices from the io_slices field,
+    groups them by IO type, and reports total/max/count per category.
+    """
+    io_slices = data.get("io_slices") or {}
+    if not io_slices:
+        return ""
+
+    summary = io_slices.get("summary") or []
+    if not summary:
+        return ""
+
+    # Aggregate by IO type
+    by_type: dict[str, dict] = {}
+    for s in summary:
+        io_type = s.get("io_type", "unknown")
+        if io_type not in by_type:
+            by_type[io_type] = {
+                "count": 0,
+                "total_ms": 0.0,
+                "max_ms": 0.0,
+                "top_items": [],
+            }
+        entry = by_type[io_type]
+        entry["count"] += s.get("count", 0)
+        entry["total_ms"] += s.get("total_ms", 0)
+        entry["max_ms"] = max(entry["max_ms"], s.get("max_ms", 0))
+        entry["top_items"].append(s)
+
+    lines = ["[IO分析]"]
+
+    for io_type, stats in sorted(by_type.items(), key=lambda x: -x[1]["total_ms"]):
+        label = _IO_TYPE_LABELS.get(io_type, io_type)
+        lines.append(
+            f"  {label}: {stats['count']}次, "
+            f"总耗时{stats['total_ms']:.1f}ms, "
+            f"最大{stats['max_ms']:.1f}ms"
+        )
+        # Show top 3 slowest items per type
+        top_items = sorted(stats["top_items"], key=lambda x: -x.get("max_ms", 0))[:3]
+        for item in top_items:
+            name = item.get("name", "?")
+            # Shorten: SI$net#com.example.ApiClient.execute → ApiClient.execute
+            short = name.replace("SI$", "")
+            for prefix in ("net#", "db#", "img#"):
+                if short.startswith(prefix):
+                    short = short[len(prefix):]
+                    break
+            count = item.get("count", 0)
+            max_ms = item.get("max_ms", 0)
+            total_ms = item.get("total_ms", 0)
+            lines.append(
+                f"    → {short}: {count}次, "
+                f"最大{max_ms:.1f}ms, "
+                f"总{total_ms:.1f}ms"
+            )
+
+    total_count = io_slices.get("total_count", 0)
+    if total_count > 0:
+        lines.append(f"  IO操作总计: {total_count}次")
 
     return "\n".join(lines)
