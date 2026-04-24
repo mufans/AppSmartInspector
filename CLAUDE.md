@@ -163,16 +163,18 @@ Agents are separate from graph nodes. They contain the business logic:
 | `trace_target_process` | `str` | CLI override: target process name |
 | `skip_wait` | `bool` | CLI flag: skip waiting for app connection |
 | `_route` | `str` | Internal: RouteDecision value |
-| `_trace_path` | `str` | Internal: trace file path (set by /full <trace.pb>) |
+| `_trace_path` | `str` | Internal: trace file path (pre-loaded trace skips device collection) |
 
 ### RouteDecision
 
 ```
-full_analysis  → collector → attributor → reporter
+full_analysis  → collector → analyzer → attributor → reporter
+startup        → collector → analyzer → startup_analyzer (cold start with ADB force-stop/launch)
 android        → android_expert
 analyze        → collector → perf_analyzer
 explorer       → explorer
-trace          → collector → perf_analyzer
+trace          → collector → analyzer → END
+quick          → deterministic analysis (no LLM)
 end            → END
 ```
 
@@ -191,7 +193,8 @@ end            → END
 ### CLI Mode (Headless/CI)
 
 ```
-uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--duration 10000] [--output report.json] [--format json|markdown] [--source-dir ./src] [--debug]
+uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--duration 10000] [--output report.json] [--format json|markdown] [--source-dir ./src] [--debug] [--cmd full_analysis]
+./scripts/si.sh --ci --trace trace.pb --target com.example.app
 ```
 
 - `--ci`: Non-interactive mode, run full pipeline and exit
@@ -200,7 +203,20 @@ uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--dura
 - `--duration <ms>`: Trace duration (default 10000)
 - `--output <path>`: Output file path (stdout if not specified)
 - `--format json|markdown`: Report format (default markdown)
+- `--cmd <command>`: Pipeline command (default: full_analysis)
+  - `full_analysis` / `full`: Full pipeline (collect → analyze → attribute → report)
+  - `startup`: Cold start analysis (auto force-stop + launch app via adb)
+  - `analyze`: Analyze existing perf_summary data
+  - `trace`: Collect and analyze trace (stops before attribution)
 - JSON format includes structured `issues` with P0/P1/P2 severity
+- `scripts/si.sh` is a convenience wrapper that auto-detects project root and uses `uv run`
+
+#### Cold Start CI Example
+
+```bash
+# Cold start profiling: force-stop app, record trace, launch app, analyze
+./scripts/si.sh --ci --cmd startup --target com.example.app --duration 10000 --output report.md
+```
 
 ### /full (Main Entry Point)
 
