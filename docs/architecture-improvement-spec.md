@@ -507,11 +507,17 @@ def get_tool_timeout() -> int:
 
 ### P0（紧急）— 影响用户体验的问题
 
-| # | 项目 | 涉及文件 | 说明 |
-|---|------|----------|------|
-| P0-1 | TraceProcessor 资源泄漏 | `graph/nodes/collector.py:184` | 使用 `with` 语句确保 close |
-| P0-2 | 缺少 `@node_error_handler` | `graph/nodes/attributor.py:33`, `graph/nodes/reporter/__init__.py:21` | 添加装饰器 |
-| P0-3 | `_walk_call_chain` 性能 | `collector/perfetto.py:2104-2133` | 预加载 slice map 替代逐行查询 |
+| # | 项目 | 涉及文件 | 说明 | 状态 |
+|---|------|----------|------|------|
+| P0-1 | TraceProcessor 资源泄漏 | `graph/nodes/collector.py:184` | 使用 `with` 语句确保 close | ✅ 已完成 |
+| P0-2 | 缺少 `@node_error_handler` | `graph/nodes/attributor.py:33`, `graph/nodes/reporter/__init__.py:21` | 添加装饰器 | ✅ 已完成 |
+| P0-3 | `_walk_call_chain` 性能 | `collector/perfetto.py:2104-2133` | 预加载 slice map 替代逐行查询 | ✅ 已完成 |
+
+> **P0 功能改进已于 2026-04-24 完成**，新增了以下功能：
+> - IO Hooks 默认启用（`SI$net#`/`SI$db#`/`SI$img#`），IO 切片独立收集和归因
+> - 冷启动专项分析模式（`collector/startup.py` + `graph/nodes/startup.py`）
+> - Headless/CI 模式（`headless.py` + CLI `--ci` 参数）
+> - JSON 报告格式（`graph/nodes/reporter/json_formatter.py`）
 
 ### P1（重要）— 架构层面的改进
 
@@ -536,6 +542,16 @@ def get_tool_timeout() -> int:
 | P2-5 | bridge_server 全局状态 | `ws/bridge_server.py:314-317` | 封装到类 |
 | P2-6 | _structured_ok 竞态 | `agents/attributor.py:55` | Lock 保护 |
 | P2-7 | WS 连接断开清理 | `ws/server.py:278-283` | 清理 pending_acks |
+
+### P1 Feature Roadmap — 规划中的功能改进
+
+| # | 项目 | 说明 | 涉及模块 |
+|---|------|------|----------|
+| P1-1 | Compose 重组追踪 | 追踪 Jetpack Compose 重组次数和耗时，定位不必要的 recomposition | Android SDK + collector |
+| P1-2 | 内存分配分析 | 基于 `android.java_hprof` 数据源分析内存分配热点，定位内存抖动和泄漏 | collector + 新 agent |
+| P1-3 | 历史对比与趋势 | 多次分析结果对比，生成 before/after 报告和性能趋势图 | reporter + persistence |
+| P1-4 | 智能一键分析 | 基于历史数据和 device profile 自动选择最佳分析策略 | orchestrator |
+| P1-5 | ExtraHook 参数自动推断 | 分析代码结构自动推荐 Hook 配置，减少手动配置 | agents + commands |
 
 ### P3（可选）— 长期演进方向
 

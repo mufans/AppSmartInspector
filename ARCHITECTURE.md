@@ -73,6 +73,7 @@ smartinspector/
 │   │           ├── __init__.py  #       reporter_node entry (streaming output)
 │   │           ├── generator.py #       LLM report generation (streaming + retry + token estimation)
 │   │           ├── formatter.py #       Data formatting (perf JSON + attribution → Markdown)
+│   │           ├── json_formatter.py #  JSON structured report formatting (CI/automation)
 │   │           └── persistence.py #     Report file saving (./reports/)
 │   │
 │   ├── agents/                  # Agent definitions (LLM + tools)
@@ -84,8 +85,10 @@ smartinspector/
 │   │   └── deterministic.py     #   Deterministic pre-computation (reduces LLM tokens)
 │   │
 │   ├── collector/               # Data collection & processing
-│   │   └── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON (CPU调用链, 系统级CPU, WS+SQL合并, context manager)
+│   │   ├── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON (CPU调用链, 系统级CPU, WS+SQL合并, context manager, IO slices)
+│   │   └── startup.py           #   StartupAnalyzer: cold start phase splitting + bottleneck identification
 │   │
+│   ├── headless.py              # HeadlessRunner: non-interactive CI mode (full pipeline, JSON/Markdown output)
 │   ├── commands/                # Slash command implementations
 │   │   ├── __init__.py          #   Command registry (SLASH_COMMANDS dict + handle_slash_command)
 │   │   ├── attribution.py       #   SI$ tag parsing + attribution extraction
@@ -442,14 +445,45 @@ def handle_slash_command(user_input: str, state: dict) -> dict:
 
 ### 8. Reporter (`graph/nodes/reporter/`)
 
-**Role**: Generate the final Markdown performance report with LLM.
+**Role**: Generate the final Markdown or JSON performance report with LLM.
 
 **Sub-modules**:
 - `formatter.py` — builds Markdown sections from perf JSON and attribution results
+- `json_formatter.py` — structured JSON report (summary, issues, metrics) for CI/automation
 - `generator.py` — LLM report generation with streaming and retry on failure
 - `persistence.py` — saves report to `./reports/perf_report_YYYYMMDD_HHMMSS.md`
 
-**Output**: Complete Markdown report (header tables + LLM analysis + source attribution)
+**Output**: Complete Markdown report (header tables + LLM analysis + source attribution) or JSON report (structured issues with severity)
+
+### 8.1 Startup Node (`graph/nodes/startup.py`)
+
+**Role**: Analyze cold start performance from collected trace.
+
+**Model**: None (deterministic via `StartupAnalyzer`)
+
+**Workflow**:
+1. `StartupAnalyzer(trace_path, target_process)` — locates startup timestamps in trace
+2. Phase splitting: process_start → Application.onCreate → Activity.onCreate → first doFrame
+3. Critical path extraction: longest SI$ slices during startup
+4. Bottleneck identification: slowest slice per phase with optimization suggestions
+
+**Output**: Markdown startup analysis report with phases table, critical path, and bottleneck list
+
+### 8.2 Headless Runner (`headless.py`)
+
+**Role**: Non-interactive analysis runner for CI/CD integration.
+
+**Usage**: `uv run smartinspector --ci [options]`
+
+**Workflow**:
+1. Collect trace from device or use existing trace file
+2. `PerfettoCollector.summarize()` → perf JSON
+3. `compute_hints()` → deterministic pre-computation
+4. `extract_attributable_slices()` → source attribution
+5. Optional LLM analysis (graceful degradation without API key)
+6. Generate report in Markdown or JSON format
+
+**Output**: Report written to file (`--output`) or stdout
 
 ### 9. Code Explorer (`graph/nodes/explorer.py`)
 
@@ -492,6 +526,9 @@ PerfSummary
 │   ├── slowest_slices: list[dict]     # Top 30 slowest individual slices
 │   └── rv_instances: list[dict]       # Grouped by RV#[viewId]#[Adapter]
 │       └── methods: dict              # Per-method stats (count, total_ms, max_ms)
+├── io_slices: dict                     # IO slices (SI$net#/SI$db#/SI$img# — all threads)
+│   ├── total_count: int               # Total IO slice count
+│   └── summary: list[dict]            # Aggregated by IO type + class
 └── metadata: dict                      # Trace metadata + table diagnosis
 ```
 
@@ -504,6 +541,7 @@ PerfSummary
 | `collect_frame_timeline()` | `actual_frame_timeline_slice` | Frame jank from SurfaceFlinger |
 | `collect_memory()` | `heap_graph_object` + `heap_graph_class` | Java heap allocation |
 | `collect_view_slices()` | `slice` | Custom TraceHook tags + system atrace |
+| `collect_io_slices()` | `slice` | IO slices (SI$net#/SI$db#/SI$img#) from all threads |
 | `collect_threads()` | `thread` | Thread listing |
 | `collect_sys_stats()` | `sys_stats` | System-level CPU metrics |
 
@@ -547,6 +585,14 @@ Application.onCreate()
 | `layout_inflate` | false | LayoutInflater: inflate | `SI$inflate#[layout_name]#[parent_class]` |
 | `view_traverse` | false | View: measure/layout/draw (非RV) | `SI$view#[class].[method]` |
 | `handler_dispatch` | false | Handler: dispatchMessage (主线程) | `SI$handler#[msg_class]` |
+
+**IO Hook 点（默认启用，全线程追踪）**：
+
+| Hook | 默认 | Tag 格式 | 说明 |
+|------|------|---------|------|
+| Network IO | true | `SI$net#[Class].execute` | OkHttp / HttpURLConnection |
+| Database IO | true | `SI$db#[Class].query#[table]` | SQLiteDatabase / Room |
+| Image Load | true | `SI$img#[Class].into` | Glide / Coil |
 
 **自定义 hook 点（extra_hooks 配置）**：
 
@@ -760,7 +806,8 @@ User: "全面分析列表滑动性能"
   │   ├─ collect_cpu_hotspots()
   │   ├─ collect_frame_timeline()
   │   ├─ collect_memory()
-  │   ├─ collect_view_slices()  ← SI$ prefix filtering, rv_instances grouping
+  │   ├─ collect_view_slices()  ← SI$ prefix filtering, rv_instances grouping, IO slices excluded
+  │   ├─ collect_io_slices()     ← SI$net#/SI$db#/SI$img# from all threads
   │   └─ collect_block_events()  ← WS 结构化 JSON + SQL atrace 合并（非覆盖）
   └─ State: perf_summary = "{...json...}", _trace_path = "/tmp/xxx.pb"
   │
@@ -840,6 +887,10 @@ orchestrator → collector → analyzer → END
 16. **Configurable limits** — Hardcoded values (tool timeout, read limits, report tokens, WS ping timeout) centralized in `config.py` with `SI_*` environment variable overrides
 17. **Thread-safe singletons** — LLM client singletons in agents use double-checked locking pattern (`threading.Lock`) for thread-safe lazy initialization
 18. **Shared path validation** — Tools share `path_utils.validate_search_path()` to prevent directory traversal attacks
+19. **IO slice separation** — IO slices (`SI$net#/SI$db#/SI$img#`) collected independently from view slices, avoiding pollution of main-thread analysis; IO hooks enabled by default for comprehensive tracing
+20. **Cold start phase splitting** — `StartupAnalyzer` identifies 4 startup phases (pre-main → Application.onCreate → Activity.onCreate → first frame) and extracts critical path + bottlenecks
+21. **Headless/CI mode** — `HeadlessRunner` provides non-interactive pipeline execution with JSON output for CI/CD integration; graceful degradation without LLM API key
+22. **JSON report format** — Structured JSON output with severity classification (P0/P1/P2), issue categorization, and source attribution, designed for automated parsing
 
 ---
 

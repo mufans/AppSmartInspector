@@ -18,16 +18,20 @@ src/smartinspector/          # Main Python package (installed via hatchling)
     device.py                #   /devices, /connect, /status, /disconnect
     session.py               #   /help, /clear, /summary, /tokens
   collector/                 # Perfetto trace collection & SQL analysis
-    perfetto.py              #   PerfettoCollector — 13 collect_*() methods
+    perfetto.py              #   PerfettoCollector — 14 collect_*() methods (incl. collect_io_slices)
+    startup.py               #   StartupAnalyzer — cold start phase splitting & bottleneck ID
   graph/                     # LangGraph orchestration
     nodes/                   #   Graph nodes (orchestrator, collector, attributor, reporter, ...)
+      startup.py             #   Cold start analysis node
       reporter/              #   Reporter sub-package
         formatter.py         #     format_perf_sections(), format_attribution_section()
+        json_formatter.py    #     JSON structured report (CI/automation)
         generator.py         #     LLM report generation
         persistence.py       #     Markdown report file output
     state.py                 #   AgentState TypedDict, _pass_through(), node_error_handler()
   tools/                     # File search tools (glob, grep, read) — used by agents
   ws/                        # WebSocket server for app communication
+  headless.py                # Headless/CI non-interactive runner
   config.py                  # Runtime configuration (env vars: SI_*)
   debug_log.py               # Debug logging utility → reports/debug_*.log
   perfetto_compat.py         # macOS IPv4 fix for perfetto trace_processor
@@ -174,6 +178,20 @@ end            → END
 
 ## Commands
 
+### CLI Mode (Headless/CI)
+
+```
+uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--duration 10000] [--output report.json] [--format json|markdown] [--source-dir ./src] [--debug]
+```
+
+- `--ci`: Non-interactive mode, run full pipeline and exit
+- `--trace <path>`: Analyze existing trace file (skip device collection)
+- `--target <pkg>`: Target process package name
+- `--duration <ms>`: Trace duration (default 10000)
+- `--output <path>`: Output file path (stdout if not specified)
+- `--format json|markdown`: Report format (default markdown)
+- JSON format includes structured `issues` with P0/P1/P2 severity
+
 ### /full (Main Entry Point)
 
 ```
@@ -261,6 +279,7 @@ Each `collect_*()` method queries Perfetto SQL tables and returns structured dat
 | `collect_memory()` | Aggregated memory summary | `process_memory_snapshot` |
 | `collect_threads()` | Thread list for target process | `thread`, `process` |
 | `collect_view_slices()` | View system slices (doFrame, measure, layout, draw, RV) with parent chains | `slice`, `args` |
+| `collect_io_slices()` | IO-related slices (net/db/img) from all threads | `slice` |
 | `collect_io_slices()` | IO-related slices (net/db/img) | `slice` |
 | `collect_input_events()` | Touch/input event data | `slice` |
 | `collect_block_events()` | SI$block slices merged with logcat SIBlock stack traces | `slice`, `android_logs` |
@@ -280,9 +299,9 @@ Android hook layer emits custom Perfetto slices with `SI$` prefix:
 | `SI$handler#[msg_class]` | Handler message dispatch | `SI$handler#ScrollRunnable` |
 | `SI$Activity.[lifecycle]` | Activity lifecycle | `SI$Activity.onResume` |
 | `SI$Fragment.[lifecycle]` | Fragment lifecycle | `SI$Fragment.onCreateView` |
-| `SI$db#...` | Database operations (excluded from main analysis) | |
-| `SI$net#...` | Network operations (excluded from main analysis) | |
-| `SI$img#...` | Image operations (excluded from main analysis) | |
+| `SI$db#...` | Database operations (collected to io_slices, IO slice attribution) | |
+| `SI$net#...` | Network operations (collected to io_slices, IO slice attribution) | |
+| `SI$img#...` | Image operations (collected to io_slices, IO slice attribution) | |
 | `SI$touch#...` | Touch events (excluded from thread state analysis) | |
 
 ## Reporter Pipeline
