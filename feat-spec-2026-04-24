@@ -1,0 +1,750 @@
+# SmartInspector 功能完善与架构优化 Spec
+
+> **版本**: v1.0
+> **日期**: 2026-04-24
+> **范围**: Android 平台优先 + 全平台扩展规划
+> **目标读者**: 开源贡献者
+> **里程碑**: 1 个月
+
+---
+
+## 1. 项目现状评估
+
+### 1.1 架构概览
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    CLI (graph/cli.py)                     │
+│              LangGraph REPL + Slash Commands             │
+├──────────┬──────────┬──────────┬────────────────────────┤
+│Orchestr- │ Explorer │ Android  │    Pipeline Chain      │
+│ator      │ (grep/   │ Expert   │ Collector → Analyzer   │
+│(LLM路由) │ glob/    │ (adb/    │ → Attributor → Reporter│
+│          │ read)    │ perfetto)│                         │
+├──────────┴──────────┴──────────┴────────────────────────┤
+│              Collector (collector/perfetto.py)           │
+│         SQL → PerfSummary JSON (~2KB)                    │
+├─────────────────────────────────────────────────────────┤
+│           Bridge Server (ws/bridge_server.py)            │
+│         Perfetto UI Plugin ↔ Frame Analyzer              │
+├─────────────────────────────────────────────────────────┤
+│              Android Hook Layer (tracelib)               │
+│   TraceHook (Pine AOP) + BlockMonitor + SIClient         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 1.2 已实现能力
+
+| 层级 | 能力 | 实现质量 |
+|------|------|----------|
+| **Android Hook** | Activity/Fragment 生命周期追踪 | 完整，含动态子类发现 |
+| | RecyclerView 全管线追踪 | 完整，含 setAdapter 动态 hook |
+| | LayoutInflate 追踪 | 完整，含 layout 资源名 |
+| | View measure/layout/draw | 完整，仅自定义 View |
+| | Handler dispatch | 完整，仅主线程 |
+| | BlockMonitor 卡顿检测 | 完整，API 29+ Observer + Printer fallback |
+| | Network IO (OkHttp/HttpURLConn) | 代码已实现，默认关闭 |
+| | Database IO (SQLite/Room) | 代码已实现，默认关闭 |
+| | Image Load (Glide/Coil) | 代码已实现，默认关闭 |
+| | Input Event (dispatchTouchEvent) | 完整 |
+| **Python Pipeline** | Perfetto trace 采集 | 完整，含 SELinux bypass |
+| | 帧时间线分析 (FPS/Jank) | 完整，含 SurfaceFlinger jank type |
+| | 自定义切片分析 (SI$ tags) | 完整，含 parent_id 调用链重建 |
+| | CPU 热点分析 | 完整，含 callchain 重建 |
+| | 线程状态分析 (Running/Sleeping/D) | 完整，overlap-based SQL |
+| | 确定性预计算 | 完整，P0/P1/P2 严重度分类 |
+| | 源码归因 (Attributor) | 完整，fast path + LLM fallback + 依赖搜索 |
+| | 报告生成 | 完整，流式输出 |
+| **Perfetto UI** | Bridge Server + 自定义插件 | 完整，frame_selected 交互分析 |
+| | TraceServer (HTTP SQL 查询) | 完整 |
+
+### 1.3 关键差距（基于代码分析）
+
+#### A. Android Hook 层差距
+
+1. **IO hooks 虽已实现但未启用且未经测试**：`hookNetworkIo()` / `hookDatabaseIo()` / `hookImageLoad()` 代码存在（`TraceHook.java:632-728`），但 `HookConfig` 中默认 `false`，且 Python 端 `collect_io_slices()` 已有对应查询。缺的是真实场景验证。
+2. **无 Compose 支持**：Jetpack Compose 的重组(recomposition)追踪完全缺失，而 Compose 已是 Android UI 主流。
+3. **无 Coroutine 追踪**：协程的线程切换和挂起无法追踪。
+4. **无冷启动专项分析**：`skip_wait` 机制存在（`orchestrator.py:104-113`），但缺少从 Application.onCreate 到第一帧的完整链路追踪。
+5. **ExtraHook 参数推断简陋**：`hookExtraClasses()` 只尝试无参签名（`TraceHook.java:782-783`），无法精确匹配方法参数。
+6. **无 GPU 渲染分析**：`HookConfig.collectGpuMem` 默认关闭，无 GPU pipeline 追踪。
+
+#### B. Python 分析管线差距
+
+7. **无内存分配追踪**：`PerfSummary` 有 `memory` 字段但 `summarize()` 中未实现 `collect_memory()` — 只采集了 RSS 计数器，无对象级分配分析。
+8. **IO slices 未纳入归因**：`collect_io_slices()` 查询独立于 `view_slices`，归因管线不处理 IO 类型切片。
+9. **无跨进程分析**：`_resolve_target_process()` 只关注单进程（`perfetto.py:92-173`），无法分析多进程交互。
+10. **headless/CI 模式缺失**：整个管线依赖交互式 REPL，无 `--json` 或 `--ci` 输出模式。
+11. **报告仅 Markdown**：无 JSON 机器可读格式。
+12. **无历史对比**：多次分析结果无法对比趋势。
+
+#### C. 开发者体验差距
+
+13. **一键分析不够简单**：需要 5+ 步才能完成一次完整分析（连设备 → 启动 app → 采集 trace → 分析 → 查看报告）。
+14. **配置管理分散**：Android 端 `SharedPreferences`、CLI 端环境变量、WS 协议三套配置。
+15. **错误恢复差**：`node_error_handler` 只捕获异常返回错误消息，不重试。
+
+---
+
+## 2. 分阶段路线图
+
+### P0: 核心体验完善（第 1-2 周）
+
+> 目标：让现有功能真正好用，解决"能用但不好用"的问题
+
+| # | 任务 | 影响文件 | 优先级理由 |
+|---|------|----------|-----------|
+| P0-1 | **IO hooks 验证与启用** | `TraceHook.java`, `HookConfig.java`, `collector/perfetto.py` | 代码已写好，只需测试+默认开启 |
+| P0-2 | **冷启动专项分析模式** | `orchestrator.py`, `collector_node`, `TraceHook.java`, 新增 `collect_startup.py` | 移动端最高频优化场景 |
+| P0-3 | **Headless/CI 模式** | `cli.py`, 新增 `headless.py`, `reporter/formatter.py` | 开源贡献者基本需求 |
+| P0-4 | **JSON 报告格式** | `reporter/`, 新增 `json_formatter.py` | CI 集成 + 自动化 |
+| P0-5 | **IO slices 归因** | `commands/attribution.py`, `agents/attributor.py` | 将已有数据纳入完整分析 |
+
+### P1: 分析能力扩展（第 3-4 周）
+
+> 目标：扩展分析深度，覆盖更多 Android 性能场景
+
+| # | 任务 | 影响文件 | 优先级理由 |
+|---|------|----------|-----------|
+| P1-1 | **Compose 重组追踪** | 新增 `ComposeHook.kt`, `collector/perfetto.py` | Android UI 现代化需求 |
+| P1-2 | **内存分配分析** | `collector/perfetto.py` (heap_graph), 新增 `collect_memory.py` | OOM 和内存泄漏是第二大类问题 |
+| P1-3 | **历史对比与趋势** | 新增 `storage/`, `commands/compare.py` | 持续性能监控 |
+| P1-4 | **智能一键分析** | `cli.py`, `commands/quick.py` | 降低使用门槛 |
+| P1-5 | **ExtraHook 参数自动推断** | `TraceHook.java` | 自定义 hook 可用性 |
+
+### P2: 生态扩展（后续）
+
+> 目标：多平台支持 + 高级分析能力
+
+| # | 任务 | 说明 |
+|---|------|------|
+| P2-1 | **HarmonyOS 平台支持** | hdc + hiperf/hitrace，已有设计文档 |
+| P2-2 | **iOS Instruments 集成** | instruments CLI + .trace 文件解析 |
+| P2-3 | **实时监控模式** | streaming adb logcat + 持续分析 |
+| P2-4 | **ANR 自动捕获与分析** | ANR trace 文件解析 + 归因 |
+| P2-5 | **网络瀑布图** | OkHttp 事件追踪 + 时间线可视化 |
+
+---
+
+## 3. P0 详细设计
+
+### 3.1 P0-1: IO Hooks 验证与启用
+
+**现状**：`TraceHook.java` 中 `hookNetworkIo()` (L632)、`hookDatabaseIo()` (L659)、`hookImageLoad()` (L709) 已完整实现，Python 端 `collect_io_slices()` (L977) 已有查询。只是 `HookConfig` 默认关闭且未经集成测试。
+
+**变更清单**：
+
+```
+platform/android/tracelib/src/main/java/com/smartinspector/tracelib/HookConfig.java
+  - networkIo: false → true
+  - databaseIo: false → true
+  - imageLoad:  false → true
+
+src/smartinspector/commands/attribution.py
+  - extract_attributable_slices() 增加对 SI$net#/SI$db#/SI$img# 的解析
+
+src/smartinspector/agents/deterministic.py
+  - 新增 _analyze_io_slices() helper
+  - 对 IO 切片按类型分类统计 + 按耗时排序
+
+src/smartinspector/graph/nodes/reporter/formatter.py
+  - IO 分析结果格式化为报告章节
+```
+
+**验证方式**：
+1. Demo App 增加 IO 场景（网络请求、数据库读写、图片加载）
+2. `/full` 分析验证 IO slices 出现在报告中
+3. 确认 IO hooks 对主线程 ANR 无影响
+
+### 3.2 P0-2: 冷启动专项分析模式
+
+**现状**：`orchestrator.py:104-113` 已检测冷启动关键词并设置 `skip_wait=True`。但缺少：
+- 启动阶段自动切分（pre-main → main → first-frame → full-frame）
+- Application.onCreate 追踪（已 hook `TraceHook.java:263-278`，但无下游分析）
+- 启动链路可视化
+
+**设计**：
+
+```python
+# 新增 collector/startup.py
+
+class StartupAnalyzer:
+    """冷启动分析器：从 trace 中提取启动链路"""
+
+    def analyze_cold_start(self, collector: PerfettoCollector) -> StartupResult:
+        # Phase 1: 定位 app 进程启动时间
+        #   SELECT MIN(ts) FROM process_track WHERE ...
+        #   或 package_list 表中 uid 首次出现
+
+        # Phase 2: 切分启动阶段
+        #   pre_main: fork → Application.attachBaseContext
+        #   init:     Application.onCreate → Activity.onCreate
+        #   first_frame: Activity.onCreate → 首帧 doFrame
+        #   full_draw: 首帧 → 首帧完成后绘制完毕
+
+        # Phase 3: 每个阶段的 SI$ 切片聚合
+        #   与 view_slices 查询复用，按时间窗口过滤
+
+        # Phase 4: 关键路径提取
+        #   主线程上 dur 最长的切片链
+```
+
+**CLI 集成**：
+```
+用户输入: "分析冷启动" / "分析启动耗时"
+→ orchestrator → collector (skip_wait=True, duration=15s)
+  → startup_analyzer → 报告
+```
+
+**报告输出格式**：
+```markdown
+## 冷启动分析
+
+总耗时: 1.23s
+
+| 阶段 | 耗时 | 占比 |
+|------|------|------|
+| pre-main (进程启动) | 120ms | 10% |
+| Application.onCreate | 350ms | 28% |
+| Activity.onCreate → 首帧 | 580ms | 47% |
+| 首帧渲染完成 | 180ms | 15% |
+
+### 关键瓶颈
+1. **Application.onCreate (350ms)**
+   - DataRepository.initialize: 200ms (SI$inflate#splash_layout)
+   - ...
+
+### 优化建议
+- 延迟初始化: DataRepository.initialize 可移至后台线程
+- 布局优化: splash_layout 层级过深 (4 层 LinearLayout)
+```
+
+### 3.3 P0-3: Headless/CI 模式
+
+**设计**：
+
+```bash
+# 非交互模式
+smartinspector --ci \
+  --target com.example.app \
+  --duration 10000 \
+  --source-dir /path/to/source \
+  --output reports/report.json \
+  --format json
+
+# 分析已有 trace
+smartinspector --ci \
+  --trace /path/to/trace.pb \
+  --source-dir /path/to/source \
+  --output reports/report.md \
+  --format markdown
+```
+
+**新增文件**：
+```
+src/smartinspector/headless.py     # HeadlessRunner 类
+src/smartinspector/commands/quick.py  # /quick 命令实现
+```
+
+**核心逻辑**：
+```python
+class HeadlessRunner:
+    """非交互式分析运行器，跳过 REPL 直接执行完整管线"""
+
+    def run(self, trace_path: str = None,
+            collect: bool = True, target: str = None,
+            source_dir: str = ".", output: str = None,
+            format: str = "markdown") -> str:
+
+        if collect:
+            trace_path = PerfettoCollector.pull_trace_from_device(...)
+            collector = PerfettoCollector(trace_path, target_process=target)
+            summary = collector.summarize()
+
+        # 确定性分析
+        hints = compute_hints(summary.to_json())
+
+        # LLM 分析
+        analysis = analyze_perf(summary.to_json())
+
+        # 源码归因
+        attribution = run_attribution(attributable_slices)
+
+        # 生成报告
+        if format == "json":
+            report = format_json(summary, analysis, attribution)
+        else:
+            report = format_markdown(summary, analysis, attribution)
+
+        if output:
+            Path(output).write_text(report)
+        return report
+```
+
+### 3.4 P0-4: JSON 报告格式
+
+**Schema 设计**：
+
+```json
+{
+  "version": "1.0",
+  "timestamp": "2026-04-24T10:30:00Z",
+  "target": {
+    "package": "com.example.app",
+    "device": "Pixel 7, Android 14"
+  },
+  "trace": {
+    "path": "/tmp/si_trace_xxx.pb",
+    "duration_ms": 10000,
+    "start_ts": 1234567890
+  },
+  "summary": {
+    "fps": 58.3,
+    "total_frames": 580,
+    "jank_frames": 12,
+    "cpu_usage_pct": 45.2
+  },
+  "issues": [
+    {
+      "severity": "P0",
+      "category": "ui_thread_block",
+      "title": "DemoAdapter.onBindViewHolder 耗时 20ms",
+      "duration_ms": 20.0,
+      "frame_budget_pct": 120,
+      "source": {
+        "file": "adapter/DemoAdapter.java",
+        "line_start": 45,
+        "line_end": 52,
+        "snippet": "...",
+        "finding": "Thread.sleep(20) 在主线程执行"
+      },
+      "recommendation": "将 Thread.sleep 替换为异步加载"
+    }
+  ],
+  "metrics": {
+    "frame_timeline": { ... },
+    "cpu_hotspots": [ ... ],
+    "thread_state": [ ... ],
+    "io_slices": { ... },
+    "memory": { ... }
+  }
+}
+```
+
+### 3.5 P0-5: IO Slices 归因
+
+**变更点**：
+
+在 `commands/attribution.py` 的 `extract_attributable_slices()` 中增加 IO 切片解析：
+
+```python
+# 现有: 只处理 SI$ 开头且排除 SI$net#/SI$db#/SI$img#
+# 变更: 对 IO 切片也进行类名/方法名提取和归因
+
+def _parse_io_slice_name(name: str) -> dict:
+    """解析 IO slice 名称为 class.method
+
+    SI$net#okhttp3.internal.connection.RealCall.execute
+    SI$db#com.example.data.DatabaseHelper.query#users
+    SI$img#com.bumptech.glide.request.RequestBuilder.into
+    """
+    # 去掉 SI$prefix# 得到 FQN
+    for prefix in ("SI$net#", "SI$db#", "SI$img#"):
+        if name.startswith(prefix):
+            body = name[len(prefix):]
+            # 可能有 #table 后缀 (DB query)
+            parts = body.split("#")
+            fqn = parts[0]
+            # 解析 class.method
+            if "." in fqn:
+                last_dot = fqn.rfind(".")
+                return {
+                    "class_name": fqn[:last_dot],
+                    "method_name": fqn[last_dot+1:],
+                    "io_type": prefix[3:-1],  # "net"/"db"/"img"
+                }
+    return None
+```
+
+在 `agents/deterministic.py` 新增 `_analyze_io_slices()`：
+
+```python
+def _analyze_io_slices(data: dict) -> str:
+    """分析 IO 切片：按类型聚合，标记主线程 IO"""
+    io_slices = data.get("io_slices") or {}
+    if not io_slices:
+        return ""
+
+    summary = io_slices.get("summary") or []
+    lines = ["[IO 分析]"]
+
+    # 按类型聚合
+    by_type = {}
+    for s in summary:
+        io_type = s.get("io_type", "unknown")
+        if io_type not in by_type:
+            by_type[io_type] = {"count": 0, "total_ms": 0, "max_ms": 0, "items": []}
+        by_type[io_type]["count"] += s["count"]
+        by_type[io_type]["total_ms"] += s["total_ms"]
+        by_type[io_type]["max_ms"] = max(by_type[io_type]["max_ms"], s["max_ms"])
+        by_type[io_type]["items"].append(s)
+
+    for io_type, stats in sorted(by_type.items(), key=lambda x: -x[1]["total_ms"]):
+        lines.append(
+            f"  {io_type}: {stats['count']}次, "
+            f"总耗时{stats['total_ms']:.1f}ms, "
+            f"最大{stats['max_ms']:.1f}ms"
+        )
+
+    return "\n".join(lines)
+```
+
+---
+
+## 4. P1 详细设计
+
+### 4.1 P1-1: Compose 重组追踪
+
+**技术方案**：
+
+Compose 编译器会在编译期为每个可组合函数生成代码，并使用 `Composer` 进行追踪。Android 已在 `androidx.compose.runtime` 中提供了 `TraceInformation` 接口（API 31+）。
+
+**Hook 方案**：
+
+```kotlin
+// 新增 ComposeHook.kt
+object ComposeHook {
+
+    fun hook() {
+        // 方案 A: Hook ComposeRuntime 的 trace 系统
+        // compose.runtime.internal.TracerImpl.begin / end
+        try {
+            val tracer = Class.forName(
+                "androidx.compose.runtime.internal.TracerImpl"
+            )
+            safeHookMethod(tracer, "beginSection", ...)
+            safeHookMethod(tracer, "endSection", ...)
+        } catch (e: Exception) {
+            // Fallback: 方案 B
+        }
+
+        // 方案 B: Hook Compose 的 remember 和 recompose
+        // 追踪每个 Composable 的调用次数和耗时
+        try {
+            val composer = Class.forName(
+                "androidx.compose.runtime.ComposerImpl"
+            )
+            // startRestartGroup / endRestartGroup
+            safeHookMethod(composer, "startRestartGroup", ...)
+        } catch (e: Exception) {
+            Log.w(TAG, "Compose hook failed: ${e.message}")
+        }
+    }
+}
+```
+
+**Perfetto 集成**：
+- 切片前缀：`SI$compose#`
+- Tag 格式：`SI$compose#ComposableName#recompose` / `SI$compose#ComposableName#first`
+- 下游 Python 端新增 `collect_compose_slices()` 查询
+
+### 4.2 P1-2: 内存分配分析
+
+**现状**：`PerfettoCollector` 已采集 `collectJavaHeap=true`（在 Perfetto 配置中），但 `summarize()` 中 `memory` 字段只从 `process_counter_track` 获取 RSS，未利用 `heap_graph` 表。
+
+**新增分析**：
+
+```python
+def collect_memory(self, target_upid: int) -> dict:
+    """分析 Java 堆内存分配和对象分布"""
+    tp = self._open()
+
+    # 1. Java 堆对象统计 (heap_graph)
+    #    按类名聚合对象数量和总大小
+    heap_stats = tp.query("""
+        SELECT
+          o.type_name,
+          COUNT(*) AS obj_count,
+          SUM(o.self_size) AS total_size
+        FROM heap_graph_object o
+        JOIN heap_graph_class c ON o.type_name = c.name
+        WHERE o.upid = {upid}
+          AND o.reachable = 1
+        GROUP BY o.type_name
+        ORDER BY total_size DESC
+        LIMIT 20
+    """)
+
+    # 2. 内存增长趋势 (process_counter_track)
+    #    RSS / anon 内存随时间变化
+
+    # 3. Activity/Fragment 泄漏检测
+    #    查找已 destroy 但仍被引用的 Activity/Fragment
+    leak_suspects = tp.query("""
+        SELECT o.type_name, o.self_size
+        FROM heap_graph_object o
+        WHERE o.type_name LIKE '%Activity%'
+           OR o.type_name LIKE '%Fragment%'
+        ORDER BY o.self_size DESC
+        LIMIT 10
+    """)
+
+    return {
+        "heap_objects": [...],
+        "memory_trend": [...],
+        "leak_suspects": [...],
+    }
+```
+
+### 4.3 P1-3: 历史对比
+
+**存储设计**：
+
+```
+reports/
+  ├── 2026-04-24_103000_report.json    # JSON 格式报告
+  ├── 2026-04-24_103000_trace.pb       # 原始 trace
+  └── baseline.json                    # 基线报告 (可选)
+```
+
+**对比命令**：
+
+```bash
+/compare <report1.json> <report2.json>
+
+# 输出:
+## 性能对比报告
+
+| 指标 | 报告 A (4/20) | 报告 B (4/24) | 变化 |
+|------|--------------|--------------|------|
+| FPS | 55.2 | 58.3 | +5.6% ↑ |
+| Jank 帧 | 18 | 12 | -33% ↓ |
+| 平均帧耗时 | 18.5ms | 16.2ms | -12% ↓ |
+| CPU | 52% | 45% | -13% ↓ |
+
+### 回归项
+- DemoAdapter.onBindViewHolder: 15ms → 20ms (+33%) ⚠️
+
+### 改善项
+- MainThread IO: 80ms → 10ms (-87%) ✓
+```
+
+### 4.4 P1-4: 智能一键分析
+
+**目标**：`/quick` 命令，30 秒内完成轻量分析，不需要 LLM 调用。
+
+```python
+# commands/quick.py
+
+def quick_analysis(trace_path: str, source_dir: str) -> str:
+    """快速分析：纯确定性，不调用 LLM"""
+    collector = PerfettoCollector(trace_path)
+    summary = collector.summarize()
+    hints = compute_hints(summary.to_json())
+
+    # 运行归因 (fast path only)
+    attributable = extract_attributable_slices(...)
+    results = run_attribution(attributable)  # 只用 fast path
+
+    # 拼接报告
+    return format_quick_report(hints, results)
+```
+
+### 4.5 P1-5: ExtraHook 参数自动推断
+
+**现状**：`hookExtraClasses()` 只尝试无参签名。
+
+**改进**：
+
+```java
+private static void hookExtraClasses() {
+    for (ExtraHook eh : HookConfigManager.getExtraHooks()) {
+        try {
+            Class<?> clazz = Class.forName(eh.className);
+            for (String methodName : eh.methods) {
+                // 自动推断所有可能的重载签名
+                for (Method m : clazz.getDeclaredMethods()) {
+                    if (m.getName().equals(methodName)) {
+                        Pine.hook(m, new MethodHook() { ... });
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Extra hook failed: " + e.getMessage());
+        }
+    }
+}
+```
+
+---
+
+## 5. 架构改进
+
+### 5.1 配置统一
+
+**现状**：三套配置系统
+- Android: `SharedPreferences` + `HookConfig` JSON
+- CLI: 环境变量 + `config.py` 全局变量
+- WS 协议: `config_sync` / `config_update` 消息
+
+**改进方案**：引入统一配置文件 `si.yaml`
+
+```yaml
+# si.yaml - 项目级配置
+android:
+  hooks:
+    network_io: true
+    database_io: true
+  perfetto:
+    duration_ms: 10000
+    buffer_size_kb: 65536
+    cpu_sampling_interval_ms: 1
+
+analysis:
+  source_dir: "./src"
+  frame_budget_ms: 16.67  # 0 = auto detect
+  jank_threshold_ms: 16.0
+
+llm:
+  model: "deepseek-chat"
+  base_url: "https://api.deepseek.com"
+  # api_key from env SI_API_KEY
+
+output:
+  format: "markdown"  # markdown | json
+  reports_dir: "./reports"
+```
+
+CLI 和 Android 端都从这份配置同步。
+
+### 5.2 错误恢复增强
+
+**现状**：`node_error_handler` 只捕获异常，返回错误消息。
+
+**改进**：
+
+```python
+def node_error_handler(node_name: str, retry: int = 0):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(state):
+            last_error = None
+            for attempt in range(retry + 1):
+                try:
+                    return func(state)
+                except Exception as e:
+                    last_error = e
+                    if attempt < retry:
+                        print(f"  [{node_name}] retry {attempt+1}/{retry}...", flush=True)
+            # All retries failed
+            return {
+                "messages": [AIMessage(content=f"[{node_name}] Error: {last_error}")],
+                **_pass_through(state),
+            }
+        return wrapper
+    return decorator
+```
+
+### 5.3 Collector 拆分
+
+**现状**：`collector/perfetto.py` 是 1340+ 行的大文件。
+
+**拆分方案**：
+
+```
+collector/
+  __init__.py
+  perfetto.py          # PerfettoCollector 核心 (trace 加载, summarize)
+  queries/
+    __init__.py
+    frame_timeline.py  # collect_frame_timeline()
+    cpu_hotspots.py    # collect_cpu_hotspots(), collect_cpu_usage()
+    view_slices.py     # collect_view_slices(), collect_io_slices()
+    thread_state.py    # collect_thread_state()
+    block_events.py    # collect_block_events()
+    memory.py          # collect_memory() (P1-2)
+    startup.py         # StartupAnalyzer (P0-2)
+    input_events.py    # collect_input_events()
+    scheduling.py      # collect_sched()
+  trace_server.py      # TraceServer
+  device.py            # pull_trace_from_device(), adb 操作
+```
+
+---
+
+## 6. 贡献者指南
+
+### 6.1 如何贡献
+
+每个 P0/P1 任务都是独立的 PR 单元，贡献者可以：
+
+1. 从 issue 列表中认领任务
+2. 在对应分支上开发（`feat/p0-io-hooks`, `feat/p0-startup`, etc.）
+3. 确保通过 `pytest tests/` 测试
+4. Demo App 场景验证
+5. 提交 PR + 填写 PR 模板
+
+### 6.2 代码规范
+
+- **Python**: 类型注解 + docstring，`debug_log()` 用于数据检查日志
+- **Java/Kotlin**: `SI$` 前缀标签，`shortenFqn()` 处理 127 字符限制
+- **SQL**: 查询放在 `collector/queries/` 独立文件中
+- **LLM prompt**: 放在 `prompts/` 目录，使用 `load_prompt()` 加载
+
+### 6.3 测试要求
+
+- 每个 P0 变更需要同步更新 Demo App 场景
+- Python 测试使用 synthetic trace（参考 `tests/` 现有模式）
+- Android 测试：Demo App 手动验证 + 截图
+
+---
+
+## 附录 A: 当前 SI$ Tag 体系
+
+| 前缀 | 类别 | 格式 | 示例 |
+|------|------|------|------|
+| `SI$` | Activity 生命周期 | `SI$Class.method` | `SI$MainActivity.onCreate` |
+| `SI$` | Fragment 生命周期 | `SI$Class.method` | `SI$DetailFragment.onCreateView` |
+| `SI$` | RV 管线 | `SI$RV#id#Adapter.method` | `SI$RV#recycler#DemoAdapter.onBindViewHolder` |
+| `SI$` | Layout 膨胀 | `SI$inflate#layout#parent` | `SI$inflate#item_complex#RecyclerView` |
+| `SI$` | View 遍历 | `SI$view#Class.method` | `SI$view#HeavyDrawView.draw` |
+| `SI$` | Handler | `SI$handler#callbackClass` | `SI$handler#Worker$1` |
+| `SI$block#` | 卡顿 | `SI$block#class#NNms` | `SI$block#DemoAdapter$1.run#250ms` |
+| `SI$touch#` | 触摸事件 | `SI$touch#activity#ACTION` | `SI$touch#MainActivity#DOWN` |
+| `SI$net#` | 网络 IO | `SI$net#class.method` | `SI$net#RealCall.execute` |
+| `SI$db#` | 数据库 IO | `SI$db#class.method#table` | `SI$db#DatabaseHelper.query#users` |
+| `SI$img#` | 图片加载 | `SI$img#class.method` | `SI$img#RequestBuilder.into` |
+| `SI$inflate#` | 布局膨胀 | `SI$inflate#name#parent` | `SI$inflate#item_complex#RecyclerView` |
+
+## 附录 B: LangGraph 管线流程
+
+```
+用户输入 → orchestrator (LLM 路由)
+  ├─ full_analysis → collector → analyzer → attributor → reporter → END
+  ├─ android → android_expert → [analyzer] → END
+  ├─ analyze → perf_analyzer → END
+  ├─ explorer → explorer → END
+  └─ end → fallback → END
+
+Slash Commands:
+  /trace [dur] [pkg]  → collector → analyzer → END
+  /full [pkg]         → collector → analyzer → attributor → reporter → END
+  /frame ts=X dur=Y   → frame_analyzer (直接)
+  /open [path]        → bridge_server + browser
+  /config             → 查看配置
+  /hooks              → 查看 hook 状态
+```
+
+## 附录 C: WebSocket 协议
+
+| 方向 | 消息类型 | 用途 |
+|------|----------|------|
+| App → CLI | `config_sync` | App 连接时发送当前配置 |
+| CLI → App | `config_update` | CLI 推送配置变更 |
+| CLI → App | `start_trace` | 请求 App 确认 hook 就绪 |
+| App → CLI | `ack` | 确认 start_trace |
+| CLI → App | `get_block_events` | 请求缓存的 block 事件 |
+| App → CLI | `block_events` | 返回 block 事件 JSON |
+| Bridge → CLI | `frame_selected` | Perfetto UI 插件选帧事件 |
+| CLI → Bridge | `analysis_result` | 帧分析结果 |
+| CLI → Bridge | `analysis_progress` | 分析进度 |
