@@ -654,34 +654,51 @@ class PerfettoCollector:
         return {}
 
     def collect_memory(self) -> dict:
-        """Collect Java heap memory from android.java_hprof data."""
-        tp = self._open()
-        try:
-            rows = tp.query("""
-                SELECT
-                  c.name AS class_name,
-                  COUNT(*) AS obj_count,
-                  SUM(o.self_size) AS total_bytes
-                FROM heap_graph_object o
-                JOIN heap_graph_class c ON o.type_id = c.id
-                WHERE o.reachable = 1
-                GROUP BY c.name
-                ORDER BY total_bytes DESC
-                LIMIT 15
-            """)
-        except Exception as e:
-            # heap_graph tables may not exist if no Java heap dump
-            logger.debug("Heap graph query failed: %s", e)
-            return {}
+        """Collect Java heap memory from android.java_hprof data.
 
-        allocs = []
-        for r in rows:
-            allocs.append({
-                "class_name": r.class_name,
-                "obj_count": r.obj_count,
-                "total_size_kb": round(r.total_bytes / 1024, 1),
-            })
-        return {"heap_graph_classes": allocs}
+        Uses heap_graph tables for detailed allocation analysis including
+        leak suspects and dominator trees.
+        """
+        from smartinspector.collector.memory import collect_heap_graph_analysis
+
+        tp = self._open()
+
+        # Resolve target upid for process-scoped queries
+        target_upid = None
+        if self._target_process_cache:
+            target_upid = self._target_process_cache.get("upid")
+
+        # Detailed heap graph analysis
+        result = collect_heap_graph_analysis(tp, target_upid)
+
+        # Fallback: if heap_graph_analysis returned nothing, try basic query
+        if not result:
+            try:
+                rows = tp.query("""
+                    SELECT
+                      c.name AS class_name,
+                      COUNT(*) AS obj_count,
+                      SUM(o.self_size) AS total_bytes
+                    FROM heap_graph_object o
+                    JOIN heap_graph_class c ON o.type_id = c.id
+                    WHERE o.reachable = 1
+                    GROUP BY c.name
+                    ORDER BY total_bytes DESC
+                    LIMIT 15
+                """)
+                allocs = []
+                for r in rows:
+                    allocs.append({
+                        "class_name": r.class_name,
+                        "obj_count": r.obj_count,
+                        "total_size_kb": round(r.total_bytes / 1024, 1),
+                    })
+                if allocs:
+                    result["heap_graph_classes"] = allocs
+            except Exception as e:
+                logger.debug("Basic heap graph query failed: %s", e)
+
+        return result
 
     def collect_threads(self) -> list[dict]:
         """Collect thread info."""

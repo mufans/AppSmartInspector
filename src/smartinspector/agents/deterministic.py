@@ -58,6 +58,7 @@ def compute_hints(perf_json: str) -> str:
         _analyze_thread_state(data),
         _analyze_io_slices(data),
         _analyze_compose_slices(data),
+        _analyze_memory(data),
     ]
 
     return "\n\n".join(s for s in sections if s)
@@ -538,5 +539,67 @@ def _analyze_compose_slices(data: dict) -> str:
     total_count = compose_slices.get("total_count", 0)
     if total_count > 0:
         lines.append(f"  Compose操作总计: {total_count}次")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 9: Memory allocation analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_memory(data: dict) -> str:
+    """Analyze heap memory allocation and detect potential leaks.
+
+    Reports top heap objects by size, leak suspects (destroyed Activities/Fragments
+    still in heap), and memory growth anomalies.
+    """
+    memory = data.get("memory")
+    if not memory:
+        return ""
+
+    lines = ["[内存分配分析]"]
+
+    # Top heap objects
+    heap_objects = memory.get("heap_objects") or memory.get("heap_graph_classes") or []
+    if heap_objects:
+        lines.append("  堆内存Top对象:")
+        for obj in heap_objects[:10]:
+            name = obj.get("class_name", "?")
+            count = obj.get("obj_count", 0)
+            size_kb = obj.get("total_size_kb", 0)
+            # Shorten class name for readability
+            short = name.rsplit(".", 1)[-1] if "." in name else name
+            lines.append(f"    {short}: {count}个, {size_kb:.1f}KB")
+
+    # Leak suspects
+    leak_suspects = memory.get("leak_suspects") or []
+    if leak_suspects:
+        lines.append("  潜在泄漏:")
+        for suspect in leak_suspects[:5]:
+            name = suspect.get("class_name", "?")
+            count = suspect.get("obj_count", 0)
+            size_kb = suspect.get("total_size_kb", 0)
+            short = name.rsplit(".", 1)[-1] if "." in name else name
+            lines.append(f"    ⚠ {short}: {count}个实例, {size_kb:.1f}KB")
+
+    # Process memory trend
+    proc_mem = data.get("process_memory") or {}
+    processes = proc_mem.get("processes", [])
+    if processes:
+        from smartinspector.collector.memory import analyze_memory_trend
+        trend = analyze_memory_trend(proc_mem)
+        trend_procs = trend.get("processes", [])
+        for p in trend_procs:
+            if p.get("anomaly") or p.get("high_anon"):
+                peak = p.get("peak_rss_mb", 0)
+                name = p.get("name", "?")
+                lines.append(f"  {name}: 峰值{peak:.0f}MB")
+                if p.get("anomaly"):
+                    lines.append(f"    {p['anomaly']}")
+                if p.get("high_anon"):
+                    lines.append(f"    {p['high_anon']}")
+
+    if len(lines) <= 1:
+        return ""
 
     return "\n".join(lines)
