@@ -1702,6 +1702,7 @@ class PerfettoCollector:
         cpu_sampling_interval_ms: int = 1,
         collect_cpu_callstacks: bool = True,
         collect_java_heap: bool = True,
+        on_record_start: callable | None = None,
     ) -> str:
         """Pull a Perfetto trace from connected Android device via adb.
 
@@ -1716,6 +1717,8 @@ class PerfettoCollector:
             cpu_sampling_interval_ms: CPU sampling interval in ms (1-10).
             collect_cpu_callstacks: Enable CPU callstack profiling (requires target_process).
             collect_java_heap: Enable Java heap profiling (requires target_process).
+            on_record_start: Optional callback invoked after Perfetto recording starts
+                             on device (useful for cold start app launch).
 
         Returns:
             Path to the downloaded trace file.
@@ -1852,12 +1855,33 @@ class PerfettoCollector:
 
         # Strategy 1: Config mode via stdin pipe (preferred)
         try:
-            subprocess.run(
-                ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
-                input=config_text,
-                check=True, capture_output=True, text=True,
-                timeout=timeout_sec,
-            )
+            if on_record_start:
+                # Use Popen so we can invoke callback while Perfetto is recording
+                proc = subprocess.Popen(
+                    ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                proc.stdin.write(config_text)
+                proc.stdin.close()
+                # Give Perfetto a moment to start recording, then invoke callback
+                import time
+                time.sleep(0.5)
+                on_record_start()
+                stdout, stderr = proc.communicate(timeout=timeout_sec)
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(
+                        proc.returncode, proc.args, stdout, stderr,
+                    )
+            else:
+                subprocess.run(
+                    ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
+                    input=config_text,
+                    check=True, capture_output=True, text=True,
+                    timeout=timeout_sec,
+                )
             collection_error = None
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             err_msg = ""

@@ -2,13 +2,69 @@
 
 import json
 import logging
+import subprocess
 
 from langchain_core.messages import AIMessage
 
 from smartinspector.debug_log import debug_log
-from smartinspector.graph.state import AgentState
+from smartinspector.graph.state import AgentState, RouteDecision
 
 logger = logging.getLogger(__name__)
+
+
+def _check_adb_available() -> bool:
+    """Check if adb is available in PATH."""
+    try:
+        subprocess.run(
+            ["adb", "version"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _adb_force_stop(package: str) -> bool:
+    """Force-stop an app via adb. Returns True on success."""
+    try:
+        result = subprocess.run(
+            ["adb", "shell", "am", "force-stop", package],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            logger.info("adb force-stop %s succeeded", package)
+            return True
+        logger.warning("adb force-stop failed: %s", result.stderr.strip())
+        return False
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.warning("adb force-stop unavailable: %s", e)
+        return False
+
+
+def _adb_launch_app(package: str) -> bool:
+    """Launch an app via adb am start. Returns True on success."""
+    try:
+        result = subprocess.run(
+            ["adb", "shell", "am", "start", "-n", f"{package}/.MainActivity"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            logger.info("adb am start %s succeeded", package)
+            return True
+        # Fallback: try launch by package only (monkey command)
+        result2 = subprocess.run(
+            ["adb", "shell", "monkey", "-p", package, "-c",
+             "android.intent.category.LAUNCHER", "1"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result2.returncode == 0:
+            logger.info("adb monkey launch %s succeeded", package)
+            return True
+        logger.warning("adb launch failed: %s", result.stderr.strip())
+        return False
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.warning("adb launch unavailable: %s", e)
+        return False
 
 
 def _read_perfetto_config() -> dict:
@@ -113,7 +169,31 @@ def collector_node(state: AgentState) -> dict:
     from smartinspector.collector.perfetto import PerfettoCollector
 
     skip_wait = state.get("skip_wait", False)
-    logger.info("Starting trace collection...")
+    route = state.get("_route", "")
+    is_startup = route in (RouteDecision.STARTUP, RouteDecision.STARTUP.value)
+    logger.info("Starting trace collection (route=%s)...", route)
+
+    # Cold start auto ADB launch: force-stop before trace, launch after
+    cold_start_target = None
+    if is_startup:
+        pc_pre = _read_perfetto_config()
+        cold_start_target = (
+            state.get("trace_target_process")
+            or pc_pre.get("target_process", "")
+            or None
+        )
+        if cold_start_target:
+            if _check_adb_available():
+                logger.info("Cold start mode: force-stopping %s", cold_start_target)
+                _adb_force_stop(cold_start_target)
+            else:
+                logger.warning(
+                    "adb not found in PATH, skipping cold start auto-launch. "
+                    "Manually stop the app before tracing for best results."
+                )
+                cold_start_target = None  # Disable auto-launch
+        else:
+            logger.warning("Cold start mode but no --target specified, skipping auto ADB launch")
 
     # Notify app to ensure hooks are ready before collecting
     if skip_wait:
@@ -169,6 +249,18 @@ def collector_node(state: AgentState) -> dict:
 
         logger.info("Config: duration=%dms, buffer=%dKB", duration_ms, buffer_size_kb)
 
+        # Cold start: ensure target_process is set in state for downstream nodes
+        if is_startup and cold_start_target and not target_process:
+            target_process = cold_start_target
+
+        # Build on_record_start callback for cold start: launch app while Perfetto records
+        on_record_start = None
+        if cold_start_target:
+            _launch_target = cold_start_target
+            def on_record_start():
+                logger.info("Cold start mode: launching %s (during trace recording)", _launch_target)
+                _adb_launch_app(_launch_target)
+
         trace_path = PerfettoCollector.pull_trace_from_device(
             duration_ms=duration_ms,
             target_process=target_process,
@@ -177,6 +269,7 @@ def collector_node(state: AgentState) -> dict:
             cpu_sampling_interval_ms=cpu_sampling_interval_ms,
             collect_cpu_callstacks=collect_cpu_callstacks if target_process else False,
             collect_java_heap=collect_java_heap if target_process else False,
+            on_record_start=on_record_start,
         )
         logger.info("Trace saved to %s", trace_path)
         debug_log("collector", f"trace_path: {trace_path}")
