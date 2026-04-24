@@ -102,6 +102,19 @@ def reporter_node(state: AgentState) -> dict:
     if report_path:
         complete_report += f"\n\n---\n报告已保存至: {report_path}"
 
+    # Auto-save analysis result for historical comparison
+    try:
+        from smartinspector.storage.store import save_analysis_result
+        analysis_path = save_analysis_result(
+            perf_summary=perf_json,
+            perf_analysis=perf_analysis,
+            attribution_result=attribution_result,
+            trace_path=state.get("_trace_path", ""),
+        )
+        logger.info("Auto-saved analysis result for comparison: %s", analysis_path)
+    except Exception as e:
+        logger.debug("Auto-save analysis result failed: %s", e)
+
     return {
         "messages": [AIMessage(content=complete_report)],
         "perf_summary": perf_json,
