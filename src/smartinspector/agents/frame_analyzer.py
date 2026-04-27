@@ -5,6 +5,7 @@ data, runs source code attribution, and calls LLM for frame-level analysis.
 """
 
 import json
+import logging
 import threading
 
 from langchain_openai import ChatOpenAI
@@ -12,6 +13,8 @@ from langchain_openai import ChatOpenAI
 from smartinspector.config import get_llm_kwargs
 from smartinspector.prompts import load_prompt
 from smartinspector.token_tracker import get_tracker
+
+logger = logging.getLogger(__name__)
 
 _prompt = load_prompt("frame-analyzer")
 _llm = None
@@ -79,10 +82,19 @@ def analyze_frame(trace_path: str, ts_ns: int, dur_ns: int,
         except (json.JSONDecodeError, TypeError):
             summary_context = existing_summary[:2000]
 
-    # Truncate frame data for LLM input
+    # Truncate frame data for LLM input — use SQL summarizer for large lists
+    from smartinspector.agents.deterministic import summarize_sql_result
+
     frame_json = json.dumps(frame_data, indent=2, ensure_ascii=False)
     if len(frame_json) > 6000:
-        frame_data["slices"] = frame_data["slices"][:20]
+        # Summarize slices list if too large
+        slices = frame_data.get("slices", [])
+        if len(slices) > 20:
+            slices_summary = summarize_sql_result(
+                slices, "dur_ms", top_n=10, group_col="name",
+            )
+            frame_data["slices_summary"] = slices_summary
+            frame_data["slices"] = slices[:20]
         frame_json = json.dumps(frame_data, indent=2, ensure_ascii=False)
 
     user_content = (
@@ -109,7 +121,23 @@ def analyze_frame(trace_path: str, ts_ns: int, dur_ns: int,
     get_tracker().record_from_message("frame_analyzer", response)
     debug_log("frame", f"Step 3 response:\n{response.content}")
     debug_log("frame", "Step 3 done")
-    return response.content
+
+    result = response.content
+
+    # Verify analysis quality
+    from smartinspector.agents.verifier import verify_analysis
+    verification = verify_analysis(result, hints)
+    if not verification.passed:
+        logger.warning(
+            "Frame analysis verification issues: %s (score=%.2f)",
+            "; ".join(verification.issues),
+            verification.score,
+        )
+        if verification.warnings:
+            for w in verification.warnings:
+                logger.warning("  %s", w)
+
+    return result
 
 
 def _run_source_attribution(frame_data: dict, existing_summary: str,

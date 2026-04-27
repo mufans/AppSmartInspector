@@ -7,6 +7,223 @@ LLM only needs to organize language around these conclusions.
 """
 
 import json
+import statistics
+
+
+# ---------------------------------------------------------------------------
+# SQL Summarizer: compress raw SQL results for LLM consumption
+# ---------------------------------------------------------------------------
+
+# Default histogram buckets (milliseconds)
+_HIST_BUCKETS = [
+    (0, 16, "<16ms"),
+    (16, 32, "16-32ms"),
+    (32, 64, "32-64ms"),
+    (64, float("inf"), ">64ms"),
+]
+
+
+def summarize_sql_result(
+    rows: list[dict],
+    metric_col: str,
+    top_n: int = 10,
+    threshold_pct: float = 2.0,
+    group_col: str | None = None,
+) -> str:
+    """Compress SQL query results into a statistical summary + outlier samples.
+
+    Applies four compression strategies:
+    1. Statistics: count, min, max, avg, p95, p99
+    2. Distribution histogram: bucket values into ranges
+    3. Outlier sampling: top N rows exceeding avg * threshold_pct
+    4. Dedup aggregation: rows sharing the same group_col key are merged
+
+    Args:
+        rows: SQL query result rows.
+        metric_col: Name of the numeric column to summarize.
+        top_n: Max number of outlier rows to include.
+        threshold_pct: Outlier threshold as multiple of the average.
+        group_col: Optional column to group/dedup by (e.g. "name").
+
+    Returns:
+        Compressed text summary suitable for LLM input.
+    """
+    if not rows:
+        return "[SQL摘要] 无数据"
+
+    # Extract numeric values from metric_col
+    values: list[float] = []
+    for r in rows:
+        v = r.get(metric_col)
+        if v is not None:
+            try:
+                values.append(float(v))
+            except (ValueError, TypeError):
+                pass
+
+    if not values:
+        return f"[SQL摘要] {len(rows)} 行, {metric_col} 列无数值"
+
+    lines: list[str] = []
+    count = len(values)
+    min_v = min(values)
+    max_v = max(values)
+    avg_v = sum(values) / count
+
+    # Percentiles
+    sorted_vals = sorted(values)
+    p95 = sorted_vals[int(count * 0.95)] if count >= 20 else max_v
+    p99 = sorted_vals[int(count * 0.99)] if count >= 100 else max_v
+
+    lines.append(
+        f"[SQL摘要] {count} 行, "
+        f"min={min_v:.2f}, max={max_v:.2f}, avg={avg_v:.2f}, "
+        f"p95={p95:.2f}, p99={p99:.2f}"
+    )
+
+    # Distribution histogram
+    bucket_counts = [0] * len(_HIST_BUCKETS)
+    for v in values:
+        for i, (lo, hi, _) in enumerate(_HIST_BUCKETS):
+            if lo <= v < hi:
+                bucket_counts[i] += 1
+                break
+    hist_parts = [
+        f"{label}={cnt}" for (_, _, label), cnt in zip(_HIST_BUCKETS, bucket_counts) if cnt > 0
+    ]
+    lines.append(f"  分布: {', '.join(hist_parts)}")
+
+    # Dedup aggregation by group_col
+    if group_col:
+        groups: dict[str, dict] = {}
+        for r in rows:
+            key = str(r.get(group_col, "?"))
+            v = r.get(metric_col, 0)
+            try:
+                v = float(v)
+            except (ValueError, TypeError):
+                continue
+            if key in groups:
+                groups[key]["total"] += v
+                groups[key]["count"] += 1
+                groups[key]["max"] = max(groups[key]["max"], v)
+            else:
+                groups[key] = {"total": v, "count": 1, "max": v}
+
+        if groups:
+            sorted_groups = sorted(groups.items(), key=lambda x: -x[1]["total"])
+            agg_lines = []
+            for name, stats in sorted_groups[:10]:
+                cnt = stats["count"]
+                avg_g = stats["total"] / cnt if cnt > 0 else 0
+                cnt_label = f", {cnt}次" if cnt > 1 else ""
+                agg_lines.append(f"  {name}: 总{stats['total']:.2f}ms, 最大{stats['max']:.2f}ms{cnt_label}")
+            lines.append(f"  聚合 (按{group_col}, top {min(len(sorted_groups), 10)}):")
+            lines.extend(agg_lines)
+
+    # Outlier sampling
+    threshold = avg_v * threshold_pct
+    outliers = [(r, float(r.get(metric_col, 0))) for r in rows
+                if _safe_float(r.get(metric_col)) > threshold]
+    outliers.sort(key=lambda x: -x[1])
+
+    if outliers:
+        lines.append(f"  异常采样 (>{threshold:.2f}ms, top {min(len(outliers), top_n)}):")
+        for r, v in outliers[:top_n]:
+            # Build a compact representation of the row
+            parts = [f"{metric_col}={v:.2f}"]
+            for k, val in r.items():
+                if k != metric_col and val is not None:
+                    parts.append(f"{k}={val}")
+            lines.append(f"    {', '.join(parts[:4])}")  # max 4 fields per row
+
+    return "\n".join(lines)
+
+
+def compress_perf_json(perf_json: str) -> str:
+    """Compress large list fields in a perf JSON string using summarize_sql_result.
+
+    Targets the heaviest fields that bloat LLM token usage:
+    - view_slices.slowest_slices
+    - view_slices.call_chains
+    - block_events
+    - frame_timeline.jank_detail / slowest_frames
+    - cpu_usage.top_processes[].threads
+    - thread_state
+
+    Each list is replaced with its summarized text if it exceeds a size threshold.
+
+    Args:
+        perf_json: Raw perf summary JSON string.
+
+    Returns:
+        JSON string with large lists replaced by compressed summaries.
+    """
+    try:
+        data = json.loads(perf_json)
+    except (json.JSONDecodeError, TypeError):
+        return perf_json
+
+    modified = False
+
+    # view_slices.slowest_slices
+    vs = data.get("view_slices") or {}
+    slowest = vs.get("slowest_slices") or []
+    if len(slowest) > 20:
+        summary = summarize_sql_result(slowest, "dur_ms", top_n=10, group_col="name")
+        vs["slowest_slices_summary"] = summary
+        vs["slowest_slices"] = slowest[:5]  # keep top 5 raw rows
+        modified = True
+
+    # block_events
+    block_events = data.get("block_events") or []
+    if len(block_events) > 10:
+        summary = summarize_sql_result(block_events, "dur_ms", top_n=5, group_col="name")
+        data["block_events_summary"] = summary
+        data["block_events"] = block_events[:3]
+        modified = True
+
+    # frame_timeline jank_detail / slowest_frames
+    ft = data.get("frame_timeline") or {}
+    for key in ("jank_detail", "slowest_frames"):
+        frames = ft.get(key) or []
+        if len(frames) > 10:
+            summary = summarize_sql_result(frames, "dur_ms", top_n=5)
+            ft[f"{key}_summary"] = summary
+            ft[key] = frames[:3]
+            modified = True
+
+    # cpu_usage top_processes threads
+    cpu = data.get("cpu_usage") or {}
+    top_procs = cpu.get("top_processes") or []
+    for proc in top_procs:
+        threads = proc.get("threads") or []
+        if len(threads) > 10:
+            summary = summarize_sql_result(threads, "cpu_pct", top_n=5, group_col="name")
+            proc["threads_summary"] = summary
+            proc["threads"] = threads[:3]
+            modified = True
+
+    # thread_state
+    thread_states = data.get("thread_state") or []
+    if len(thread_states) > 10:
+        summary = summarize_sql_result(thread_states, "dur_ms", top_n=5, group_col="slice_name")
+        data["thread_state_summary"] = summary
+        data["thread_state"] = thread_states[:5]
+        modified = True
+
+    if not modified:
+        return perf_json
+
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _safe_float(v) -> float:
+    """Safely convert a value to float, returning 0 on failure."""
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return 0.0
 
 
 def _detect_frame_budget_ms(data: dict) -> float:

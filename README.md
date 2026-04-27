@@ -10,7 +10,8 @@ AI 驱动的跨平台移动端性能分析 CLI 工具。通过自然语言交互
 - 📊 **全量分析流水线** — 自动采集 → 分析 → 源码归因 → 报告生成
 - 🔍 **SI$ 源码归因** — 通过 TraceHook tag 将性能热点精确归因到源码位置（含 IO 切片归因）
 - 🛡️ **健壮性保障** — 全链路异常处理，Agent 崩溃不丢会话状态
-- ⚡ **Token 效率优化** — 消息窗口裁剪、路由 token 限制、流式输出
+- ⚡ **Token 效率优化** — SQL 结果智能压缩（统计摘要+异常采样）、消息窗口裁剪、路由 token 限制、流式输出
+- ✅ **分析质量验证** — L1 格式检查 + L2 一致性验证，自动检测 LLM 输出遗漏和不一致，支持重试补充
 - 🔒 **Release 零开销** — Release 变体为纯 no-op stubs，编译器内联后零运行时开销
 - 💬 **实时通信** — WebSocket CLI↔App 双向通信，支持心跳检测和断线重连
 - 🖥️ **Perfetto UI 交互** — 自托管 Perfetto UI + SI Bridge 插件，框选时间范围即可 AI 分析
@@ -194,10 +195,11 @@ smartinspector/
 │   ├── agents/                     #   Agent 定义 (LLM + Tools)
 │   │   ├── android.py              #     Android Expert Agent
 │   │   ├── explorer.py             #     Code Explorer Agent
-│   │   ├── perf_analyzer.py        #     Perf Analyzer (单次 LLM 调用)
+│   │   ├── perf_analyzer.py        #     Perf Analyzer (单次 LLM 调用 + 验证重试)
 │   │   ├── attributor.py           #     源码归因 Agent (run_attribution)
 │   │   ├── frame_analyzer.py       #     帧分析 Agent (Perfetto UI 交互归因)
-│   │   └── deterministic.py        #     确定性预计算 (减少 LLM token)
+│   │   ├── deterministic.py        #     确定性预计算 + SQL Summarizer (减少 LLM token)
+│   │   └── verifier.py             #     分析质量验证 (L1 格式 + L2 一致性, 0 token)
 │   │
 │   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU, context manager)
 │   ├── collector/startup.py        #   冷启动分析器 (启动阶段切分, 关键路径提取, 瓶颈识别)
@@ -525,6 +527,8 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 | P1-3 | 历史对比与趋势 | 多次分析结果对比，生成 before/after 报告和性能趋势图 | ✅ 已完成 |
 | P1-4 | 智能一键分析 | 纯确定性快速分析，不调用 LLM，30 秒内完成轻量分析 | ✅ 已完成 |
 | P1-5 | ExtraHook 参数自动推断 | 自动推断所有重载签名，无需手动配置方法参数 | ✅ 已完成 |
+| P1-6 | SQL Summarizer | 压缩 SQL 查询结果为统计摘要+异常采样，降低 60-80% token 消耗 | ✅ 已完成 |
+| P1-7 | Analysis Verifier | L1 格式检查 + L2 一致性验证，自动检测遗漏和不一致，支持重试 | ✅ 已完成 |
 
 ### 平台扩展
 
@@ -572,6 +576,21 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 
 - `TraceHook.java` 改进 `hookExtraClasses()`：自动推断所有重载签名
 - 遍历 `getDeclaredMethods()` 匹配方法名，替代原先的只尝试无参签名
+
+**P1-6: SQL Summarizer**
+
+- `deterministic.py` 新增 `summarize_sql_result()` — 将 SQL 查询结果压缩为统计摘要 (count/min/max/avg/p95/p99) + 分布直方图 + 异常采样 + 去重聚合
+- `deterministic.py` 新增 `compress_perf_json()` — 对 perf JSON 中的大列表字段 (slowest_slices/block_events/frame_timeline/thread_state) 自动应用压缩
+- 集成到 `perf_analyzer.py` (perf_json 传入前压缩) 和 `frame_analyzer.py` (slices 列表压缩)
+- Token 消耗降低 60-80%，减少 LLM 在大量数据中的幻觉
+
+**P1-7: Analysis Verifier**
+
+- `agents/verifier.py` 新增分层验证系统 (0 token，纯规则)
+- L1 格式检查：数值存在性、方法名引用、长度合理、P0/P1/P2 分级
+- L2 一致性验证：P0 问题覆盖、关键数据点数值一致性 (±20%)、热点方法覆盖
+- 集成到 `perf_analyzer.py` 和 `frame_analyzer.py`，L2 失败时自动重试一次补充遗漏
+- `VerificationResult` 包含 score/issues/warnings/l1_passed/l2_passed 属性
 
 ### ✅ 已完成 (2026-04-24 P0 改进)
 

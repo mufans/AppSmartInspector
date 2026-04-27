@@ -10,7 +10,8 @@ AI-powered Android performance analysis CLI. Collects Perfetto traces from devic
 ```
 src/smartinspector/          # Main Python package (installed via hatchling)
   agents/                    # LLM agent logic (attribution, analysis, frame analysis)
-    deterministic.py         #   Pre-computed hints (no LLM) — severity, call chain, thread state
+    deterministic.py         #   Pre-computed hints (no LLM) — severity, call chain, thread state, SQL summarizer
+    verifier.py              #   Analysis quality verification (L1 heuristic + L2 consistency, 0 tokens)
   commands/                  # Slash command handlers
     trace.py                 #   /trace, /record, /analyze, /frame, /open, /close
     orchestrate.py           #   /full, /report
@@ -362,7 +363,7 @@ Sections are ordered by priority to survive truncation at `SI_REPORT_MAX_TOKENS`
 
 ### Deterministic Pre-computation
 
-`agents/deterministic.py` provides 6 analysis modules (all pure Python, no LLM):
+`agents/deterministic.py` provides 8 analysis modules (all pure Python, no LLM):
 
 1. `_classify_severity()` — P0/P1/P2 severity based on device frame budget
 2. `_compute_call_chain_distribution()` — Call chain time distribution with percentages
@@ -370,6 +371,44 @@ Sections are ordered by priority to survive truncation at `SI_REPORT_MAX_TOKENS`
 4. `_correlate_jank_frames()` — Frame ↔ Slice ↔ InputEvent three-way correlation
 5. `_identify_cpu_hotspots()` — CPU function sampling hotspot identification
 6. `_analyze_thread_state()` — Running vs Sleeping/DiskSleep classification per slice
+7. `summarize_sql_result()` — Compress raw SQL query results into statistical summary + outlier samples
+8. `compress_perf_json()` — Compress large list fields in perf JSON to reduce LLM token usage
+
+### SQL Summarizer
+
+`summarize_sql_result()` compresses raw SQL query rows into a compact summary:
+
+- **Statistics**: count, min, max, avg, p95, p99
+- **Distribution histogram**: bucket values into ranges (<16ms, 16-32ms, 32-64ms, >64ms)
+- **Outlier sampling**: top N rows exceeding avg * threshold_pct
+- **Dedup aggregation**: rows sharing the same group_col key merged (total, max, count)
+
+`compress_perf_json()` applies summarization to large list fields in perf JSON:
+- `view_slices.slowest_slices` (>20 rows) → keep top 5 + summary
+- `block_events` (>10 rows) → keep top 3 + summary
+- `frame_timeline.jank_detail/slowest_frames` (>10 rows) → keep top 3 + summary
+- `cpu_usage.top_processes[].threads` (>10 rows) → keep top 3 + summary
+- `thread_state` (>10 rows) → keep top 5 + summary
+
+### Analysis Verifier
+
+`agents/verifier.py` validates LLM analysis output quality (0 tokens, pure Python):
+
+**L1: Heuristic Check**
+- Result contains concrete numeric values (at least 1)
+- Result contains specific method/class names (at least 1)
+- Result length is reasonable (100–10000 characters)
+- Result includes P0/P1/P2 severity classification
+
+**L2: Consistency Check**
+- P0 issues from deterministic hints are mentioned in analysis
+- Key data points (FPS, CPU, frame budget) are numerically consistent (±20%)
+- Hotspot methods from outlier sampling are covered in analysis
+
+**Result handling**:
+- L1+L2 all pass → return result directly
+- L2 fails → retry LLM once with missing context
+- L1 fails → log warning, return result with quality warning
 
 ## Android App Conventions
 
