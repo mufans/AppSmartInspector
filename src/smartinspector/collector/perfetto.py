@@ -1859,6 +1859,9 @@ class PerfettoCollector:
         try:
             if on_record_start:
                 # Use Popen so we can invoke callback while Perfetto is recording
+                import threading
+                import time
+
                 proc = subprocess.Popen(
                     ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
                     stdin=subprocess.PIPE,
@@ -1866,17 +1869,41 @@ class PerfettoCollector:
                     stderr=subprocess.PIPE,
                     text=True,
                 )
-                proc.stdin.write(config_text)
-                proc.stdin.close()
+                try:
+                    proc.stdin.write(config_text)
+                    proc.stdin.flush()
+                    proc.stdin.close()
+                except (BrokenPipeError, OSError) as e:
+                    logger.warning("Failed to write config to perfetto stdin: %s", e)
+
                 # Give Perfetto a moment to start recording, then invoke callback
-                import time
                 time.sleep(0.5)
-                on_record_start()
+
+                # Run on_record_start in a thread so pipe I/O is not blocked
+                callback_error = None
+
+                def _run_callback():
+                    nonlocal callback_error
+                    try:
+                        on_record_start()
+                    except Exception as exc:
+                        callback_error = exc
+                        logger.warning("on_record_start callback failed: %s", exc)
+
+                cb_thread = threading.Thread(target=_run_callback, daemon=True)
+                cb_thread.start()
+                # Wait for callback to finish, but cap at a reasonable timeout
+                cb_thread.join(timeout=10.0)
+                if cb_thread.is_alive():
+                    logger.warning("on_record_start callback timed out after 10s")
+
                 stdout, stderr = proc.communicate(timeout=timeout_sec)
                 if proc.returncode != 0:
                     raise subprocess.CalledProcessError(
                         proc.returncode, proc.args, stdout, stderr,
                     )
+                if callback_error:
+                    logger.warning("Trace collected but on_record_start had errors: %s", callback_error)
             else:
                 subprocess.run(
                     ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],

@@ -1,9 +1,12 @@
 """Trace collection and analysis commands: /trace, /record, /analyze, /frame."""
 
 import json
+import logging
 
 from smartinspector.collector.perfetto import PerfettoCollector
 from smartinspector.ws.server import SIServer
+
+logger = logging.getLogger(__name__)
 
 
 def _get_perfetto_config() -> dict:
@@ -42,7 +45,7 @@ def cmd_trace(args: str, state: dict) -> dict:
         try:
             duration_ms = int(parts[0])
             if duration_ms < 100 or duration_ms > 60000:
-                print(f"  Warning: duration {duration_ms}ms out of range [100, 60000], clamped.")
+                logger.warning("duration %dms out of range [100, 60000], clamped.", duration_ms)
                 duration_ms = max(100, min(60000, duration_ms))
         except ValueError:
             target_process = parts[0]
@@ -87,7 +90,7 @@ def cmd_record(args: str, state: dict) -> dict:
         try:
             duration_ms = int(parts[0])
             if duration_ms < 100 or duration_ms > 60000:
-                print(f"  Warning: duration {duration_ms}ms out of range [100, 60000], clamped.")
+                logger.warning("duration %dms out of range [100, 60000], clamped.", duration_ms)
                 duration_ms = max(100, min(60000, duration_ms))
         except ValueError:
             target_process = parts[0]

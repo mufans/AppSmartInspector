@@ -94,9 +94,9 @@ class BridgeServer:
         try:
             self._loop.run_until_complete(self._serve())
         except OSError as e:
-            print(f"  [bridge] Failed to start: {e}")
+            logger.error("Bridge server failed to start: %s", e)
         except Exception as e:
-            print(f"  [bridge] Unexpected error: {e}")
+            logger.error("Bridge server unexpected error: %s", e)
 
     async def _serve(self):
         import websockets
@@ -121,7 +121,7 @@ class BridgeServer:
         """Handle WebSocket connections from the Perfetto UI plugin."""
         self._ws_clients.add(ws)
         remote = ws.remote_address if hasattr(ws, "remote_address") else "?"
-        print(f"  [bridge] Plugin connected: {remote}")
+        logger.info("Plugin connected: %s", remote)
         try:
             async for raw in ws:
                 try:
@@ -139,7 +139,7 @@ class BridgeServer:
             pass
         finally:
             self._ws_clients.discard(ws)
-            print(f"  [bridge] Plugin disconnected: {remote}")
+            logger.info("Plugin disconnected: %s", remote)
 
     async def _handle_frame_selected(self, ws, payload: dict):
         """Forward frame selection to the agent and return results."""
@@ -358,7 +358,7 @@ def start_bridge(
     trace_server = TraceServer(trace_path, port=9001)
     print(f"  [bridge] Starting trace_processor_shell on :9001...", flush=True)
     if not trace_server.start():
-        print("  [bridge] WARNING: TraceServer failed to start, /frame SQL queries will use file mode")
+        logger.warning("TraceServer failed to start, /frame SQL queries will use file mode")
     _active_trace_server = trace_server
 
     # Store perf_summary and attribution_result for analysis context

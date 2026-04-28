@@ -6,6 +6,8 @@ from smartinspector.commands import handle_slash_command
 from smartinspector.graph.builder import create_graph
 from smartinspector.graph.streaming import _stream_run
 
+logger = logging.getLogger(__name__)
+
 
 def main():
     """Run the interactive chat loop."""
@@ -94,7 +96,7 @@ def main():
     if not get_api_key():
         issues.append("No API key configured. Set SI_API_KEY or OPENAI_API_KEY.")
     for issue in issues:
-        print(f"  Warning: {issue}")
+        logger.warning(issue)
 
     # Auto-start WS server + adb reverse so app can connect on launch
     port = get_ws_port()

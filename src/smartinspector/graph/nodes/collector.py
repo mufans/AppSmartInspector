@@ -191,9 +191,15 @@ def collector_node(state: AgentState) -> dict:
     """
     from smartinspector.collector.perfetto import PerfettoCollector
 
-    skip_wait = state.get("skip_wait", False)
+    # Clear stale trace data to force re-collection on full_analysis/startup routes.
+    # Without this, a second /full would reuse the old _trace_path and skip device collection.
     route = state.get("_route", "")
     is_startup = route in (RouteDecision.STARTUP, RouteDecision.STARTUP.value)
+    is_full = route in (RouteDecision.FULL_ANALYSIS, RouteDecision.FULL_ANALYSIS.value)
+    if is_full or is_startup:
+        state = {**state, "_trace_path": ""}
+
+    skip_wait = state.get("skip_wait", False)
     logger.info("Starting trace collection (route=%s)...", route)
 
     # Cold start auto ADB launch: force-stop before trace, launch after

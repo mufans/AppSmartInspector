@@ -110,7 +110,7 @@ def orchestrator_node(state: AgentState) -> dict:
         get_tracker().record_from_message("orchestrator", response)
         raw = response.content.strip().lower()
     except Exception as e:
-        print(f"  [orchestrator] LLM call failed: {e}", flush=True)
+        logger.error("LLM call failed: %s", e)
         raw = ""
 
     # Extract valid label
@@ -150,6 +150,31 @@ def orchestrator_node(state: AgentState) -> dict:
             # Re-route to dedicated startup analysis pipeline
             decision = RouteDecision.STARTUP
             logger.info("Detected startup analysis intent, routing to startup analyzer")
+
+    # Bug 2: startup route requires a package name for cold start ADB launch
+    if decision == RouteDecision.STARTUP:
+        target = state.get("trace_target_process", "")
+        if not target:
+            # Try reading from perfetto config via WS server
+            try:
+                from smartinspector.commands.trace import _get_perfetto_config
+                pc = _get_perfetto_config()
+                target = pc.get("target_process", "")
+            except Exception:
+                pass
+        if not target:
+            fallback_msg = (
+                "冷启动分析需要指定目标应用包名。请先通过以下方式设置：\n"
+                "  /config target_process com.xxx.xxx\n"
+                "或者在命令中指定包名：\n"
+                "  /full com.xxx.xxx\n"
+                "  分析冷启动 com.xxx.xxx"
+            )
+            return {
+                "messages": [AIMessage(content=fallback_msg)],
+                "_route": RouteDecision.END,
+                **_pass_through(state),
+            }
 
     return {"messages": [], "_route": decision, "skip_wait": skip_wait, **_pass_through(state)}
 

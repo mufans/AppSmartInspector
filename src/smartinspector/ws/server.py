@@ -257,15 +257,15 @@ class SIServer:
         try:
             self._loop.run_until_complete(_serve())
         except OSError as e:
-            print(f"  [ws] Failed to start: {e}")
+            logger.error("WS server failed to start: %s", e)
         except Exception as e:
-            print(f"  [ws] Unexpected error: {e}")
+            logger.error("WS server unexpected error: %s", e)
 
     async def _handler(self, ws) -> None:
         self._connections.add(ws)
         self._connection_event.set()  # signal app connection
         remote = ws.remote_address if hasattr(ws, "remote_address") else "?"
-        print(f"  [ws] App connected: {remote}")
+        logger.info("App connected: %s", remote)
         debug_log("ws", f"App connected: {remote}")
         try:
             async for raw in ws:
@@ -279,7 +279,7 @@ class SIServer:
             pass
         finally:
             self._connections.discard(ws)
-            print(f"  [ws] App disconnected: {remote}")
+            logger.info("App disconnected: %s", remote)
             debug_log("ws", f"App disconnected: {remote}")
 
     async def _dispatch(self, ws, msg: dict) -> None:

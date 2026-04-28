@@ -4,11 +4,14 @@ Uses WS (via adb forward) for config sync with the app.
 """
 
 import json
+import logging
 import re
 import subprocess
 
 from smartinspector.ws.server import SIServer
 from smartinspector.config import get_ws_port
+
+logger = logging.getLogger(__name__)
 
 # Valid Java identifier pattern (allows dots for FQN, $ for inner classes)
 _SAFE_IDENTIFIER_RE = re.compile(r'^[A-Za-z_$][\w.$]*$')
@@ -28,7 +31,7 @@ def _ensure_server(state: dict) -> SIServer:
             )
             print(f"  WS server started, adb forward tcp:{port} → tcp:{port}")
         except Exception as e:
-            print(f"  Warning: adb forward failed: {e}")
+            logger.warning("adb forward failed: %s", e)
     return server
 
 
