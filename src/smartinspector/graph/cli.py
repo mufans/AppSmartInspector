@@ -25,6 +25,10 @@ def main():
         datefmt='%H:%M:%S',
     )
 
+    # Silence noisy third-party loggers
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
+
     parser = argparse.ArgumentParser(description="SmartInspector CLI")
     parser.add_argument("--source-dir", default="", help="Source code directory for attribution search")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to reports/debug_*.log")

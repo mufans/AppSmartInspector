@@ -4,7 +4,7 @@ from smartinspector.commands.device import cmd_devices, cmd_connect, cmd_status,
 from smartinspector.commands.trace import cmd_trace, cmd_record, cmd_analyze, cmd_frame, cmd_open, cmd_close
 from smartinspector.commands.hook import cmd_config, cmd_hooks, cmd_hook, cmd_debug
 from smartinspector.commands.session import cmd_help, cmd_clear, cmd_summary, cmd_tokens
-from smartinspector.commands.orchestrate import cmd_full, cmd_report
+from smartinspector.commands.orchestrate import cmd_full, cmd_startup, cmd_report
 from smartinspector.commands.compare import cmd_compare
 from smartinspector.commands.quick import cmd_quick
 
@@ -29,6 +29,7 @@ SLASH_COMMANDS = {
     "/summary": cmd_summary,
     "/tokens": cmd_tokens,
     "/full": cmd_full,
+    "/startup": cmd_startup,
     "/report": cmd_report,
     "/compare": cmd_compare,
     "/quick": cmd_quick,

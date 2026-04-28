@@ -1,8 +1,11 @@
-"""Orchestration commands: /full, /report."""
+"""Orchestration commands: /full, /startup, /report."""
 
 import json
 import datetime
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 
 def _build_report_header(perf_json: str, trace_path: str = "") -> str:
@@ -181,6 +184,64 @@ def cmd_full(args: str, state: dict) -> dict:
 
     return _stream_run(graph, state)
 
+
+
+def cmd_startup(args: str, state: dict) -> dict:
+    """Cold start analysis: force-stop app, record trace, launch app, analyze.
+
+    Routes through the LangGraph pipeline (collector → analyzer → startup)
+    with skip_wait=True and the dedicated startup route.
+
+    Usage: /startup [package_name]
+
+    Args:
+        package_name: Target app package name. If not provided, uses the
+                      value from /config target_process or --target.
+    """
+    from smartinspector.graph import create_graph, _stream_run
+
+    # Parse package name from args
+    tokens = args.split() if args else []
+    package_name = ""
+    for t in tokens:
+        if not t.startswith("-") and "." in t:
+            package_name = t
+            break
+
+    if package_name:
+        state["trace_target_process"] = package_name
+        logger.info("Startup target package: %s", package_name)
+    else:
+        # Fall back to existing config
+        package_name = state.get("trace_target_process", "")
+        if not package_name:
+            try:
+                from smartinspector.commands.trace import _get_perfetto_config
+                pc = _get_perfetto_config()
+                package_name = pc.get("target_process", "")
+            except Exception:
+                pass
+
+    if not package_name:
+        print("冷启动分析需要指定目标应用包名。用法：")
+        print("  /startup com.xxx.xxx")
+        print("或先通过 /config target_process com.xxx.xxx 设置默认包名")
+        return state
+
+    # Set startup flags
+    state["skip_wait"] = True
+    state["trace_target_process"] = package_name
+
+    graph = create_graph()
+
+    # Route directly to startup pipeline
+    state["messages"] = state.get("messages", []) + [
+        {"role": "user", "content": f"分析冷启动 {package_name}"},
+    ]
+    state["_route"] = "startup"
+
+    logger.info("Starting cold start analysis for %s", package_name)
+    return _stream_run(graph, state)
 
 def cmd_report(args: str, state: dict) -> dict:
     """Generate a performance report from collected data.
