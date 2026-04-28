@@ -343,6 +343,7 @@ Orchestrator 通过 LLM 分类将用户请求路由到对应 Agent：
 - **性能解读** (`analyze`): "解读这份数据" / "分析一下刚才采集的数据" / "解读一下这个 perf_summary" → Perf Analyzer
 - **源码搜索** (`explorer`): "搜索 XXX 类源码" / "查看 LazyForEach 的实现" / "定位 DataManager.loadData 方法" → Code Explorer
 - **通用问答** (`end`): "什么是卡顿" / "怎么优化列表滑动" / "你好" → Fallback 回复
+- **指标追问** (`metric_qa`): "CPU 占用率怎么样" / "帧率怎么样" / "内存有没有泄漏" / "性能怎么样" → Metric QA（需要先完成分析）
 
 ## 报告示例
 

@@ -24,6 +24,7 @@ src/smartinspector/          # Main Python package (installed via hatchling)
   graph/                     # LangGraph orchestration
     nodes/                   #   Graph nodes (orchestrator, collector, attributor, reporter, ...)
       startup.py             #   Cold start analysis node
+      metric_qa.py           #   Natural language metric query node
       reporter/              #   Reporter sub-package
         formatter.py         #     format_perf_sections(), format_attribution_section()
         json_formatter.py    #     JSON structured report (CI/automation)
@@ -176,6 +177,7 @@ analyze        → collector → perf_analyzer
 explorer       → explorer
 trace          → collector → analyzer → END
 quick          → deterministic analysis (no LLM)
+metric_qa      → metric_qa node (natural language metric query, format: metric_qa:<id>)
 end            → END
 ```
 
@@ -251,6 +253,29 @@ uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--dura
 | `/status` | Show device and session status |
 | `/summary` | Show current trace summary |
 | `/tokens` | Show token usage stats |
+
+### Metric QA (自然语言指标问答)
+
+在已有 `perf_summary` 数据的基础上，用自然语言追问具体性能指标。支持 6 大类、20 个细粒度指标。
+
+**触发方式**：分析完成后，直接用自然语言提问：
+- "CPU 占用率怎么样" → `metric_qa:cpu`
+- "帧率怎么样" → `metric_qa:frame`
+- "内存有没有泄漏" → `metric_qa:heap`
+- "性能怎么样" → `metric_qa:overview`
+
+**支持的指标**：
+
+| 类别 | 指标 ID | 触发词 |
+|------|---------|--------|
+| CPU | `cpu`, `cpu_hotspot`, `sched`, `blocked` | cpu占用/热点/调度/阻塞 |
+| 内存 | `memory`, `heap` | 内存/RSS/堆/泄漏 |
+| UI | `frame`, `rv`, `view`, `compose`, `inflate`, `startup` | 帧率/列表/绘制/重组/布局/启动 |
+| IO | `io`, `network`, `db`, `image` | io/网络/数据库/图片 |
+| 系统 | `thread_state`, `sys`, `input` | 线程状态/系统/触摸 |
+| 总览 | `overview` | 性能总览 |
+
+**前置条件**：必须先通过 `/full`、`/trace`、`/analyze` 等命令完成分析。若无数据，提示用户先采集。
 
 ## Configuration
 
@@ -430,6 +455,21 @@ The Android app injects trace hooks that emit `SI$` prefixed slices into Perfett
 - Main branch: `master`
 - Branch naming: `feat/`, `fix/`, `hotfix/` prefixes
 - Commit format: Conventional commits (`feat(scope): description`, `fix(scope): description`)
+
+## Pre-Commit Checklist
+
+- **所有功能点改造完成后必须执行CLI命令验证**：`uv run smartinspector --help`，确保没有语法错误
+- 新增/修改的节点必须在graph中正确注册
+- prompt文件必须通过`load_prompt()`能正确加载
+- 更新CLAUDE.md和README.md
+
+## Logging Rules
+
+- **⛔ 所有 info/warning 日志必须使用 `logger.info()` / `logger.warning()`，禁止 `print()`**
+- `print()` 仅允许用于用户面向的交互式输出（CLI 提示、进度、表格）
+- debug 日志使用 `debug_log(category, message)`
+- error 日志使用 `logger.error()`
+- 每个模块开头：`import logging; logger = logging.getLogger(__name__)`
 
 ## Known Issues & Design Notes
 

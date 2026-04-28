@@ -17,6 +17,7 @@ from smartinspector.graph.nodes.collector import collector_node
 from smartinspector.graph.nodes.attributor import attributor_node
 from smartinspector.graph.nodes.reporter import reporter_node
 from smartinspector.graph.nodes.startup import startup_node
+from smartinspector.graph.nodes.metric_qa import metric_qa_node
 
 
 
@@ -41,6 +42,7 @@ def create_graph():
     builder.add_node("explorer", explorer_node)
     builder.add_node("fallback", fallback_node)
     builder.add_node("startup", startup_node)
+    builder.add_node("metric_qa", metric_qa_node)
     # Pipeline nodes
     builder.add_node("collector", collector_node)
     builder.add_node("analyzer", analyzer_node)
@@ -60,6 +62,7 @@ def create_graph():
             "explorer": "explorer",
             "fallback": "fallback",
             "collector": "collector",
+            "metric_qa": "metric_qa",
         },
     )
 
@@ -68,6 +71,7 @@ def create_graph():
     builder.add_edge("explorer", END)
     builder.add_edge("fallback", END)
     builder.add_edge("startup", END)
+    builder.add_edge("metric_qa", END)
 
     # Android expert: if perf_summary detected → continue pipeline, else END
     builder.add_conditional_edges(

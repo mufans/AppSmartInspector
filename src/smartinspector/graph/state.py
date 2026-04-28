@@ -21,6 +21,7 @@ class RouteDecision(str, Enum):
     END = "end"
     TRACE = "trace"              # /trace command: collector → analyzer
     QUICK = "quick"              # /quick command: deterministic, no LLM
+    METRIC_QA = "metric_qa"      # natural language metric query (format: metric_qa:<id>)
 
 
 class AgentState(TypedDict):
