@@ -141,16 +141,17 @@ def _compare_results(info_a: dict, info_b: dict, state: dict) -> dict:
     print("|------|--------------|--------------|------|")
 
     # Compare numeric metrics
+    # (key, display_name, higher_is_better)
     numeric_metrics = [
-        ("fps", "FPS", higher_is_better=True),
-        ("total_frames", "总帧数", higher_is_better=True),
-        ("jank_frames", "卡顿帧", higher_is_better=False),
-        ("cpu_usage_pct", "CPU%", higher_is_better=False),
-        ("peak_rss_mb", "峰值RSS (MB)", higher_is_better=False),
-        ("avg_rss_mb", "平均RSS (MB)", higher_is_better=False),
-        ("io_total_count", "IO操作数", higher_is_better=False),
-        ("total_heap_mb", "堆内存 (MB)", higher_is_better=False),
-        ("compose_recompositions", "Compose重组", higher_is_better=False),
+        ("fps", "FPS", True),
+        ("total_frames", "总帧数", True),
+        ("jank_frames", "卡顿帧", False),
+        ("cpu_usage_pct", "CPU%", False),
+        ("peak_rss_mb", "峰值RSS (MB)", False),
+        ("avg_rss_mb", "平均RSS (MB)", False),
+        ("io_total_count", "IO操作数", False),
+        ("total_heap_mb", "堆内存 (MB)", False),
+        ("compose_recompositions", "Compose重组", False),
     ]
 
     regressions = []

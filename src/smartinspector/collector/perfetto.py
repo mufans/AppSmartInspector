@@ -1,5 +1,7 @@
 """PerfettoCollector: adb collect -> SQL query -> unified JSON."""
 
+from __future__ import annotations
+
 import bisect
 import json
 import os
