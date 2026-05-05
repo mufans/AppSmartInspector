@@ -34,33 +34,96 @@ class StartupResult:
     def to_markdown(self) -> str:
         """Format startup analysis as markdown report."""
         lines = ["## 冷启动分析\n"]
-        lines.append(f"总耗时: {self.total_ms:.0f}ms\n")
-        lines.append("| 阶段 | 耗时 | 占比 |")
-        lines.append("|------|------|------|")
-        for phase in self.phases:
-            name = phase.get("name", "?")
-            dur = phase.get("dur_ms", 0)
-            pct = phase.get("pct", 0)
-            lines.append(f"| {name} | {dur:.0f}ms | {pct:.0f}% |")
 
+        # Overall assessment
+        total = self.total_ms
+        if total < 500:
+            assessment = "优秀 (< 500ms)"
+        elif total < 1000:
+            assessment = "良好 (500-1000ms)"
+        elif total < 2500:
+            assessment = "一般 (1000-2500ms)"
+        else:
+            assessment = "较慢 (> 2500ms)"
+
+        lines.append(f"**总耗时: {total:.0f}ms** — {assessment}\n")
+
+        # Phase breakdown table
+        if self.phases:
+            lines.append("### 启动阶段\n")
+            lines.append("| 阶段 | 耗时 | 占比 |")
+            lines.append("|------|------|------|")
+            for phase in self.phases:
+                name = phase.get("name", "?")
+                dur = phase.get("dur_ms", 0)
+                pct = phase.get("pct", 0)
+                lines.append(f"| {name} | {dur:.0f}ms | {pct:.0f}% |")
+
+        # Critical path — top slices by duration
         if self.critical_path:
-            lines.append("\n### 关键路径\n")
-            for item in self.critical_path[:10]:
+            lines.append("\n### 关键路径 (耗时最长的操作)\n")
+            top_slices = sorted(self.critical_path, key=lambda x: -x.get("dur_ms", 0))[:10]
+            for item in top_slices:
                 name = item.get("name", "?")
                 dur = item.get("dur_ms", 0)
-                lines.append(f"- **{name}** ({dur:.1f}ms)")
+                thread = item.get("thread_name", "")
+                thread_info = f" [{thread}]" if thread else ""
+                lines.append(f"- **{name}**{thread_info} — {dur:.1f}ms")
 
+        # Bottleneck analysis with root cause and suggestions
         if self.bottlenecks:
-            lines.append("\n### 关键瓶颈\n")
-            for bn in self.bottlenecks:
+            lines.append("\n### 瓶颈分析与优化建议\n")
+            for i, bn in enumerate(self.bottlenecks, 1):
                 phase = bn.get("phase", "?")
                 name = bn.get("name", "?")
                 dur = bn.get("dur_ms", 0)
-                lines.append(f"1. **{phase} — {name}** ({dur:.0f}ms)")
+                pct = bn.get("pct_of_phase", 0)
+                thread = bn.get("thread_name", "")
+
+                lines.append(f"{i}. **{name}**")
+                if thread:
+                    lines.append(f"   - 所在线程: `{thread}`")
+                lines.append(f"   - 阶段: {phase}，耗时 {dur:.1f}ms" +
+                             (f"（占该阶段 {pct:.0f}%）" if pct > 0 else ""))
                 if bn.get("suggestion"):
-                    lines.append(f"   - {bn['suggestion']}")
+                    lines.append(f"   - 建议: {bn['suggestion']}")
+        elif self.critical_path:
+            # Fallback: no bottleneck phases identified, but we have critical path
+            lines.append("\n### 耗时分析\n")
+            top_5 = sorted(self.critical_path, key=lambda x: -x.get("dur_ms", 0))[:5]
+            for item in top_5:
+                name = item.get("name", "?")
+                dur = item.get("dur_ms", 0)
+                suggestion = self._suggest_optimization_static(name)
+                lines.append(f"- **{name}** — {dur:.1f}ms")
+                if suggestion:
+                    lines.append(f"  - 建议: {suggestion}")
+
+        # Performance summary
+        lines.append("\n### 总结\n")
+        if total < 500:
+            lines.append("冷启动性能优秀，无明显瓶颈。")
+        elif total < 1000:
+            if self.bottlenecks:
+                top_bn = self.bottlenecks[0]
+                lines.append(f"冷启动性能良好，主要耗时在 **{top_bn.get('name', '未知')}** "
+                             f"({top_bn.get('dur_ms', 0):.0f}ms)。")
+            else:
+                lines.append("冷启动性能良好，建议关注耗时最长的操作。")
+        elif total < 2500:
+            lines.append(f"冷启动性能一般（{total:.0f}ms），建议优化上述瓶颈操作。")
+        else:
+            lines.append(f"冷启动较慢（{total:.0f}ms），建议重点优化耗时最长的阶段。")
+            if self.bottlenecks:
+                top_names = [bn["name"] for bn in self.bottlenecks[:3]]
+                lines.append(f"优先优化: {', '.join(top_names)}")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _suggest_optimization_static(slice_name: str) -> str:
+        """Generate optimization suggestion based on slice type (static version)."""
+        return StartupAnalyzer._suggest_optimization(slice_name)
 
 
 class StartupAnalyzer:
@@ -304,28 +367,37 @@ class StartupAnalyzer:
         if process_start <= 0:
             return []
 
+        # Resolve target process upid for filtering
+        from smartinspector.collector.perfetto import PerfettoCollector
+        collector = PerfettoCollector(self.trace_path, target_process=self.target_process)
+        target_info = collector._resolve_target_process(self.target_process)
+        upid = target_info.get("upid") if target_info else None
+
         try:
+            # Query slices on main thread (or any thread in target process)
+            upid_filter = f"AND t.upid = {upid}" if upid else ""
             rows = tp.query(f"""
-                SELECT s.name, s.ts, s.dur
+                SELECT s.name, s.ts, s.dur, t.name as thread_name
                 FROM slice s
                 JOIN thread_track tt ON s.track_id = tt.id
                 JOIN thread t ON tt.utid = t.utid
                 WHERE s.ts >= {process_start}
                   AND s.ts < {end_bound}
                   AND s.dur > 0
-                  AND (s.name LIKE 'SI$%' OR s.name LIKE '%doFrame%')
+                  {upid_filter}
                 ORDER BY s.dur DESC
-                LIMIT 20
+                LIMIT 30
             """)
 
             critical_path = []
             for r in rows:
                 dur_ms = r.dur / 1_000_000 if r.dur else 0
-                if dur_ms >= 1.0:
+                if dur_ms >= 0.5:
                     critical_path.append({
                         "name": r.name,
                         "ts_ns": r.ts,
                         "dur_ms": dur_ms,
+                        "thread_name": r.thread_name if hasattr(r, "thread_name") else "",
                     })
 
             return sorted(critical_path, key=lambda x: x["ts_ns"])
@@ -348,10 +420,6 @@ class StartupAnalyzer:
             phase_end = phase.get("end_ns", 0)
             phase_dur = phase.get("dur_ms", 0)
 
-            # Skip short phases
-            if phase_dur < 50:
-                continue
-
             # Find slices within this phase
             phase_slices = [
                 s for s in critical_path
@@ -361,18 +429,34 @@ class StartupAnalyzer:
             if not phase_slices:
                 continue
 
-            # Find the slowest slice in this phase
-            slowest = max(phase_slices, key=lambda x: x.get("dur_ms", 0))
-            suggestion = self._suggest_optimization(slowest.get("name", ""))
+            # Top 3 slowest slices in this phase
+            top_slices = sorted(phase_slices, key=lambda x: -x.get("dur_ms", 0))[:3]
+            for s in top_slices:
+                suggestion = self._suggest_optimization(s.get("name", ""))
+                bottlenecks.append({
+                    "phase": phase_name,
+                    "name": s["name"],
+                    "dur_ms": s["dur_ms"],
+                    "phase_dur_ms": phase_dur,
+                    "pct_of_phase": s["dur_ms"] / phase_dur * 100 if phase_dur > 0 else 0,
+                    "suggestion": suggestion,
+                    "thread_name": s.get("thread_name", ""),
+                })
 
-            bottlenecks.append({
-                "phase": phase_name,
-                "name": slowest["name"],
-                "dur_ms": slowest["dur_ms"],
-                "phase_dur_ms": phase_dur,
-                "pct_of_phase": slowest["dur_ms"] / phase_dur * 100 if phase_dur > 0 else 0,
-                "suggestion": suggestion,
-            })
+        # If no phases but have critical_path, report top slices directly
+        if not phases and critical_path:
+            top_slices = sorted(critical_path, key=lambda x: -x.get("dur_ms", 0))[:5]
+            for s in top_slices:
+                suggestion = self._suggest_optimization(s.get("name", ""))
+                bottlenecks.append({
+                    "phase": "启动阶段",
+                    "name": s["name"],
+                    "dur_ms": s["dur_ms"],
+                    "phase_dur_ms": 0,
+                    "pct_of_phase": 0,
+                    "suggestion": suggestion,
+                    "thread_name": s.get("thread_name", ""),
+                })
 
         return sorted(bottlenecks, key=lambda x: -x.get("dur_ms", 0))
 
