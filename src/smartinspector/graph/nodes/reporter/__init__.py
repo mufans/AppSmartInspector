@@ -18,21 +18,12 @@ def reporter_node(state: AgentState) -> dict:
     """Generate the final performance report using LLM with streaming output."""
     from smartinspector.prompts import load_prompt
     from smartinspector.commands.orchestrate import _build_report_header
-    from smartinspector.graph.state import RouteDecision
 
     report_prompt = load_prompt("report-generator")
 
     perf_json = state.get("perf_summary", "")
     perf_analysis = state.get("perf_analysis", "")
     attribution_result = state.get("attribution_result", "")
-    route = state.get("_route", "")
-
-    is_startup = route in (RouteDecision.STARTUP, RouteDecision.STARTUP.value)
-
-    # Startup mode: perf_analysis already contains the structured startup report
-    # from startup_node. Append attribution data to it instead of regenerating.
-    if is_startup and perf_analysis:
-        return _startup_report(state, perf_analysis, perf_json, attribution_result)
 
     # Build user content with all available data
     # IMPORTANT: attribution section MUST come first (before header/analysis)
@@ -128,55 +119,3 @@ def reporter_node(state: AgentState) -> dict:
         "attribution_result": attribution_result,
     }
 
-
-def _startup_report(
-    state: AgentState,
-    startup_report: str,
-    perf_json: str,
-    attribution_result: str,
-) -> dict:
-    """Build report for startup route: keep startup analysis, append attribution."""
-    from smartinspector.commands.orchestrate import _build_report_header
-
-    print("\n  [reporter] Generating startup report...", flush=True)  # noqa: LOG
-
-    parts: list[str] = [startup_report]
-
-    # Append attribution sections (format_attribution_section includes its own headers)
-    attr_sections = format_attribution_section(attribution_result)
-    if attr_sections:
-        parts.extend(attr_sections)
-
-    # Build header from perf_summary if available
-    header_md = ""
-    if perf_json:
-        trace_path = state.get("_trace_path", "")
-        header_md = _build_report_header(perf_json, trace_path)
-
-    complete_report = (header_md + "\n" + "\n".join(parts)) if header_md else "\n".join(parts)
-
-    # Save report to file
-    report_path = save_report(complete_report)
-    if report_path:
-        complete_report += f"\n\n---\n报告已保存至: {report_path}"
-
-    # Auto-save analysis result
-    try:
-        from smartinspector.storage.store import save_analysis_result
-        analysis_path = save_analysis_result(
-            perf_summary=perf_json,
-            perf_analysis=startup_report,
-            attribution_result=attribution_result,
-            trace_path=state.get("_trace_path", ""),
-        )
-        info_log("reporter", f"Auto-saved analysis result for comparison: {analysis_path}")
-    except Exception as e:
-        debug_log("reporter", f"Auto-save analysis result failed: {e}")
-
-    return {
-        "messages": [AIMessage(content=complete_report)],
-        "perf_summary": perf_json,
-        "perf_analysis": startup_report,
-        "attribution_data": state.get("attribution_data", ""),
-        "attribution_result": attribution_result,
-    }
