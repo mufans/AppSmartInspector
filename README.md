@@ -31,7 +31,7 @@ cp .env.example .env
 # 编辑 .env: SI_API_KEY=your-api-key
 
 # 启动 CLI（自动检查 adb/API key，启动 WS server + adb reverse）
-uv run smartinspector --source-dir /path/to/your/app/source
+uv run smartinspector --src /path/to/your/app/source
 
 # adb连接手机
 
@@ -52,7 +52,7 @@ you> /open
 
 ```bash
 # 分析已有 trace 文件，输出 JSON 报告到 stdout
-uv run smartinspector --ci --trace trace.pb --format json --source-dir ./app/src
+uv run smartinspector --ci --trace trace.pb --format json --src ./app/src
 
 # 从设备采集 trace 并生成 Markdown 报告到文件
 uv run smartinspector --ci --target com.example.app --duration 5000 --output report.md
@@ -296,7 +296,7 @@ uv run smartinspector --ci [选项]
 | `--duration <ms>` | 采集时长（默认 10000ms） |
 | `--output <path>` | 输出文件路径 |
 | `--format markdown\|json` | 报告格式（默认 markdown） |
-| `--source-dir <path>` | 源码目录 |
+| `--src <path>` | 源码目录 |
 | `--debug` | 启用 debug 日志 |
 
 ### Slash 命令
