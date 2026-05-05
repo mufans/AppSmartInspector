@@ -145,6 +145,9 @@ def _extract_caller_from_stack(stack_trace: list[str], target_class: str) -> str
         if "." not in method and "/" not in method:
             return method
     return ""
+
+
+def extract_class(name: str) -> str:
     """Extract simple class name from an SI$ tag.
 
     Formats (with fully-qualified class names from getName()):
