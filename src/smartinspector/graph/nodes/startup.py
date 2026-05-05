@@ -21,6 +21,7 @@ def startup_node(state: AgentState) -> dict:
     target_process = state.get("trace_target_process", "") or None
 
     info_log("startup", f"Running cold start analysis on {trace_path}")
+    print("  [startup] Analyzing cold start phases...", flush=True)  # noqa: LOG — user-facing progress
 
     analyzer = StartupAnalyzer(trace_path, target_process=target_process)
     result = analyzer.analyze()

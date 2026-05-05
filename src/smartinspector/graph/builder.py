@@ -70,7 +70,7 @@ def create_graph():
     builder.add_edge("perf_analyzer", END)
     builder.add_edge("explorer", END)
     builder.add_edge("fallback", END)
-    builder.add_edge("startup", END)
+    builder.add_edge("startup", "attributor")
     builder.add_edge("metric_qa", END)
 
     # Android expert: if perf_summary detected → continue pipeline, else END
