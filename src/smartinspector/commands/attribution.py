@@ -114,7 +114,37 @@ def _extract_method_from_stack(stack_trace: list[str]) -> str:
     return method
 
 
-def extract_class(name: str) -> str:
+def _extract_caller_from_stack(stack_trace: list[str], target_class: str) -> str:
+    """Find the method in target_class that called the anonymous class.
+
+    Walks the stack from bottom (outermost caller) to top (innermost),
+    looking for frames from target_class that are NOT the anonymous
+    class itself (i.e. no $ in the class part).
+
+    Returns the method name, e.g. "loadAndDisplayItems".
+    """
+    if not stack_trace or not target_class:
+        return ""
+    for frame in reversed(stack_trace):
+        # Format: "at com.example.ClassName.method(File.java:42)"
+        # or "at com.example.ClassName$1.run(File.java:52)"
+        if target_class + "." not in frame:
+            continue
+        # Skip anonymous inner class frames ($N)
+        if f"{target_class}$" in frame:
+            continue
+        # Extract method from this frame
+        paren = frame.rfind("(")
+        if paren < 0:
+            continue
+        before_paren = frame[:paren]
+        dot = before_paren.rfind(".")
+        if dot < 0:
+            continue
+        method = before_paren[dot + 1:]
+        if "." not in method and "/" not in method:
+            return method
+    return ""
     """Extract simple class name from an SI$ tag.
 
     Formats (with fully-qualified class names from getName()):
@@ -532,6 +562,15 @@ def _attach_block_stacks(attributable: list[dict], block_events: list[dict]) -> 
                     stack_method = _extract_method_from_stack(stack)
                     if stack_method and stack_method != enclosing:
                         method_name = stack_method
+            elif method_name == "unknown" and stack:
+                # Pure anonymous class ($1, $2) with no enclosing method in FQN.
+                # Walk the stack trace to find the caller from the same class
+                # (e.g. stack has "at MainActivity.loadAndDisplayItems" which
+                # is the method that created this anonymous class).
+                caller = _extract_caller_from_stack(stack, class_name)
+                if caller:
+                    context_method = caller
+                    method_name = "run"  # anonymous inner class executes run()
 
         key = f"{class_name}.{method_name}"
 
