@@ -531,7 +531,13 @@ public class TraceHook {
                             : (Context) cf.thisObject;
                     layoutName = ctx.getResources().getResourceEntryName(layoutResId);
                 } catch (Exception e) {
-                    layoutName = "0x" + Integer.toHexString(layoutResId);
+                    // Fallback: try system resources for android.R layouts
+                    try {
+                        layoutName = android.content.res.Resources.getSystem()
+                                .getResourceEntryName(layoutResId);
+                    } catch (Exception e2) {
+                        layoutName = "0x" + Integer.toHexString(layoutResId);
+                    }
                 }
                 String parentClass = parent != null ? parent.getClass().getSimpleName() : "null";
                 if (!enterTrace()) return;
