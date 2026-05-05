@@ -6,7 +6,12 @@ import json
 def format_perf_sections(perf_json: str) -> list[str]:
     """Build user-facing markdown sections from perf JSON.
 
-    Returns a list of markdown strings to include in the LLM prompt.
+    Section ordering follows CLAUDE.md priority to survive truncation:
+      1. 预计算结论 (deterministic hints)
+      2. 线程状态分析 (thread state)
+      3. 帧时间线 (frame timeline)
+      4. 自定义切片统计 (view slices summary)
+      5. IO操作分析 / Compose重组分析
     """
     user_parts: list[str] = []
 
@@ -23,42 +28,8 @@ def format_perf_sections(perf_json: str) -> list[str]:
     except Exception:
         perf_data = {}
 
-    # Frame timeline detail
-    ft = perf_data.get("frame_timeline", {})
-    _total_frames = ft.get("total_frames", 0) if ft else 0
-    _avg_fps = ft.get("fps", 0) if ft else 0
-    _jank_frames = ft.get("jank_frames", 0) if ft else 0
-    if ft and _total_frames > 0:
-        ft_lines = ["## 帧时间线\n"]
-        ft_lines.append(f"FPS: {_avg_fps:.1f}, 总帧数: {_total_frames}, 卡顿帧: {_jank_frames}")
-        jank_types = ft.get("jank_types", [])
-        if jank_types:
-            ft_lines.append(f"卡顿类型: {', '.join(jank_types)}")
-        slowest = ft.get("slowest_frames", [])
-        if slowest:
-            ft_lines.append("最慢帧 (Top 5):")
-            for f in slowest[:5]:
-                idx = f.get("frame_index", "?")
-                dur = f.get("dur_ms", 0)
-                jts = ", ".join(f.get("jank_types", []))
-                ft_lines.append(f"  帧#{idx}: {dur:.1f}ms" + (f" [{jts}]" if jts else ""))
-        user_parts.append("\n".join(ft_lines))
-
-    # View slices summary (top 10 only, compact)
-    vs = perf_data.get("view_slices", {})
-    if vs:
-        vs_summary = vs.get("summary", [])
-        if vs_summary:
-            vs_lines = ["## 自定义切片统计 (Top 10)\n"]
-            for s in sorted(vs_summary, key=lambda x: -x.get("total_ms", 0))[:10]:
-                name = s.get("name", "")
-                if not name.startswith("SI$"):
-                    continue
-                vs_lines.append(f"- {name}: {s.get('count', 0)}次, 最大{s.get('max_ms', 0):.3f}ms, 总{s.get('total_ms', 0):.3f}ms")
-            if len(vs_lines) > 1:
-                user_parts.append("\n".join(vs_lines))
-
     # Thread state analysis — Running vs Sleeping vs DiskSleep with blocking details
+    # Priority 2: must appear before frame timeline to survive truncation
     thread_states = perf_data.get("thread_state", [])
     if thread_states:
         ts_lines = ["## 线程状态分析\n"]
@@ -101,6 +72,43 @@ def format_perf_sections(perf_json: str) -> list[str]:
                 ts_lines.append(f"- {short} ({dur:.1f}ms): Running {running_pct:.0f}%")
 
         user_parts.append("\n".join(ts_lines))
+
+    # Frame timeline detail
+    # Priority 3
+    ft = perf_data.get("frame_timeline", {})
+    _total_frames = ft.get("total_frames", 0) if ft else 0
+    _avg_fps = ft.get("fps", 0) if ft else 0
+    _jank_frames = ft.get("jank_frames", 0) if ft else 0
+    if ft and _total_frames > 0:
+        ft_lines = ["## 帧时间线\n"]
+        ft_lines.append(f"FPS: {_avg_fps:.1f}, 总帧数: {_total_frames}, 卡顿帧: {_jank_frames}")
+        jank_types = ft.get("jank_types", [])
+        if jank_types:
+            ft_lines.append(f"卡顿类型: {', '.join(jank_types)}")
+        slowest = ft.get("slowest_frames", [])
+        if slowest:
+            ft_lines.append("最慢帧 (Top 5):")
+            for f in slowest[:5]:
+                idx = f.get("frame_index", "?")
+                dur = f.get("dur_ms", 0)
+                jts = ", ".join(f.get("jank_types", []))
+                ft_lines.append(f"  帧#{idx}: {dur:.1f}ms" + (f" [{jts}]" if jts else ""))
+        user_parts.append("\n".join(ft_lines))
+
+    # View slices summary (top 10 only, compact)
+    # Priority 4
+    vs = perf_data.get("view_slices", {})
+    if vs:
+        vs_summary = vs.get("summary", [])
+        if vs_summary:
+            vs_lines = ["## 自定义切片统计 (Top 10)\n"]
+            for s in sorted(vs_summary, key=lambda x: -x.get("total_ms", 0))[:10]:
+                name = s.get("name", "")
+                if not name.startswith("SI$"):
+                    continue
+                vs_lines.append(f"- {name}: {s.get('count', 0)}次, 最大{s.get('max_ms', 0):.3f}ms, 总{s.get('total_ms', 0):.3f}ms")
+            if len(vs_lines) > 1:
+                user_parts.append("\n".join(vs_lines))
 
     # IO slices summary (network / database / image)
     io_slices = perf_data.get("io_slices", {})
@@ -214,6 +222,8 @@ def format_attribution_section(attribution_result: str) -> list[str]:
                 type_tag = " [数据库IO]"
             elif raw_name.startswith("SI$img#"):
                 type_tag = " [图片加载]"
+            elif raw_name.startswith("CPU$hotspot#"):
+                type_tag = " [CPU热点]"
             elif r.get("method_name") == "inflate":
                 type_tag = " [XML布局]"
             if r.get("count", 0) > 1:

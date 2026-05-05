@@ -99,7 +99,7 @@ class _FileCache:
 
 def _get_llm():
     """Get LLM with bound tools (singleton, thread-safe)."""
-    global _llm_with_tools, _system_prompt, _structured_llm
+    global _llm_with_tools, _system_prompt
     if _llm_with_tools is not None:
         return _llm_with_tools, _system_prompt
     with _llm_lock:
@@ -107,26 +107,13 @@ def _get_llm():
             return _llm_with_tools, _system_prompt
         llm = ChatOpenAI(**get_llm_kwargs(role="attributor", temperature=0))
         _llm_with_tools = llm.bind_tools([grep, glob, read])
-        # Test structured output support — some providers (e.g. DeepSeek) don't
-        # support response_format, so we probe once and cache the result.
-        _structured_llm = llm.with_structured_output(AttributionResponse)
         _system_prompt = load_prompt("attributor")
-        # Probe structured output support with a realistic multi-turn request.
-        # A trivial "test" message can succeed on some providers that then fail
-        # on real multi-turn tool-call conversations (e.g. DeepSeek returns
-        # "This response_format type is unavailable now" intermittently).
+        # Skip structured output entirely — with_structured_output uses
+        # response_format which activates DeepSeek's thinking mode, causing
+        # reasoning_content errors on subsequent calls. Text parsing fallback
+        # works reliably for all providers.
         global _structured_ok
-        try:
-            probe_messages = [
-                SystemMessage(content=_system_prompt),
-                HumanMessage(content="1. TestClass.testMethod (10.00ms, java)\n\n按 Glob→Grep→Read 搜索，输出 RESULT 行。"),
-                AIMessage(content="RESULT: TestClass.testMethod | found | /tmp/Test.java | 1-5 | test"),
-            ]
-            _structured_llm.invoke(probe_messages)
-            _structured_ok = True
-        except Exception as e:
-            _structured_ok = False
-            debug_log("attributor", f"structured output not supported ({e}), will use text parsing fallback")
+        _structured_ok = False
     return _llm_with_tools, _system_prompt
 
 
@@ -747,34 +734,11 @@ def _search_group(group: list[dict], file_cache: _FileCache, on_progress=None) -
                 # Skip any leading ToolMessages that lost their AIMessage context
                 while len(trimmed) > 2 and isinstance(trimmed[2], ToolMessage):
                     trimmed.pop(2)
-                # DeepSeek thinking mode: strip reasoning_content from trimmed AIMessages
-                # to avoid "reasoning_content must be passed back" errors
-                cleaned = []
-                for msg in trimmed:
-                    if isinstance(msg, AIMessage) and hasattr(msg, 'reasoning_content'):
-                        # Reconstruct without reasoning_content
-                        cleaned.append(AIMessage(
-                            content=msg.content,
-                            tool_calls=msg.tool_calls if hasattr(msg, 'tool_calls') else [],
-                            id=msg.id,
-                        ))
-                    else:
-                        cleaned.append(msg)
-                messages = cleaned
+                messages = trimmed
 
             debug_log("attributor", f"iteration {iteration}: invoking LLM ({len(messages)} messages)...")
             response = llm.invoke(messages)
             debug_log("attributor", f"iteration {iteration}: LLM responded")
-
-            # DeepSeek thinking mode: strip reasoning_content from response
-            # to prevent "reasoning_content must be passed back" errors on
-            # subsequent calls (the trimmed message history won't contain it)
-            if hasattr(response, 'reasoning_content') and response.reasoning_content:
-                response = AIMessage(
-                    content=response.content,
-                    tool_calls=response.tool_calls if hasattr(response, 'tool_calls') else [],
-                    id=response.id,
-                )
 
             # Record token usage
             get_tracker().record_from_message("attributor", response)

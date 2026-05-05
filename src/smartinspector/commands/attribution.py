@@ -973,6 +973,68 @@ def extract_attributable_slices(perf_summary_json: str, min_dur_ms: float = 1.0)
     # Remove entries marked as system classes by block event matching
     attributable = [e for e in attributable if not e.get("_system")]
 
+    # ── CPU hotspots: extract from cpu_hotspots (perf_sample stack profiles) ──
+    # These are function-level CPU usage from stack sampling, not SI$ slices.
+    cpu_hotspots = data.get("cpu_hotspots", [])
+    existing_keys = {f"{e['class_name']}.{e['method_name']}" for e in attributable}
+    for hs in cpu_hotspots:
+        if hs.get("error"):
+            continue
+        func = hs.get("function", "")
+        if not func or func.startswith("/") or func.startswith("[") or "::" in func:
+            continue  # Skip native/library/C++ functions
+
+        # Parse function name: "com.example.ClassName.method" -> (ClassName, method)
+        parts = func.rsplit(".", 1)
+        if len(parts) != 2:
+            continue
+        class_path, method = parts
+
+        # Get simple class name from FQN
+        simple_class = class_path.rsplit(".", 1)[-1] if "." in class_path else class_path
+
+        # Skip system classes by prefix
+        if any(class_path.startswith(p) for p in _SYSTEM_PREFIXES):
+            continue
+        # Skip known system class patterns
+        if simple_class in _SYSTEM_CLASS_PATTERNS:
+            continue
+
+        pct = hs.get("pct", 0)
+        if pct < 3:
+            continue  # Only include significant hotspots (>3% CPU)
+
+        # Skip if already attributed via SI$ slices (more precise timing)
+        key = f"{simple_class}.{method}"
+        if key in existing_keys:
+            continue
+
+        # Estimate dur_ms from CPU percentage (assuming ~10s trace)
+        estimated_ms = pct * 100
+
+        entry = {
+            "raw_name": f"CPU$hotspot#{class_path}.{method}",
+            "class_name": simple_class,
+            "method_name": method,
+            "dur_ms": estimated_ms,
+            "type": "cpu_hotspot",
+            "search_type": "java",
+            "instance": None,
+            "count": hs.get("samples", 0),
+            "total_ms": estimated_ms,
+        }
+
+        # Add callchain context for the LLM
+        callchain = hs.get("callchain", [])
+        if callchain:
+            entry["call_context"] = " → ".join(
+                n.rsplit(".", 1)[-1] if "." in n else n
+                for n in callchain[:5]
+            )
+
+        attributable.append(entry)
+        existing_keys.add(key)
+
     # Filter by minimum duration threshold
     attributable = [e for e in attributable if e["dur_ms"] >= min_dur_ms]
 

@@ -1353,13 +1353,48 @@ class PerfettoCollector:
         return results
 
     def _resolve_main_utid(self, tp) -> int | None:
-        """Resolve the main thread's utid from the thread table."""
+        """Resolve the main thread's utid from the thread table.
+
+        Tries multiple strategies:
+          1. Thread named 'main'
+          2. Thread named after the target package (common on Android)
+          3. Thread with the lowest tid in the target process (main thread is always tid 1 in-process)
+        """
+        # Strategy 1: name = 'main'
         try:
             rows = tp.query("SELECT utid FROM thread WHERE name = 'main' LIMIT 1")
             for r in rows:
                 return r.utid
         except Exception as e:
-            debug_log("perfetto", f"thread_state: main thread query failed: {e}")
+            debug_log("perfetto", f"thread_state: strategy 1 (name=main) failed: {e}")
+
+        # Strategy 2: thread named after target package
+        if self._target_package:
+            try:
+                rows = tp.query(f"SELECT utid FROM thread WHERE name = '{self._target_package}' LIMIT 1")
+                for r in rows:
+                    return r.utid
+            except Exception:
+                pass
+
+        # Strategy 3: lowest-tid thread in target process
+        proc = self._resolve_target_process()
+        upid = proc.get("upid")
+        if upid is not None:
+            try:
+                rows = tp.query(f"""
+                    SELECT t.utid FROM thread t
+                    JOIN process p ON t.upid = p.upid
+                    WHERE t.upid = {upid}
+                    ORDER BY t.tid ASC
+                    LIMIT 1
+                """)
+                for r in rows:
+                    return r.utid
+            except Exception as e:
+                debug_log("perfetto", f"thread_state: strategy 3 (lowest tid) failed: {e}")
+
+        debug_log("perfetto", "thread_state: could not resolve main thread utid")
         return None
 
     def _check_intrinsic_thread_state(self, tp) -> bool:
@@ -1559,9 +1594,10 @@ class PerfettoCollector:
         # Metadata
         tp = self._open()
         try:
-            meta = tp.query("SELECT key, str_value FROM metadata")
+            meta = tp.query("SELECT name, str_value FROM metadata")
             for r in meta:
-                summary.metadata[r.key] = r.str_value
+                val = r.str_value if hasattr(r, 'str_value') else ""
+                summary.metadata[r.name] = val
         except Exception as e:
             debug_log("perfetto", f"Metadata query failed: {e}")
 

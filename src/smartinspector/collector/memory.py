@@ -18,8 +18,14 @@ def collect_heap_graph_analysis(tp, target_upid: int | None = None) -> dict:
     """
     result: dict = {}
 
-    # 1. Java heap object statistics — top 20 classes by total size
+    # Pre-check: if heap_graph_object table doesn't exist, skip all queries
     upid_filter = f"AND o.upid = {target_upid}" if target_upid else ""
+    try:
+        tp.query("SELECT 1 FROM heap_graph_object LIMIT 1")
+    except Exception:
+        return result  # No heap dump data in this trace
+
+    # 1. Java heap object statistics — top 20 classes by total size
     try:
         rows = tp.query(f"""
             SELECT
