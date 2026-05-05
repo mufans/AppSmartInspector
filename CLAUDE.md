@@ -206,7 +206,7 @@ end            → END
 ### CLI Mode (Headless/CI)
 
 ```
-uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--duration 10000] [--output report.json] [--format json|markdown] [--source-dir ./src] [--debug] [--cmd full_analysis]
+uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--duration 10000] [--output report.json] [--format json|markdown] [--src ./src] [--debug] [--cmd full_analysis]
 ./scripts/si.sh --ci --trace trace.pb --target com.example.app
 ```
 

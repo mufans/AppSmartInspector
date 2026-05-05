@@ -22,7 +22,7 @@ def main():
     logging.disable(logging.CRITICAL)
 
     parser = argparse.ArgumentParser(description="SmartInspector CLI")
-    parser.add_argument("--source-dir", default="", help="Source code directory for attribution search")
+    parser.add_argument("--src", "--source-dir", default="", dest="source_dir", help="Source code directory for attribution search")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to reports/debug_*.log")
     parser.add_argument("--ci", action="store_true", help="Non-interactive CI mode: run pipeline and exit")
     parser.add_argument("--target", default="", help="Target process package name (CI mode)")
@@ -72,7 +72,7 @@ def main():
     if args.source_dir:
         print(f"Source dir: {get_source_dir()}")
     else:
-        print(f"Source dir: {get_source_dir()} (use --source-dir or /config source_dir <path> to change)")
+        print(f"Source dir: {get_source_dir()} (use --src or /config source_dir <path> to change)")
     print("Type /help for commands, 'quit' or Ctrl+C to exit\n")
 
     # Check prerequisites
