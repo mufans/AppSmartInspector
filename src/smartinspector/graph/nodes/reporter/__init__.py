@@ -18,12 +18,16 @@ def reporter_node(state: AgentState) -> dict:
     """Generate the final performance report using LLM with streaming output."""
     from smartinspector.prompts import load_prompt
     from smartinspector.commands.orchestrate import _build_report_header
+    from smartinspector.graph.state import RouteDecision
 
     report_prompt = load_prompt("report-generator")
 
     perf_json = state.get("perf_summary", "")
     perf_analysis = state.get("perf_analysis", "")
     attribution_result = state.get("attribution_result", "")
+    route = state.get("_route", "")
+
+    is_startup = route in (RouteDecision.STARTUP, RouteDecision.STARTUP.value)
 
     # Build user content with all available data
     # IMPORTANT: attribution section MUST come first (before header/analysis)
@@ -92,6 +96,11 @@ def reporter_node(state: AgentState) -> dict:
 
     # Prepend pre-generated header (LLM does not output header per prompt instructions)
     complete_report = (header_md + "\n" + full_content) if perf_json else full_content
+
+    # Startup route: append the structured startup analysis after LLM report
+    # so startup phases/bottlenecks/suggestions are always present verbatim
+    if is_startup and perf_analysis:
+        complete_report += f"\n\n{perf_analysis}"
 
     # Save report to file
     report_path = save_report(complete_report)
