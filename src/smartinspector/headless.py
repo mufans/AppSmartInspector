@@ -52,6 +52,8 @@ class HeadlessRunner:
         # Determine route based on cmd parameter
         route = self._resolve_route(self.cmd)
 
+        print(f"route: {route}")
+
         # Build initial state for the graph
         initial_state = {
             "messages": [],
@@ -59,7 +61,7 @@ class HeadlessRunner:
             "perf_analysis": "",
             "attribution_data": "",
             "attribution_result": "",
-            "trace_duration_ms": self.duration,
+            "trace_duration_ms": 5000 if route in (RouteDecision.STARTUP, RouteDecision.STARTUP.value) else self.duration,
             "trace_target_process": self.target or "",
             "skip_wait": route in (RouteDecision.STARTUP, RouteDecision.STARTUP.value),
             "_route": route,

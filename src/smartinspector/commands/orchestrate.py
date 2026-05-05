@@ -230,6 +230,8 @@ def cmd_startup(args: str, state: dict) -> dict:
     # Set startup flags
     state["skip_wait"] = True
     state["trace_target_process"] = package_name
+    if not state.get("trace_duration_ms"):
+        state["trace_duration_ms"] = 5000
 
     graph = create_graph()
 
