@@ -113,6 +113,7 @@ def main():
         "perf_analysis": "",
         "attribution_data": "",
         "attribution_result": "",
+        "trace_target_process": args.target or "",
         "_trace_path": "",
     }
 
