@@ -1,18 +1,16 @@
 """Metric QA node: natural language queries on specific performance metrics."""
 
 import json
-import logging
 import threading
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from smartinspector.config import get_llm_kwargs
+from smartinspector.debug_log import info_log
 from smartinspector.graph.state import AgentState, _pass_through, node_error_handler
 from smartinspector.prompts import load_prompt
 from smartinspector.token_tracker import get_tracker
-
-logger = logging.getLogger(__name__)
 
 _prompt = load_prompt("metric-qa")
 _llm = None
@@ -220,7 +218,7 @@ def metric_qa_node(state: AgentState) -> dict:
                 break
 
     # 5. Call LLM
-    logger.info("Metric QA: metric_id=%s, metric_name=%s", metric_id, metric_name)
+    info_log("metric_qa", f"Metric QA: metric_id={metric_id}, metric_name={metric_name}")
     system_prompt = _prompt.format(metric_name=metric_name, data=data)
     user_content = user_question or f"请分析一下{metric_name}的情况。"
 

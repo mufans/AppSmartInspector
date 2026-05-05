@@ -4,11 +4,9 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI
 
 from smartinspector.config import get_llm_kwargs
+from smartinspector.debug_log import info_log
 from smartinspector.token_tracker import get_tracker
 from smartinspector.graph.state import AgentState, RouteDecision, _pass_through, node_error_handler
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 _ROUTE_PROMPT = """Classify this user message. Reply with ONE label only.
@@ -110,7 +108,7 @@ def orchestrator_node(state: AgentState) -> dict:
         get_tracker().record_from_message("orchestrator", response)
         raw = response.content.strip().lower()
     except Exception as e:
-        logger.error("LLM call failed: %s", e)
+        info_log("orchestrator", f"ERROR: LLM call failed: {e}")
         raw = ""
 
     # Extract valid label
@@ -149,7 +147,7 @@ def orchestrator_node(state: AgentState) -> dict:
         if skip_wait:
             # Re-route to dedicated startup analysis pipeline
             decision = RouteDecision.STARTUP
-            logger.info("Detected startup analysis intent, routing to startup analyzer")
+            info_log("orchestrator", "Detected startup analysis intent, routing to startup analyzer")
 
     # Bug 2: startup route requires a package name for cold start ADB launch
     if decision == RouteDecision.STARTUP:

@@ -11,13 +11,12 @@ This server forwards them to the frame_analyzer agent and returns results.
 
 import asyncio
 import json
-import logging
 import os
 import pathlib
 import threading
 from typing import Callable, Awaitable
 
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import info_log, debug_log
 
 _BRIDGE_PORT = 9877
 
@@ -94,9 +93,9 @@ class BridgeServer:
         try:
             self._loop.run_until_complete(self._serve())
         except OSError as e:
-            logger.error("Bridge server failed to start: %s", e)
+            info_log("ws", f"ERROR: Bridge server failed to start: {e}")
         except Exception as e:
-            logger.error("Bridge server unexpected error: %s", e)
+            info_log("ws", f"ERROR: Bridge server unexpected error: {e}")
 
     async def _serve(self):
         import websockets
@@ -121,7 +120,7 @@ class BridgeServer:
         """Handle WebSocket connections from the Perfetto UI plugin."""
         self._ws_clients.add(ws)
         remote = ws.remote_address if hasattr(ws, "remote_address") else "?"
-        logger.info("Plugin connected: %s", remote)
+        info_log("ws", f"Plugin connected: {remote}")
         try:
             async for raw in ws:
                 try:
@@ -139,11 +138,10 @@ class BridgeServer:
             pass
         finally:
             self._ws_clients.discard(ws)
-            logger.info("Plugin disconnected: %s", remote)
+            info_log("ws", f"Plugin disconnected: {remote}")
 
     async def _handle_frame_selected(self, ws, payload: dict):
         """Forward frame selection to the agent and return results."""
-        from smartinspector.debug_log import debug_log
 
         ts = payload.get("ts", 0)
         dur = payload.get("dur", 0)
@@ -184,7 +182,7 @@ class BridgeServer:
                 "payload": result,
             }))
         except Exception as e:
-            logger.exception("Frame analysis failed")
+            info_log("ws", f"ERROR: Frame analysis failed: {e}")
             debug_log("bridge", f"ERROR: {e}")
             await ws.send(json.dumps({
                 "type": "analysis_error",
@@ -358,7 +356,7 @@ def start_bridge(
     trace_server = TraceServer(trace_path, port=9001)
     print(f"  [bridge] Starting trace_processor_shell on :9001...", flush=True)
     if not trace_server.start():
-        logger.warning("TraceServer failed to start, /frame SQL queries will use file mode")
+        info_log("ws", f"WARNING: TraceServer failed to start, /frame SQL queries will use file mode")
     _active_trace_server = trace_server
 
     # Store perf_summary and attribution_result for analysis context
@@ -371,7 +369,6 @@ def start_bridge(
     _cached_attribution_result = attribution_result
 
     async def on_frame_selected(payload: dict, send_progress=None) -> dict:
-        from smartinspector.debug_log import debug_log
 
         ts = int(payload.get("ts", 0))
         dur = int(payload.get("dur", 0))

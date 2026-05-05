@@ -1,10 +1,9 @@
 """Reporter sub-module: report file saving."""
 
-import logging
 import os
 import datetime
 
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import info_log
 
 
 def save_report(content: str) -> str | None:
@@ -20,8 +19,8 @@ def save_report(content: str) -> str | None:
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(content)
         size_kb = len(content.encode("utf-8")) / 1024
-        logger.info("Report saved to %s (%.1fKB)", report_path, size_kb)
+        info_log("reporter", f"Report saved to {report_path} ({size_kb:.1f}KB)")
         return report_path
     except OSError as e:
-        logger.error("Failed to save report: %s", e)
+        info_log("reporter", f"ERROR: Failed to save report: {e}")
         return None

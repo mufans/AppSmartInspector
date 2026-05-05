@@ -1,10 +1,9 @@
 """Headless runner: non-interactive analysis pipeline via LangGraph."""
 
 import json
-import logging
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import info_log
 
 
 class HeadlessRunner:
@@ -67,8 +66,7 @@ class HeadlessRunner:
             "_trace_path": self.trace_path or "",
         }
 
-        logger.info("Headless run: cmd=%s, route=%s, target=%s, trace=%s",
-                     self.cmd, route, self.target, self.trace_path)
+        info_log("headless", f"Headless run: cmd={self.cmd}, route={route}, target={self.target}, trace={self.trace_path}")
 
         graph = create_graph()
         config = {"configurable": {"thread_id": "headless"}}
@@ -78,7 +76,7 @@ class HeadlessRunner:
             result_state = graph.invoke(initial_state, config=config)
         except Exception as e:
             error_msg = f"Pipeline execution failed: {e}"
-            logger.error(error_msg)
+            info_log("headless", f"ERROR: {error_msg}")
             return self._format_error(error_msg)
 
         # Extract final state values
@@ -110,9 +108,9 @@ class HeadlessRunner:
                 output_path = Path(self.output)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 output_path.write_text(output, encoding="utf-8")
-                logger.info("Report saved to %s", self.output)
+                info_log("headless", f"Report saved to {self.output}")
             except OSError as e:
-                logger.error("Failed to write report: %s", e)
+                info_log("headless", f"ERROR: Failed to write report: {e}")
 
         return output
 

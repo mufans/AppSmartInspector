@@ -13,9 +13,7 @@ from pathlib import Path
 from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
 from smartinspector.perfetto_compat import patch
-
-import logging
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import info_log, debug_log
 
 # Apply macOS IPv4 fix
 patch()
@@ -93,12 +91,7 @@ class PerfettoCollector:
         self.shell_path = shell_path or str(SHELL_BIN)
         self._tp: TraceProcessor | None = None
         self._target_process_cache: dict | None = None  # cached resolve result
-        if target_process:
-            # Pre-populate cache with package name so resolve can be triggered lazily
-            self._target_process_cache = {
-                "upid": None, "pid": None, "uid": None,
-                "name": target_process, "source": "",
-            }
+        self._target_package: str | None = target_process
 
     def _open(self) -> TraceProcessor:
         if self._tp is not None:
@@ -110,18 +103,22 @@ class PerfettoCollector:
         self._tp = TraceProcessor(trace=self.trace_path, config=config)
         return self._tp
 
-    def _resolve_target_process(self, package_name: str) -> dict:
+    def _resolve_target_process(self, package_name: str | None = None) -> dict:
         """Resolve target process info (upid, pid, uid) from package name.
 
         Tries ``process`` table first, falls back to ``package_list`` table
         for cold-start scenarios where the process table may be empty.
 
         Args:
-            package_name: Android package name, e.g. "com.example.app"
+            package_name: Android package name, e.g. "com.example.app".
+                          Falls back to ``self._target_package`` if not provided.
 
         Returns:
             Dict with keys: upid, pid, uid, name, source ("process"|"package_list"|"")
         """
+        package_name = package_name or self._target_package
+        if not package_name:
+            return {}
         if self._target_process_cache is not None:
             return self._target_process_cache
 
@@ -143,7 +140,7 @@ class PerfettoCollector:
                 result["source"] = "process"
                 break
         except Exception as e:
-            logger.debug("process table lookup failed: %s", e)
+            debug_log("perfetto", f"process table lookup failed: {e}")
 
         # Strategy 2: fallback to package_list -> uid -> process
         if not result["upid"]:
@@ -179,16 +176,14 @@ class PerfettoCollector:
                         # package_list found UID but process not in process table yet
                         # (cold start: process hasn't started during trace)
                         result["source"] = "package_list_uid_only"
-                        logger.debug("package_list fallback: found uid=%d for %s but no process entry",
-                                     uid, package_name)
+                        debug_log("perfetto", f"package_list fallback: found uid={uid} for {package_name} but no process entry")
             except Exception as e:
-                logger.debug("package_list fallback failed: %s", e)
+                debug_log("perfetto", f"package_list fallback failed: {e}")
 
         if result["source"]:
-            logger.debug("resolved target process: %s -> upid=%s, pid=%s, uid=%s (via %s)",
-                         package_name, result["upid"], result["pid"], result["uid"], result["source"])
+            debug_log("perfetto", f"resolved target process: {package_name} -> upid={result['upid']}, pid={result['pid']}, uid={result['uid']} (via {result['source']})")
         else:
-            logger.debug("could not resolve target process: %s", package_name)
+            debug_log("perfetto", f"could not resolve target process: {package_name}")
 
         self._target_process_cache = result
         return result
@@ -255,7 +250,7 @@ class PerfettoCollector:
                     "occurrences": r.occurrences,
                 })
         except Exception as e:
-            logger.debug("sched_blocked_reason query failed: %s", e)
+            debug_log("perfetto", f"sched_blocked_reason query failed: {e}")
 
         result = {"hot_threads": hot_threads}
         if blocked_reasons:
@@ -284,7 +279,7 @@ class PerfettoCollector:
                 LIMIT 20
             """)
         except Exception as e:
-            logger.debug("CPU hotspot query failed: %s", e)
+            debug_log("perfetto", f"CPU hotspot query failed: {e}")
             return []
 
         if not rows:
@@ -301,7 +296,7 @@ class PerfettoCollector:
             for r in cs_rows:
                 callsite_map[r.id] = (r.name, r.parent_id)
         except Exception as e:
-            logger.debug("callsite_map query failed: %s", e)
+            debug_log("perfetto", f"callsite_map query failed: {e}")
 
         hotspots = []
         for r in rows:
@@ -356,7 +351,7 @@ class PerfettoCollector:
             for r in exp_rows:
                 expected_map[r.display_frame_token] = round(r.expected_dur_ns / 1e6, 2)
         except Exception as e:
-            logger.debug("Expected frame timeline query failed: %s", e)
+            debug_log("perfetto", f"Expected frame timeline query failed: {e}")
 
         try:
             rows = tp.query("""
@@ -373,7 +368,7 @@ class PerfettoCollector:
                 ORDER BY frame_ts ASC
             """)
         except Exception as e:
-            logger.debug("Frame timeline query failed: %s", e)
+            debug_log("perfetto", f"Frame timeline query failed: {e}")
             return {}
 
         # User-impacting jank types per Perfetto/SurfaceFlinger docs:
@@ -457,7 +452,7 @@ class PerfettoCollector:
             else:
                 return {}
         except Exception as e:
-            logger.debug("Trace bounds query failed: %s", e)
+            debug_log("perfetto", f"Trace bounds query failed: {e}")
             return {}
 
         trace_dur_ns = trace_end_ns - trace_start_ns
@@ -472,7 +467,7 @@ class PerfettoCollector:
                 num_cpus = max(1, cr.num_cpus)
                 break
         except Exception as e:
-            logger.debug("CPU count query failed: %s", e)
+            debug_log("perfetto", f"CPU count query failed: {e}")
             num_cpus = 1
 
         # Per-thread CPU usage from sched table
@@ -493,7 +488,7 @@ class PerfettoCollector:
                 LIMIT 20
             """)
         except Exception as e:
-            logger.debug("CPU usage query failed: %s", e)
+            debug_log("perfetto", f"CPU usage query failed: {e}")
             return {}
 
         # Total CPU wall-time available = trace_dur * num_cpus
@@ -566,7 +561,7 @@ class PerfettoCollector:
             if samples:
                 result["cpu_idle_samples"] = samples
         except Exception as e:
-            logger.debug("CPU idle samples query failed: %s", e)
+            debug_log("perfetto", f"CPU idle samples query failed: {e}")
 
         # 2. CPU frequency per core
         try:
@@ -589,7 +584,7 @@ class PerfettoCollector:
             if freq_by_core:
                 result["cpu_freq_by_core"] = freq_by_core
         except Exception as e:
-            logger.debug("CPU frequency query failed: %s", e)
+            debug_log("perfetto", f"CPU frequency query failed: {e}")
 
         # 3. Fork rate
         try:
@@ -606,7 +601,7 @@ class PerfettoCollector:
             if forks:
                 result["fork_rate"] = forks
         except Exception as e:
-            logger.debug("Fork rate query failed: %s", e)
+            debug_log("perfetto", f"Fork rate query failed: {e}")
 
         return result
 
@@ -651,7 +646,7 @@ class PerfettoCollector:
             if processes:
                 return {"processes": processes}
         except Exception as e:
-            logger.debug("Process memory query failed: %s", e)
+            debug_log("perfetto", f"Process memory query failed: {e}")
 
         return {}
 
@@ -698,7 +693,7 @@ class PerfettoCollector:
                 if allocs:
                     result["heap_graph_classes"] = allocs
             except Exception as e:
-                logger.debug("Basic heap graph query failed: %s", e)
+                debug_log("perfetto", f"Basic heap graph query failed: {e}")
 
         return result
 
@@ -791,11 +786,11 @@ class PerfettoCollector:
                             """)
                             rows = list(rows) + [r for r in gp_rows if not r.name.startswith("SI$touch#")]
                         except Exception as e:
-                            logger.debug("Grandparent slice query failed: %s", e)
+                            debug_log("perfetto", f"Grandparent slice query failed: {e}")
                 except Exception as e:
-                    logger.debug("Parent slice query failed: %s", e)
+                    debug_log("perfetto", f"Parent slice query failed: {e}")
         except Exception as e:
-            logger.debug("View slices query failed: %s", e)
+            debug_log("perfetto", f"View slices query failed: {e}")
             return {}
 
         slices = []
@@ -997,7 +992,7 @@ class PerfettoCollector:
                             s["process_name"] = proc_info["name"]
                             s["is_target"] = proc_info["upid"] == target_upid
             except Exception as e:
-                logger.debug("track-process annotation failed: %s", e)
+                debug_log("perfetto", f"track-process annotation failed: {e}")
 
         result = {
             "summary": sorted(name_stats.values(), key=lambda x: -x["total_ms"]),
@@ -1029,7 +1024,7 @@ class PerfettoCollector:
                 ORDER BY ts ASC
             """)
         except Exception as e:
-            logger.debug("IO slices query failed: %s", e)
+            debug_log("perfetto", f"IO slices query failed: {e}")
             return {}
 
         slices = []
@@ -1089,7 +1084,7 @@ class PerfettoCollector:
                 ORDER BY ts ASC
             """)
         except Exception as e:
-            logger.debug("Input events query failed: %s", e)
+            debug_log("perfetto", f"Input events query failed: {e}")
             return []
 
         events = []
@@ -1133,7 +1128,7 @@ class PerfettoCollector:
                 ORDER BY ts ASC
             """)
         except Exception as e:
-            logger.debug("Block events query failed: %s", e)
+            debug_log("perfetto", f"Block events query failed: {e}")
             return []
 
         block_slices = []
@@ -1184,7 +1179,7 @@ class PerfettoCollector:
                     "msg": r.msg or "",
                 })
         except Exception as e:
-            logger.debug("SIBlock logcat query failed: %s", e)
+            debug_log("perfetto", f"SIBlock logcat query failed: {e}")
 
         # 3. Correlate slices with log entries by timestamp (bisect, O(n log n + m log m))
         MATCH_WINDOW_NS = 500_000_000  # 500ms
@@ -1260,14 +1255,14 @@ class PerfettoCollector:
                 LIMIT 20
             """)
         except Exception as e:
-            logger.debug("thread_state: slice query failed: %s", e)
+            debug_log("perfetto", f"thread_state: slice query failed: {e}")
             return []
 
         # Check if __intrinsic_thread_state table is available
         has_intrinsic_ts = self._check_intrinsic_thread_state(tp)
 
         if not has_intrinsic_ts:
-            logger.debug("thread_state: __intrinsic_thread_state not available, using fallback")
+            debug_log("perfetto", "thread_state: __intrinsic_thread_state not available, using fallback")
             return self._collect_thread_state_fallback(tp, main_utid, slice_rows)
 
         # --- Primary path: __intrinsic_thread_state ---
@@ -1297,7 +1292,7 @@ class PerfettoCollector:
                     ORDER BY total_ns DESC
                 """)
             except Exception as e:
-                logger.debug("thread_state: __intrinsic_thread_state query failed for %s: %s", slice_name, e)
+                debug_log("perfetto", f"thread_state: __intrinsic_thread_state query failed for {slice_name}: {e}")
                 # Fall back to single-slice legacy query
                 results.append(self._query_thread_state_legacy(tp, main_utid, slice_name, slice_ts, sr.dur, dur_ms))
                 continue
@@ -1364,7 +1359,7 @@ class PerfettoCollector:
             for r in rows:
                 return r.utid
         except Exception as e:
-            logger.debug("thread_state: main thread query failed: %s", e)
+            debug_log("perfetto", f"thread_state: main thread query failed: {e}")
         return None
 
     def _check_intrinsic_thread_state(self, tp) -> bool:
@@ -1446,7 +1441,7 @@ class PerfettoCollector:
                 "waker_name": None,
             }
         except Exception as e:
-            logger.debug("thread_state: legacy query failed for %s: %s", slice_name, e)
+            debug_log("perfetto", f"thread_state: legacy query failed for {slice_name}: {e}")
             return {
                 "slice_name": slice_name,
                 "dur_ms": dur_ms,
@@ -1477,7 +1472,7 @@ class PerfettoCollector:
                 else:
                     result[table] = 0
             except Exception as e:
-                logger.debug("Table %s query failed: %s", table, e)
+                debug_log("perfetto", f"Table {table} query failed: {e}")
                 result[table] = -1  # table doesn't exist
         return result
 
@@ -1499,7 +1494,7 @@ class PerfettoCollector:
                 ORDER BY ts ASC
             """)
         except Exception as e:
-            logger.debug("Compose slices query failed: %s", e)
+            debug_log("perfetto", f"Compose slices query failed: {e}")
             return {}
 
         slices = []
@@ -1568,7 +1563,7 @@ class PerfettoCollector:
             for r in meta:
                 summary.metadata[r.key] = r.str_value
         except Exception as e:
-            logger.debug("Metadata query failed: %s", e)
+            debug_log("perfetto", f"Metadata query failed: {e}")
 
         # Table diagnosis — help understand why data may be missing
         try:
@@ -1587,14 +1582,14 @@ class PerfettoCollector:
             if notes:
                 summary.metadata["diagnosis"] = notes
         except Exception as e:
-            logger.debug("Table diagnosis failed: %s", e)
+            debug_log("perfetto", f"Table diagnosis failed: {e}")
 
         # P1-5: Resolve target process with package_list fallback for cold-start support
-        if self._target_process_cache and self._target_process_cache.get("name"):
-            resolved = self._resolve_target_process(self._target_process_cache["name"])
+        if self._target_package:
+            resolved = self._resolve_target_process(self._target_package)
             if resolved.get("source"):
                 summary.metadata["target_process"] = resolved
-                logger.debug("target process resolved via %s: %s", resolved["source"], resolved)
+                debug_log("perfetto", f"target process resolved via {resolved['source']}: {resolved}")
 
         # Scheduling
         try:
@@ -1668,12 +1663,12 @@ class PerfettoCollector:
             if sys_stats:
                 summary.sys_stats = sys_stats
         except Exception as e:
-            logger.debug("sys_stats collection failed: %s", e)
+            debug_log("perfetto", f"sys_stats collection failed: {e}")
 
         # Thread state analysis (Running/S/D per SI$ slice)
         try:
             summary.thread_state = self.collect_thread_state()
-            logger.debug("thread_state: collected %d entries", len(summary.thread_state))
+            debug_log("perfetto", f"thread_state: collected {len(summary.thread_state)} entries")
             if not summary.thread_state:
                 # Diagnose why thread_state is empty
                 try:
@@ -1686,11 +1681,11 @@ class PerfettoCollector:
                     for r in tp.query("SELECT COUNT(*) as c FROM thread_state WHERE utid IN (SELECT utid FROM thread WHERE name = 'main')"):
                         ts_main = r.c
                         break
-                    logger.debug("thread_state diagnosis: total=%d, main_thread=%d", ts_count, ts_main)
+                    debug_log("perfetto", f"thread_state diagnosis: total={ts_count}, main_thread={ts_main}")
                 except Exception as e2:
-                    logger.debug("thread_state diagnosis failed: %s", e2)
+                    debug_log("perfetto", f"thread_state diagnosis failed: {e2}")
         except Exception as e:
-            logger.debug("thread_state collection failed: %s", e)
+            debug_log("perfetto", f"thread_state collection failed: {e}")
 
         return summary
 
@@ -1874,7 +1869,29 @@ class PerfettoCollector:
                     proc.stdin.flush()
                     proc.stdin.close()
                 except (BrokenPipeError, OSError) as e:
-                    logger.warning("Failed to write config to perfetto stdin: %s", e)
+                    info_log("perfetto", f"WARNING: Failed to write config to perfetto stdin: {e}")
+
+                # Read stdout/stderr in background threads to avoid pipe
+                # buffer deadlock (communicate() is unsafe here because
+                # stdin was already closed above — it would raise
+                # "ValueError: I/O operation on closed file").
+                stdout_chunks: list[str] = []
+                stderr_chunks: list[str] = []
+
+                def _pipe_reader(stream, chunks: list[str]) -> None:
+                    try:
+                        chunks.append(stream.read())
+                    except (ValueError, OSError):
+                        chunks.append("")
+
+                t_out = threading.Thread(
+                    target=_pipe_reader, args=(proc.stdout, stdout_chunks), daemon=True,
+                )
+                t_err = threading.Thread(
+                    target=_pipe_reader, args=(proc.stderr, stderr_chunks), daemon=True,
+                )
+                t_out.start()
+                t_err.start()
 
                 # Give Perfetto a moment to start recording, then invoke callback
                 time.sleep(0.5)
@@ -1888,22 +1905,28 @@ class PerfettoCollector:
                         on_record_start()
                     except Exception as exc:
                         callback_error = exc
-                        logger.warning("on_record_start callback failed: %s", exc)
+                        info_log("perfetto", f"WARNING: on_record_start callback failed: {exc}")
 
                 cb_thread = threading.Thread(target=_run_callback, daemon=True)
                 cb_thread.start()
                 # Wait for callback to finish, but cap at a reasonable timeout
                 cb_thread.join(timeout=10.0)
                 if cb_thread.is_alive():
-                    logger.warning("on_record_start callback timed out after 10s")
+                    info_log("perfetto", "WARNING: on_record_start callback timed out after 10s")
 
-                stdout, stderr = proc.communicate(timeout=timeout_sec)
+                # Wait for perfetto recording to complete
+                proc.wait(timeout=timeout_sec)
+                t_out.join(timeout=5)
+                t_err.join(timeout=5)
+
+                stdout = stdout_chunks[0] if stdout_chunks else ""
+                stderr = stderr_chunks[0] if stderr_chunks else ""
                 if proc.returncode != 0:
                     raise subprocess.CalledProcessError(
                         proc.returncode, proc.args, stdout, stderr,
                     )
                 if callback_error:
-                    logger.warning("Trace collected but on_record_start had errors: %s", callback_error)
+                    info_log("perfetto", f"WARNING: Trace collected but on_record_start had errors: {callback_error}")
             else:
                 subprocess.run(
                     ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
@@ -1918,7 +1941,7 @@ class PerfettoCollector:
                 err_msg = e.stderr.strip() or e.stdout.strip() or f"exit {e.returncode}"
             else:
                 err_msg = "timeout"
-            logger.debug("config mode (stdin pipe) failed: %s", err_msg)
+            debug_log("perfetto", f"config mode (stdin pipe) failed: {err_msg}")
             collection_error = f"stdin-pipe: {err_msg}"
 
             # Strategy 2: P1-6 SELinux fallback — push config file, use cat pipe
@@ -1938,7 +1961,7 @@ class PerfettoCollector:
                     timeout=timeout_sec,
                 )
                 collection_error = None
-                logger.debug("SELinux fallback (cat pipe) succeeded")
+                debug_log("perfetto", "SELinux fallback (cat pipe) succeeded")
                 # Cleanup config file
                 subprocess.run(
                     ["adb", "shell", "rm", config_device_path],
@@ -1950,7 +1973,7 @@ class PerfettoCollector:
                     err_msg2 = e2.stderr.strip() or e2.stdout.strip() or f"exit {e2.returncode}"
                 else:
                     err_msg2 = str(e2)
-                logger.debug("SELinux fallback (cat pipe) failed: %s", err_msg2)
+                debug_log("perfetto", f"SELinux fallback (cat pipe) failed: {err_msg2}")
                 collection_error = f"stdin-pipe + cat-pipe: {err_msg} / {err_msg2}"
 
                 # Strategy 3: P1-7 Auto-degradation — command-line mode
@@ -1970,7 +1993,7 @@ class PerfettoCollector:
                         timeout=timeout_sec,
                     )
                     collection_error = None
-                    logger.debug("auto-degradation to cmdline mode succeeded")
+                    debug_log("perfetto", "auto-degradation to cmdline mode succeeded")
                     print("  [collector] Degraded to cmdline mode (no config)", flush=True)
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e3:
                     err_msg3 = ""
@@ -2037,7 +2060,7 @@ class TraceServer:
         while time.monotonic() < deadline:
             try:
                 urllib.request.urlopen(f"http://127.0.0.1:{self.port}/status", timeout=1)
-                logger.info("TraceServer ready on :%d", self.port)
+                info_log("perfetto", f"TraceServer ready on :{self.port}")
                 return True
             except (urllib.error.URLError, OSError):
                 if self.process.poll() is not None:

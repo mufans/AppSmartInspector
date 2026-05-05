@@ -1,16 +1,14 @@
 """Perf Analyzer: single-shot LLM call to interpret performance summaries."""
 
 import json
-import logging
 import threading
 
 from langchain_openai import ChatOpenAI
 
 from smartinspector.config import get_llm_kwargs
+from smartinspector.debug_log import info_log
 from smartinspector.prompts import load_prompt
 from smartinspector.token_tracker import get_tracker
-
-logger = logging.getLogger(__name__)
 
 _prompt = load_prompt("perf-analyzer")
 _llm = None
@@ -68,14 +66,12 @@ def analyze_perf(perf_json: str) -> str:
     # Verify analysis quality
     verification = verify_analysis(result, hints)
     if not verification.passed:
-        logger.warning(
-            "Analysis verification issues: %s (score=%.2f)",
-            "; ".join(verification.issues),
-            verification.score,
+        info_log("perf_analyzer",
+            f"WARNING: Analysis verification issues: {'; '.join(verification.issues)} (score={verification.score:.2f})"
         )
         if verification.warnings:
             for w in verification.warnings:
-                logger.warning("  %s", w)
+                info_log("perf_analyzer", f"WARNING:   {w}")
 
         # If L2 failed, retry once with additional context
         if not verification.l2_passed:

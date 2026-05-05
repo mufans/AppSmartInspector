@@ -1,33 +1,25 @@
 """CLI entry: main() REPL loop."""
 
-import logging
-
 from smartinspector.commands import handle_slash_command
+from smartinspector.debug_log import info_log
 from smartinspector.graph.builder import create_graph
 from smartinspector.graph.streaming import _stream_run
-
-logger = logging.getLogger(__name__)
 
 
 def main():
     """Run the interactive chat loop."""
     import argparse
+    import os
     import subprocess
     import pathlib
 
     from smartinspector.config import get_source_dir, set_source_dir, get_ws_port, get_api_key
+    from smartinspector.debug_log import info_log, debug_log
     from smartinspector.ws.server import SIServer
 
-    # Configure standard logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
-        datefmt='%H:%M:%S',
-    )
-
-    # Silence noisy third-party loggers
-    logging.getLogger('httpx').setLevel(logging.WARNING)
-    logging.getLogger('httpcore').setLevel(logging.WARNING)
+    # Silence third-party loggers — all SmartInspector logging goes via info_log/debug_log
+    import logging
+    logging.disable(logging.CRITICAL)
 
     parser = argparse.ArgumentParser(description="SmartInspector CLI")
     parser.add_argument("--source-dir", default="", help="Source code directory for attribution search")
@@ -48,10 +40,7 @@ def main():
         set_source_dir(args.source_dir)
 
     if args.debug:
-        import os
         os.environ["SI_DEBUG"] = "1"
-        logging.getLogger().setLevel(logging.DEBUG)
-        from smartinspector.debug_log import debug_log
         debug_log("cli", "Debug logging enabled via --debug flag")
 
     # ── CI / headless mode ──
@@ -100,7 +89,8 @@ def main():
     if not get_api_key():
         issues.append("No API key configured. Set SI_API_KEY or OPENAI_API_KEY.")
     for issue in issues:
-        logger.warning(issue)
+        info_log("cli", f"WARNING: {issue}")
+        print(f"  WARNING: {issue}")
 
     # Auto-start WS server + adb reverse so app can connect on launch
     port = get_ws_port()

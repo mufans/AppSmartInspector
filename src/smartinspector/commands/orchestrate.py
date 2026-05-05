@@ -2,10 +2,9 @@
 
 import json
 import datetime
-import logging
 import os
 
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import info_log
 
 
 def _build_report_header(perf_json: str, trace_path: str = "") -> str:
@@ -210,7 +209,7 @@ def cmd_startup(args: str, state: dict) -> dict:
 
     if package_name:
         state["trace_target_process"] = package_name
-        logger.info("Startup target package: %s", package_name)
+        info_log("orchestrate", f"Startup target package: {package_name}")
     else:
         # Fall back to existing config
         package_name = state.get("trace_target_process", "")
@@ -240,7 +239,7 @@ def cmd_startup(args: str, state: dict) -> dict:
     ]
     state["_route"] = "startup"
 
-    logger.info("Starting cold start analysis for %s", package_name)
+    info_log("orchestrate", f"Starting cold start analysis for {package_name}")
     return _stream_run(graph, state)
 
 def cmd_report(args: str, state: dict) -> dict:

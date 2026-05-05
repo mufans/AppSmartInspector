@@ -16,16 +16,13 @@ Protocol (JSON):
 
 import asyncio
 import json
-import logging
 import pathlib
 import threading
 import uuid
 from typing import Callable
 
 from smartinspector.config import get_ws_ping_timeout
-from smartinspector.debug_log import debug_log
-
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import info_log, debug_log
 
 _CONFIG_PATH = pathlib.Path.home() / ".smartinspector_config.json"
 
@@ -225,7 +222,7 @@ class SIServer:
         try:
             _CONFIG_PATH.write_text(config_json)
         except Exception as e:
-            logger.debug("Failed to persist config: %s", e)
+            debug_log("ws", f"Failed to persist config: {e}")
 
     @staticmethod
     def _load_cached_config() -> str:
@@ -234,7 +231,7 @@ class SIServer:
             if _CONFIG_PATH.exists():
                 return _CONFIG_PATH.read_text()
         except Exception as e:
-            logger.debug("Failed to load cached config: %s", e)
+            debug_log("ws", f"Failed to load cached config: {e}")
         return ""
 
     # ── Internal async ─────────────────────────────────────────
@@ -257,15 +254,15 @@ class SIServer:
         try:
             self._loop.run_until_complete(_serve())
         except OSError as e:
-            logger.error("WS server failed to start: %s", e)
+            info_log("ws", f"ERROR: WS server failed to start: {e}")
         except Exception as e:
-            logger.error("WS server unexpected error: %s", e)
+            info_log("ws", f"ERROR: WS server unexpected error: {e}")
 
     async def _handler(self, ws) -> None:
         self._connections.add(ws)
         self._connection_event.set()  # signal app connection
         remote = ws.remote_address if hasattr(ws, "remote_address") else "?"
-        logger.info("App connected: %s", remote)
+        info_log("ws", f"App connected: {remote}")
         debug_log("ws", f"App connected: {remote}")
         try:
             async for raw in ws:
@@ -279,7 +276,7 @@ class SIServer:
             pass
         finally:
             self._connections.discard(ws)
-            logger.info("App disconnected: %s", remote)
+            info_log("ws", f"App disconnected: {remote}")
             debug_log("ws", f"App disconnected: {remote}")
 
     async def _dispatch(self, ws, msg: dict) -> None:

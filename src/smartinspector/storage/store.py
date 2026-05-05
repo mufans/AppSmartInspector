@@ -1,12 +1,11 @@
 """Persistent storage for performance analysis results."""
 
 import json
-import logging
 import os
 from datetime import datetime
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import info_log
 
 # Default reports directory
 _DEFAULT_REPORTS_DIR = Path(__file__).resolve().parent.parent.parent.parent.parent / "reports"
@@ -65,7 +64,7 @@ def save_analysis_result(
     }
 
     filepath.write_text(json.dumps(record, indent=2, ensure_ascii=False))
-    logger.info("Saved analysis result to: %s", filepath)
+    info_log("store", f"Saved analysis result to: {filepath}")
     return str(filepath)
 
 
@@ -150,12 +149,12 @@ def load_analysis_result(filepath: str) -> dict | None:
     try:
         path = Path(filepath)
         if not path.exists():
-            logger.warning("Analysis file not found: %s", filepath)
+            info_log("store", f"WARNING: Analysis file not found: {filepath}")
             return None
         data = json.loads(path.read_text())
         return data
     except (json.JSONDecodeError, OSError) as e:
-        logger.error("Failed to load analysis file: %s", e)
+        info_log("store", f"ERROR: Failed to load analysis file: {e}")
         return None
 
 

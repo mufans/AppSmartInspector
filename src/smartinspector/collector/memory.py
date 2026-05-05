@@ -1,8 +1,6 @@
 """Memory allocation analysis via Perfetto heap_graph tables."""
 
-import logging
-
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import debug_log
 
 
 def collect_heap_graph_analysis(tp, target_upid: int | None = None) -> dict:
@@ -46,7 +44,7 @@ def collect_heap_graph_analysis(tp, target_upid: int | None = None) -> dict:
         if heap_objects:
             result["heap_objects"] = heap_objects
     except Exception as e:
-        logger.debug("Heap graph object query failed: %s", e)
+        debug_log("memory", f"Heap graph object query failed: {e}")
 
     # 2. Activity/Fragment leak suspects
     #    Find destroyed Activities/Fragments still reachable in the heap
@@ -87,7 +85,7 @@ def collect_heap_graph_analysis(tp, target_upid: int | None = None) -> dict:
         if leak_suspects:
             result["leak_suspects"] = leak_suspects
     except Exception as e:
-        logger.debug("Leak suspect query failed: %s", e)
+        debug_log("memory", f"Leak suspect query failed: {e}")
 
     # 3. Dominator tree — objects that retain the most memory
     try:
@@ -115,7 +113,7 @@ def collect_heap_graph_analysis(tp, target_upid: int | None = None) -> dict:
         if dominators:
             result["dominators"] = dominators
     except Exception as e:
-        logger.debug("Dominator query failed: %s", e)
+        debug_log("memory", f"Dominator query failed: {e}")
 
     # 4. Reference chain analysis for largest objects
     #    Shows what's keeping large objects alive
@@ -150,7 +148,7 @@ def collect_heap_graph_analysis(tp, target_upid: int | None = None) -> dict:
         if ref_chains:
             result["reference_chains"] = ref_chains
     except Exception as e:
-        logger.debug("Reference chain query failed: %s", e)
+        debug_log("memory", f"Reference chain query failed: {e}")
 
     return result
 

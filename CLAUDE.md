@@ -90,29 +90,39 @@ bin/                         # trace_processor_shell binary (used by PerfettoCol
 
 ## Logging Rules (IMPORTANT)
 
-Three logging mechanisms, each with distinct purpose:
+**禁止使用 Python `logging` 模块。** 所有日志统一使用 `debug_log.py` 的两个函数：
 
 | Mechanism | Usage | Output |
 |-----------|-------|--------|
-| `debug_log(category, msg)` | Pipeline data inspection | `reports/debug_*.log` |
-| `print(f"  [node] msg", flush=True)` | User-facing progress | Console (stdout) |
-| `logger.debug(msg)` | Internal library logging | Python logging (not in debug log files) |
+| `info_log(category, msg)` | Pipeline progress, warnings, errors (always written) | `reports/debug_*.log` |
+| `debug_log(category, msg)` | Detailed diagnostics, SQL queries, raw data (SI_DEBUG only) | `reports/debug_*.log` |
+| `print(...)` | User-facing interactive output only (CLI prompts, streaming tokens) | Console (stdout) |
 
-**Rule**: When adding observability to collector/agent/reporter code that needs to appear in `reports/debug_*.log`, use `debug_log()` — NOT `logger.debug()`.
+**Rules**:
+- `info_log()` / `debug_log()` 是唯一的日志 API，禁止 `import logging; logger = logging.getLogger(__name__)`
+- `print()` 仅允许用于用户面向的交互式输出（CLI 提示、流式 token、进度表格）
+- Python `logging` 在 `cli.py` 中通过 `logging.disable(logging.CRITICAL)` 完全静默（防止第三方库日志泄漏到控制台）
 
 Enable debug mode: `SI_DEBUG=1` or `--debug` flag.
 
-Categories: `collector`, `attributor`, `reporter`, `ws`, `full`.
+Categories: `collector`, `attributor`, `reporter`, `ws`, `full`, `startup`, `headless`.
 
 ### debug_log API
 
 ```python
-from smartinspector.debug_log import debug_log
+from smartinspector.debug_log import info_log, debug_log
+
+# Always written (pipeline progress, warnings, errors)
+info_log("collector", "Starting trace collection...")
+info_log("collector", f"WARNING: adb force-stop failed: {result.stderr.strip()}")
+
+# Only written when SI_DEBUG=1 (detailed diagnostics)
 debug_log("collector", f"thread_state: {name} running={running_ms:.1f}ms")
 ```
 
 - Thread-safe (serialized via threading.Lock)
-- No-op when `SI_DEBUG` is not set
+- `debug_log()` is no-op when `SI_DEBUG` is not set
+- `info_log()` always writes regardless of debug mode
 - Auto-creates `reports/` directory and log file on first call
 
 ## Architecture
@@ -465,11 +475,11 @@ The Android app injects trace hooks that emit `SI$` prefixed slices into Perfett
 
 ## Logging Rules
 
-- **⛔ 所有 info/warning 日志必须使用 `logger.info()` / `logger.warning()`，禁止 `print()`**
+- **⛔ 所有日志必须使用 `info_log()` / `debug_log()`，禁止 `import logging; logger = ...`**
 - `print()` 仅允许用于用户面向的交互式输出（CLI 提示、进度、表格）
-- debug 日志使用 `debug_log(category, message)`
-- error 日志使用 `logger.error()`
-- 每个模块开头：`import logging; logger = logging.getLogger(__name__)`
+- `info_log(category, msg)` — 始终写入 `reports/debug_*.log`（流程进度、警告、错误）
+- `debug_log(category, msg)` — 仅 `SI_DEBUG=1` 时写入（详细诊断、SQL 查询、原始数据）
+- **禁止 `import logging; logger = logging.getLogger(__name__)`**
 
 ## Known Issues & Design Notes
 
@@ -521,54 +531,31 @@ Perfetto UI Plugin (WS client)
 
 ### 规则
 
-1. **统一使用标准 `logging` 模块**，禁止使用 `print()` 输出日志
-2. 每个模块文件顶部初始化：`logger = logging.getLogger(__name__)`
+1. **禁止使用 Python `logging` 模块**，统一使用 `debug_log.py` 的 `info_log()` / `debug_log()`
+2. 在 `cli.py` 中通过 `logging.disable(logging.CRITICAL)` 静默所有第三方库日志
 3. 日志级别规范：
-   - `logger.debug()` — 调试信息（SQL查询失败、fallback触发、内部状态变化）
-   - `logger.info()` — 关键流程节点（采集开始/完成、报告生成完成、设备连接）
-   - `logger.warning()` — 可恢复的异常（API降级、fallback、重试）
-   - `logger.error()` — 严重错误（采集失败、报告生成失败）
-4. **日志格式统一**：`[模块名] 消息内容`，通过 logging formatter 配置，不要在消息中手动加 `[tag]`
-5. **用户面向的进度输出**（流式token、进度条等）可以继续用 `print()`，但必须标注 `# noqa: LOG` 注释说明原因
-6. **禁止裸 `print()`**：所有 print 必须改为 logger 调用，除非有明确注释说明原因
-
-### 当前需要改造的文件
-
-- `src/smartinspector/graph/nodes/collector.py` — 多处 `print("  [collector] ...")`
-- `src/smartinspector/graph/nodes/analyzer.py` — `print("  [analyzer] ...")`
-- `src/smartinspector/graph/nodes/reporter/__init__.py` — 多处 `print("  [reporter] ...")`
-- `src/smartinspector/graph/nodes/reporter/persistence.py` — `print("  [reporter] ...")`
-- `src/smartinspector/graph/nodes/reporter/generator.py` — `print("  [reporter] ...")`（流式输出除外）
-
-### logging 配置
-
-在 CLI 入口（`cli.py`）统一配置 logging：
-
-```python
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
-    datefmt='%H:%M:%S',
-)
-# debug 模式通过 --debug 参数降低到 DEBUG 级别
-```
+   - `info_log(category, msg)` — 始终写入（采集开始/完成、报告生成完成、设备连接、警告、错误）
+   - `debug_log(category, msg)` — 仅 `SI_DEBUG=1` 时写入（SQL查询、原始数据、内部状态变化）
+4. **用户面向的进度输出**（流式token、进度条等）可以继续用 `print()`，但必须标注 `# noqa: LOG` 注释说明原因
+5. **禁止裸 `print()`**：所有 print 必须改为 `info_log()` 调用，除非有明确注释说明原因
 
 ### 示例
 
 ```python
 # ✅ 正确
-import logging
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import info_log, debug_log
 
-logger.info("Starting trace collection")
-logger.debug("process table lookup failed: %s", e)
-logger.warning("__intrinsic_thread_state not available, falling back to sched")
+info_log("collector", "Starting trace collection...")
+info_log("collector", f"WARNING: adb force-stop failed: {e}")
+info_log("collector", f"ERROR: Trace collection failed: {e}")
+debug_log("collector", f"process table lookup result: {rows}")
 
 # ❌ 错误
-print("  [collector] Starting trace collection...")  # 改用 logger.info()
-print(f"  [reporter] Failed to save report: {e}")     # 改用 logger.error()
+import logging
+logger = logging.getLogger(__name__)  # 禁止使用 logging 模块
+logger.info("Starting trace collection")
+
+print("  [collector] Starting trace collection...")  # 改用 info_log()
 
 # ✅ 允许的 print（用户面向的流式输出）
 print(token, end="", flush=True)  # noqa: LOG — streaming LLM tokens to user
@@ -588,7 +575,7 @@ print(token, end="", flush=True)  # noqa: LOG — streaming LLM tokens to user
    - 必须使用 `@node_error_handler("node_name")` 装饰器
    - 必须返回 dict 且包含 `messages` 字段
    - 必须使用 `_pass_through(state)` 透传其他状态字段
-   - 必须使用标准 logging（参见 Logging Standard 章节）
+   - 必须使用标准日志（`info_log`/`debug_log`，参见 Logging Standard 章节）
 
 ### 反例（禁止）
 ```python

@@ -1,9 +1,8 @@
 """Cold start analyzer: extract startup phases from Perfetto trace."""
 
 import json
-import logging
 
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import info_log, debug_log
 
 
 class StartupResult:
@@ -91,11 +90,11 @@ class StartupAnalyzer:
         try:
             timestamps = self._find_startup_timestamps(tp)
         except Exception as e:
-            logger.warning("Failed to find startup timestamps: %s", e)
+            info_log("startup", f"WARNING: Failed to find startup timestamps: {e}")
             return StartupResult()
 
         if not timestamps:
-            logger.info("No startup sequence detected in trace")
+            info_log("startup", "No startup sequence detected in trace")
             return StartupResult()
 
         total_ms = timestamps.get("total_ms", 0)
@@ -125,7 +124,7 @@ class StartupAnalyzer:
         # Resolve target process
         from smartinspector.collector.perfetto import PerfettoCollector
         collector = PerfettoCollector(self.trace_path, target_process=self.target_process)
-        target_info = collector._resolve_target_process()
+        target_info = collector._resolve_target_process(self.target_process)
         if not target_info:
             return {}
 
@@ -133,11 +132,11 @@ class StartupAnalyzer:
         if not upid:
             return {}
 
-        # Phase 1: Find process start time
+        # Phase 1: Find process start time from thread.start_ts
         try:
             rows = tp.query(f"""
-                SELECT MIN(ts) as start_ts
-                FROM process_track
+                SELECT MIN(start_ts) as start_ts
+                FROM thread
                 WHERE upid = {upid}
             """)
             process_start = None
@@ -147,21 +146,6 @@ class StartupAnalyzer:
                     break
         except Exception:
             process_start = None
-
-        # Fallback: use thread table for process start
-        if process_start is None:
-            try:
-                rows = tp.query(f"""
-                    SELECT MIN(ts) as start_ts
-                    FROM thread
-                    WHERE upid = {upid}
-                """)
-                for r in rows:
-                    if r.start_ts:
-                        process_start = r.start_ts
-                        break
-            except Exception:
-                pass
 
         if process_start is None:
             return {}
@@ -347,7 +331,7 @@ class StartupAnalyzer:
             return sorted(critical_path, key=lambda x: x["ts_ns"])
 
         except Exception as e:
-            logger.debug("Critical path extraction failed: %s", e)
+            debug_log("startup", f"Critical path extraction failed: {e}")
             return []
 
     def _identify_bottlenecks(

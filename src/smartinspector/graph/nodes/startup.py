@@ -1,13 +1,9 @@
 """Startup analysis node: cold start phase splitting and bottleneck identification."""
 
-import logging
-
 from langchain_core.messages import AIMessage
 
-from smartinspector.debug_log import debug_log
+from smartinspector.debug_log import debug_log, info_log
 from smartinspector.graph.state import AgentState, _pass_through, node_error_handler
-
-logger = logging.getLogger(__name__)
 
 
 @node_error_handler("startup")
@@ -24,7 +20,7 @@ def startup_node(state: AgentState) -> dict:
 
     target_process = state.get("trace_target_process", "") or None
 
-    logger.info("Running cold start analysis on %s", trace_path)
+    info_log("startup", f"Running cold start analysis on {trace_path}")
 
     analyzer = StartupAnalyzer(trace_path, target_process=target_process)
     result = analyzer.analyze()

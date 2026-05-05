@@ -1,15 +1,13 @@
 """Smart quick analysis command: /quick — deterministic analysis without LLM."""
 
 import json
-import logging
 
 from smartinspector.collector.perfetto import PerfettoCollector
 from smartinspector.agents.deterministic import compute_hints
 from smartinspector.commands.attribution import extract_attributable_slices
 from smartinspector.commands.orchestrate import _build_report_header
 from smartinspector.storage.store import save_analysis_result
-
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import info_log, debug_log
 
 
 def cmd_quick(args: str, state: dict) -> dict:
@@ -69,13 +67,13 @@ def cmd_quick(args: str, state: dict) -> dict:
                 trace_path=trace_path,
             )
         except Exception as e:
-            logger.debug("Quick analysis auto-save failed: %s", e)
+            debug_log("quick", f"Quick analysis auto-save failed: {e}")
 
     except FileNotFoundError:
         print(f"ERROR: Trace file not found: {trace_path}")
     except Exception as e:
         print(f"ERROR: {e}")
-        logger.error("Quick analysis failed: %s", e, exc_info=True)
+        info_log("quick", f"ERROR: Quick analysis failed: {e}")
 
     return state
 

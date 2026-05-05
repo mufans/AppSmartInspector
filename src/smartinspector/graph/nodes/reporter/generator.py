@@ -1,12 +1,9 @@
 """Reporter sub-module: LLM report generation with streaming."""
 
-import logging
-
 from langchain_core.messages import SystemMessage, HumanMessage
 
+from smartinspector.debug_log import info_log
 from smartinspector.token_tracker import get_tracker
-
-logger = logging.getLogger(__name__)
 
 
 def generate_report(report_prompt: str, user_content: str) -> str:
@@ -37,14 +34,14 @@ def generate_report(report_prompt: str, user_content: str) -> str:
                 input_tokens = um.get("input_tokens", 0)
     except Exception as e:
         # Stream failed (network error, API disconnect) — retry with invoke
-        logger.warning("Stream interrupted (%s), retrying...", e)
+        info_log("reporter", f"WARNING: Stream interrupted ({e}), retrying...")
         try:
             response = llm.invoke(messages)
             full_content = response.content
             get_tracker().record_from_message("reporter", response)
         except Exception as e2:
             full_content = full_content or f"[reporter] Report generation failed: {e2}"
-            logger.error("Retry also failed: %s", e2)
+            info_log("reporter", f"ERROR: Retry also failed: {e2}")
 
     # Record token usage (estimate output from content length if metadata incomplete)
     output_tokens = len(full_content) // 3  # rough estimate for CJK text

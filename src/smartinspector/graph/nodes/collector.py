@@ -1,16 +1,13 @@
 """Collector node: trace collection (first step of full pipeline)."""
 
 import json
-import logging
 import os
 import subprocess
 
 from langchain_core.messages import AIMessage
 
-from smartinspector.debug_log import debug_log
+from smartinspector.debug_log import debug_log, info_log
 from smartinspector.graph.state import AgentState, RouteDecision
-
-logger = logging.getLogger(__name__)
 
 
 def _check_adb_available() -> bool:
@@ -33,12 +30,12 @@ def _adb_force_stop(package: str) -> bool:
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
-            logger.info("adb force-stop %s succeeded", package)
+            info_log("collector", f"adb force-stop {package} succeeded")
             return True
-        logger.warning("adb force-stop failed: %s", result.stderr.strip())
+        info_log("collector", f"WARNING: adb force-stop failed: {result.stderr.strip()}")
         return False
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        logger.warning("adb force-stop unavailable: %s", e)
+        info_log("collector", f"WARNING: adb force-stop unavailable: {e}")
         return False
 
 
@@ -51,25 +48,65 @@ def _adb_launch_monkey(package: str) -> bool:
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
-            logger.info("adb monkey launch %s succeeded", package)
+            info_log("collector", f"adb monkey launch {package} succeeded")
             return True
-        logger.warning("adb monkey launch failed: %s", result.stderr.strip())
+        info_log("collector", f"WARNING: adb monkey launch failed: {result.stderr.strip()}")
         return False
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        logger.warning("adb monkey launch unavailable: %s", e)
+        info_log("collector", f"WARNING: adb monkey launch unavailable: {e}")
         return False
+
+
+def _adb_resolve_launcher(package: str) -> str | None:
+    """Resolve the launcher activity component name for a package.
+
+    Uses ``cmd package resolve-activity`` to find the MAIN/LAUNCHER
+    activity, which is more reliable than ``am start -p`` on many
+    Android versions.
+
+    Returns:
+        Component string like ``com.example/.MainActivity``, or None.
+    """
+    try:
+        result = subprocess.run(
+            ["adb", "shell", "cmd", "package", "resolve-activity",
+             "--brief", "-c", "android.intent.category.LAUNCHER", package],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if "/" in line and package in line:
+                return line
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 def _adb_launch_app(package: str) -> bool:
-    """Launch an app via adb using LAUNCHER intent. Returns True on success.
-
-    Uses ``am start`` with the MAIN/LAUNCHER intent and package filter,
-    which is more portable than resolving a specific activity name.
+    """Launch an app via adb. Returns True on success.
 
     Strategy:
-        1. Try ``am start -a MAIN -c LAUNCHER -p {package}``.
-        2. Fallback to ``monkey`` command if start fails.
+        1. Resolve launcher activity via ``cmd package resolve-activity``.
+        2. Launch via ``am start -n component`` (most reliable).
+        3. Fallback to ``am start -a MAIN -c LAUNCHER -p`` (less reliable).
+        4. Fallback to ``monkey`` command.
     """
+    # Strategy 1: resolve component, then am start -n
+    component = _adb_resolve_launcher(package)
+    if component:
+        try:
+            result = subprocess.run(
+                ["adb", "shell", "am", "start", "-n", component],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and "Error" not in result.stdout:
+                info_log("collector", f"adb am start -n {component} succeeded")
+                return True
+            info_log("collector", f"WARNING: adb am start -n failed: {result.stderr.strip() or result.stdout.strip()}")
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            info_log("collector", f"WARNING: adb am start -n unavailable: {e}")
+
+    # Strategy 2: am start with intent flags
     try:
         result = subprocess.run(
             ["adb", "shell", "am", "start",
@@ -78,16 +115,15 @@ def _adb_launch_app(package: str) -> bool:
              "-p", package],
             capture_output=True, text=True, timeout=10,
         )
-        if result.returncode == 0:
-            logger.info("adb am start (intent) %s succeeded", package)
+        if result.returncode == 0 and "Error" not in result.stdout:
+            info_log("collector", f"adb am start (intent) {package} succeeded")
             return True
-        logger.warning("adb am start failed: %s", result.stderr.strip())
-
-        # Fallback: monkey command
-        return _adb_launch_monkey(package)
+        info_log("collector", f"WARNING: adb am start (intent) failed: {result.stderr.strip() or result.stdout.strip()}")
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        logger.warning("adb launch unavailable: %s", e)
-        return False
+        info_log("collector", f"WARNING: adb am start (intent) unavailable: {e}")
+
+    # Strategy 3: monkey command
+    return _adb_launch_monkey(package)
 
 
 def _read_perfetto_config() -> dict:
@@ -200,7 +236,7 @@ def collector_node(state: AgentState) -> dict:
         state = {**state, "_trace_path": ""}
 
     skip_wait = state.get("skip_wait", False)
-    logger.info("Starting trace collection (route=%s)...", route)
+    info_log("collector", f"Starting trace collection (route={route})...")
 
     # Cold start auto ADB launch: force-stop before trace, launch after
     cold_start_target = None
@@ -213,53 +249,53 @@ def collector_node(state: AgentState) -> dict:
         )
         if cold_start_target:
             if _check_adb_available():
-                logger.info("Cold start mode: force-stopping %s", cold_start_target)
+                info_log("collector", f"Cold start mode: force-stopping {cold_start_target}")
                 _adb_force_stop(cold_start_target)
             else:
-                logger.warning(
-                    "adb not found in PATH, skipping cold start auto-launch. "
+                info_log("collector",
+                    "WARNING: adb not found in PATH, skipping cold start auto-launch. "
                     "Manually stop the app before tracing for best results."
                 )
                 cold_start_target = None  # Disable auto-launch
         else:
-            logger.warning("Cold start mode but no --target specified, skipping auto ADB launch")
+            info_log("collector", "WARNING: Cold start mode but no --target specified, skipping auto ADB launch")
 
     # Notify app to ensure hooks are ready before collecting
     if skip_wait:
-        logger.info("--no-wait: skipping app connection wait, starting trace immediately")
+        info_log("collector", "--no-wait: skipping app connection wait, starting trace immediately")
     else:
         try:
             from smartinspector.ws.server import SIServer
             server = SIServer.get()
             if server.has_connections():
-                logger.info("Sending start_trace, waiting for hook ACK...")
+                info_log("collector", "Sending start_trace, waiting for hook ACK...")
                 ack_ok = server.send_start_trace(timeout=5.0)
                 if ack_ok:
-                    logger.info("Hook ACK received, hooks ready")
+                    info_log("collector", "Hook ACK received, hooks ready")
                 else:
-                    logger.warning("Hook ACK timeout, proceeding anyway")
+                    info_log("collector", "WARNING: Hook ACK timeout, proceeding anyway")
             elif server.is_running():
-                logger.info("No app connected, waiting for app to connect...")
+                info_log("collector", "No app connected, waiting for app to connect...")
                 connected = server.wait_for_connection(timeout=30.0)
                 if connected:
-                    logger.info("App connected, sending start_trace...")
+                    info_log("collector", "App connected, sending start_trace...")
                     ack_ok = server.send_start_trace(timeout=5.0)
                     if ack_ok:
-                        logger.info("Hook ACK received, hooks ready")
+                        info_log("collector", "Hook ACK received, hooks ready")
                     else:
-                        logger.warning("Hook ACK timeout, proceeding anyway")
+                        info_log("collector", "WARNING: Hook ACK timeout, proceeding anyway")
                 else:
-                    logger.warning("App connection timeout, proceeding without hook readiness check")
+                    info_log("collector", "WARNING: App connection timeout, proceeding without hook readiness check")
             else:
-                logger.info("WS server not running, proceeding without hook readiness check")
+                info_log("collector", "WS server not running, proceeding without hook readiness check")
         except Exception as e:
-            logger.warning("start_trace ACK failed: %s", e)
+            info_log("collector", f"WARNING: start_trace ACK failed: {e}")
 
     try:
         # Check for pre-existing trace file (skip device collection)
         preloaded_trace = state.get("_trace_path", "")
         if preloaded_trace and os.path.isfile(preloaded_trace):
-            logger.info("Pre-loaded trace file: %s (skipping device collection)", preloaded_trace)
+            info_log("collector", f"Pre-loaded trace file: {preloaded_trace} (skipping device collection)")
             trace_path = preloaded_trace
             target_process = state.get("trace_target_process") or None
         else:
@@ -283,7 +319,7 @@ def collector_node(state: AgentState) -> dict:
             collect_cpu_callstacks = pc.get("collectCpuCallstacks", True)
             collect_java_heap = pc.get("collectJavaHeap", True)
 
-            logger.info("Config: duration=%dms, buffer=%dKB", duration_ms, buffer_size_kb)
+            info_log("collector", f"Config: duration={duration_ms}ms, buffer={buffer_size_kb}KB")
 
             # Cold start: ensure target_process is set in state for downstream nodes
             if is_startup and cold_start_target and not target_process:
@@ -294,7 +330,7 @@ def collector_node(state: AgentState) -> dict:
             if cold_start_target:
                 _launch_target = cold_start_target
                 def on_record_start():
-                    logger.info("Cold start mode: launching %s (during trace recording)", _launch_target)
+                    info_log("collector", f"Cold start mode: launching {_launch_target} (during trace recording)")
                     _adb_launch_app(_launch_target)
 
             trace_path = PerfettoCollector.pull_trace_from_device(
@@ -307,7 +343,7 @@ def collector_node(state: AgentState) -> dict:
                 collect_java_heap=collect_java_heap if target_process else False,
                 on_record_start=on_record_start,
             )
-            logger.info("Trace saved to %s", trace_path)
+            info_log("collector", f"Trace saved to {trace_path}")
             debug_log("collector", f"trace_path: {trace_path}")
 
         collector = PerfettoCollector(trace_path, target_process=target_process)
@@ -319,7 +355,7 @@ def collector_node(state: AgentState) -> dict:
             from smartinspector.ws.server import SIServer
             server = SIServer.get()
             if server.has_connections():
-                logger.info("Requesting block events from app...")
+                info_log("collector", "Requesting block events from app...")
                 ws_events = server.request_block_events(timeout=5.0)
                 if ws_events:
                     # Merge: SQL data as primary (has precise ts_ns), WS supplements stack_trace
@@ -334,15 +370,15 @@ def collector_node(state: AgentState) -> dict:
 
                     merged = _merge_block_events(sql_events, ws_list)
                     summary.block_events = merged
-                    logger.info("Merged %d SQL + %d WS block events -> %d total", len(sql_events), len(ws_list), len(merged))
+                    info_log("collector", f"Merged {len(sql_events)} SQL + {len(ws_list)} WS block events -> {len(merged)} total")
                 else:
-                    logger.info("No block events from app")
+                    info_log("collector", "No block events from app")
         except Exception as e:
-            logger.warning("Block events request failed: %s", e)
+            info_log("collector", f"WARNING: Block events request failed: {e}")
 
         perf_json = summary.to_json()
 
-        logger.info("Analysis complete (%d bytes)", len(perf_json))
+        info_log("collector", f"Analysis complete ({len(perf_json)} bytes)")
 
         return {
             "messages": [AIMessage(content="[trace collected and analyzed]")],
@@ -360,7 +396,7 @@ def collector_node(state: AgentState) -> dict:
             "2. Run `/trace` with a pre-existing trace file\n"
             "3. Use `/config` to check device connection status"
         )
-        logger.error(error_msg)
+        info_log("collector", f"ERROR: {error_msg}")
         return {
             "messages": [AIMessage(content=error_msg)],
             "perf_summary": "",

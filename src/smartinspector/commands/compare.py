@@ -1,11 +1,8 @@
 """Historical comparison command: /compare."""
 
 import json
-import logging
 
 from smartinspector.storage.store import load_analysis_result, list_saved_analyses
-
-logger = logging.getLogger(__name__)
 
 
 def cmd_compare(args: str, state: dict) -> dict:

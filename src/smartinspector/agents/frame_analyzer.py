@@ -5,16 +5,14 @@ data, runs source code attribution, and calls LLM for frame-level analysis.
 """
 
 import json
-import logging
 import threading
 
 from langchain_openai import ChatOpenAI
 
 from smartinspector.config import get_llm_kwargs
+from smartinspector.debug_log import info_log
 from smartinspector.prompts import load_prompt
 from smartinspector.token_tracker import get_tracker
-
-logger = logging.getLogger(__name__)
 
 _prompt = load_prompt("frame-analyzer")
 _llm = None
@@ -128,14 +126,12 @@ def analyze_frame(trace_path: str, ts_ns: int, dur_ns: int,
     from smartinspector.agents.verifier import verify_analysis
     verification = verify_analysis(result, hints)
     if not verification.passed:
-        logger.warning(
-            "Frame analysis verification issues: %s (score=%.2f)",
-            "; ".join(verification.issues),
-            verification.score,
+        info_log("frame_analyzer",
+            f"WARNING: Frame analysis verification issues: {'; '.join(verification.issues)} (score={verification.score:.2f})"
         )
         if verification.warnings:
             for w in verification.warnings:
-                logger.warning("  %s", w)
+                info_log("frame_analyzer", f"WARNING:   {w}")
 
     return result
 

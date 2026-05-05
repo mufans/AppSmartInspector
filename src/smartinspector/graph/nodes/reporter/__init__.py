@@ -1,11 +1,9 @@
 """Reporter node: generate final report (pipeline step 4)."""
 
-import logging
-
 from langchain_core.messages import AIMessage
 
 from smartinspector.config import get_report_max_tokens
-from smartinspector.debug_log import debug_log
+from smartinspector.debug_log import debug_log, info_log
 
 from smartinspector.graph.state import AgentState
 from smartinspector.graph.nodes.reporter.formatter import (
@@ -14,8 +12,6 @@ from smartinspector.graph.nodes.reporter.formatter import (
 )
 from smartinspector.graph.nodes.reporter.generator import generate_report
 from smartinspector.graph.nodes.reporter.persistence import save_report
-
-logger = logging.getLogger(__name__)
 
 
 def reporter_node(state: AgentState) -> dict:
@@ -44,7 +40,7 @@ def reporter_node(state: AgentState) -> dict:
 
         # Pre-generate report header tables
         trace_path = state.get("_trace_path", "")
-        logger.debug("trace_path from state: '%s'", trace_path)
+        debug_log("reporter", f"trace_path from state: '{trace_path}'")
 
         header_md = _build_report_header(perf_json, trace_path)
         # Insert header after attribution and perf sections
@@ -64,9 +60,9 @@ def reporter_node(state: AgentState) -> dict:
 
     print("\n  [reporter] Generating report...", flush=True)  # noqa: LOG — user-facing progress
     if state.get("_trace_path"):
-        logger.info("Trace file: %s", state['_trace_path'])
+        info_log("reporter", f"Trace file: {state['_trace_path']}")
     else:
-        logger.warning("no trace_path in state")
+        info_log("reporter", "WARNING: no trace_path in state")
 
     user_content = "\n\n".join(user_parts)
 
@@ -111,9 +107,9 @@ def reporter_node(state: AgentState) -> dict:
             attribution_result=attribution_result,
             trace_path=state.get("_trace_path", ""),
         )
-        logger.info("Auto-saved analysis result for comparison: %s", analysis_path)
+        info_log("reporter", f"Auto-saved analysis result for comparison: {analysis_path}")
     except Exception as e:
-        logger.debug("Auto-save analysis result failed: %s", e)
+        debug_log("reporter", f"Auto-save analysis result failed: {e}")
 
     return {
         "messages": [AIMessage(content=complete_report)],

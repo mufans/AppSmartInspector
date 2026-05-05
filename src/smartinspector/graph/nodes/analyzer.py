@@ -1,13 +1,10 @@
 """Analyzer nodes: perf_analyzer_node and analyzer_node."""
 
-import logging
-
 from langchain_core.messages import AIMessage
 
 from smartinspector.agents.perf_analyzer import analyze_perf
+from smartinspector.debug_log import info_log
 from smartinspector.graph.state import AgentState, node_error_handler
-
-logger = logging.getLogger(__name__)
 
 
 @node_error_handler("perf_analyzer")
@@ -55,9 +52,9 @@ def analyzer_node(state: AgentState) -> dict:
             "_trace_path": state.get("_trace_path", ""),
         }
 
-    logger.info("Analyzing performance...")
+    info_log("analyzer", "Analyzing performance...")
     analysis = analyze_perf(perf_json)
-    logger.info("Analysis complete (%d chars)", len(analysis))
+    info_log("analyzer", f"Analysis complete ({len(analysis)} chars)")
 
     return {
         "messages": [AIMessage(content=analysis)],

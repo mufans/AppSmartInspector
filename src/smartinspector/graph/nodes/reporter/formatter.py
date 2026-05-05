@@ -195,10 +195,10 @@ def format_attribution_section(attribution_result: str) -> list[str]:
                   and r.get("reason") not in ("system_class", "found", "parse_failed", "error")]
 
     if failed:
-        import logging
-        logging.getLogger("smartinspector.reporter").debug(
-            "Skipped %d failed/error attribution entries (parse_failed or error)",
-            len(failed),
+        from smartinspector.debug_log import debug_log
+        debug_log(
+            "reporter",
+            f"Skipped {len(failed)} failed/error attribution entries (parse_failed or error)",
         )
 
     if found:
