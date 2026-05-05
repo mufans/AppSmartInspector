@@ -139,14 +139,13 @@ def _can_use_fast_path(group: list[dict]) -> bool:
 
     Fast path conditions:
       - All issues are java type (not xml)
-      - No anonymous inner classes ($ in class_name)
       - Method name is known (not "unknown" or empty)
+      - Anonymous inner classes ($ in class_name) are allowed — fast path
+        will extract the outer class name for glob search, then use
+        context_method for grep if available, or method_name directly.
     """
     for issue in group:
         if issue.get("search_type") != "java":
-            return False
-        cn = issue.get("class_name", "")
-        if "$" in cn:
             return False
         mn = issue.get("method_name", "")
         if not mn or mn == "unknown":
@@ -748,11 +747,34 @@ def _search_group(group: list[dict], file_cache: _FileCache, on_progress=None) -
                 # Skip any leading ToolMessages that lost their AIMessage context
                 while len(trimmed) > 2 and isinstance(trimmed[2], ToolMessage):
                     trimmed.pop(2)
-                messages = trimmed
+                # DeepSeek thinking mode: strip reasoning_content from trimmed AIMessages
+                # to avoid "reasoning_content must be passed back" errors
+                cleaned = []
+                for msg in trimmed:
+                    if isinstance(msg, AIMessage) and hasattr(msg, 'reasoning_content'):
+                        # Reconstruct without reasoning_content
+                        cleaned.append(AIMessage(
+                            content=msg.content,
+                            tool_calls=msg.tool_calls if hasattr(msg, 'tool_calls') else [],
+                            id=msg.id,
+                        ))
+                    else:
+                        cleaned.append(msg)
+                messages = cleaned
 
             debug_log("attributor", f"iteration {iteration}: invoking LLM ({len(messages)} messages)...")
             response = llm.invoke(messages)
             debug_log("attributor", f"iteration {iteration}: LLM responded")
+
+            # DeepSeek thinking mode: strip reasoning_content from response
+            # to prevent "reasoning_content must be passed back" errors on
+            # subsequent calls (the trimmed message history won't contain it)
+            if hasattr(response, 'reasoning_content') and response.reasoning_content:
+                response = AIMessage(
+                    content=response.content,
+                    tool_calls=response.tool_calls if hasattr(response, 'tool_calls') else [],
+                    id=response.id,
+                )
 
             # Record token usage
             get_tracker().record_from_message("attributor", response)
