@@ -142,10 +142,9 @@ def _startup_report(
 
     parts: list[str] = [startup_report]
 
-    # Append attribution section
+    # Append attribution sections (format_attribution_section includes its own headers)
     attr_sections = format_attribution_section(attribution_result)
     if attr_sections:
-        parts.append("### 源码归因\n")
         parts.extend(attr_sections)
 
     # Build header from perf_summary if available

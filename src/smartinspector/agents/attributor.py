@@ -741,8 +741,14 @@ def _search_group(group: list[dict], file_cache: _FileCache, on_progress=None) -
         for iteration in range(max_iterations):
             # Message window trimming: keep system(0) + human(1) + recent 6 rounds
             # Each round = 1 AIMessage + 1 ToolMessage = 2 messages
+            # IMPORTANT: ToolMessages must always follow an AIMessage with tool_calls.
+            # Find a safe trim point where the first kept message is NOT a ToolMessage.
             if len(messages) > 16:
-                messages = [messages[0], messages[1]] + messages[-12:]
+                trimmed = [messages[0], messages[1]] + messages[-12:]
+                # Skip any leading ToolMessages that lost their AIMessage context
+                while len(trimmed) > 2 and isinstance(trimmed[2], ToolMessage):
+                    trimmed.pop(2)
+                messages = trimmed
 
             debug_log("attributor", f"iteration {iteration}: invoking LLM ({len(messages)} messages)...")
             response = llm.invoke(messages)
