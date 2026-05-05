@@ -1,7 +1,16 @@
-"""Global debug logging for pipeline data inspection.
+"""Unified logging for SmartInspector pipeline.
 
-Enable via environment variable ``SI_DEBUG=1`` or CLI flag ``--debug``.
-Logs are written to ``reports/debug_{timestamp}.log``.
+All logging goes to ``reports/debug_{timestamp}.log`` — nothing is written
+to the console.
+
+Two levels:
+
+- ``info_log(category, message)`` — always written (pipeline progress,
+  warnings, errors).  Replaces ``logging.info/warning/error``.
+- ``debug_log(category, message)`` — only written when ``SI_DEBUG=1``
+  or ``--debug`` flag is set (detailed diagnostics, SQL queries, raw data).
+
+Enable verbose mode: ``SI_DEBUG=1`` or ``--debug``.
 """
 
 import datetime
@@ -25,24 +34,45 @@ def get_debug_log_path() -> pathlib.Path | None:
     return _log_path
 
 
+def _ensure_log_file() -> None:
+    """Create the log file and reports directory if needed."""
+    global _log_path
+    if _log_path is None:
+        _REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        _log_path = _REPORTS_DIR / f"debug_{ts}.log"
+
+
+def _write(category: str, message: str) -> None:
+    """Write a timestamped line to the log file (thread-safe)."""
+    with _lock:
+        _ensure_log_file()
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        line = f"[{ts}] [{category}] {message}\n"
+        with _log_path.open("a", encoding="utf-8") as f:  # type: ignore[union-attr]
+            f.write(line)
+
+
+def info_log(category: str, message: str) -> None:
+    """Log an info-level message (always written, regardless of SI_DEBUG).
+
+    Args:
+        category: Module identifier (collector, attributor, reporter, ws, etc.)
+        message: Log message
+    """
+    _write(category, message)
+
+
 def debug_log(category: str, message: str) -> None:
-    """Append a timestamped debug entry to the log file.
+    """Log a debug-level message (only written when SI_DEBUG=1).
 
     Safe to call from any thread; writes are serialised.
     If debug mode is off this is a no-op.
+
+    Args:
+        category: Module identifier (collector, attributor, reporter, ws, etc.)
+        message: Log message
     """
     if not is_debug_enabled():
         return
-
-    global _log_path
-
-    with _lock:
-        if _log_path is None:
-            _REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            _log_path = _REPORTS_DIR / f"debug_{ts}.log"
-
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        line = f"[{ts}] [{category}] {message}\n"
-        with _log_path.open("a", encoding="utf-8") as f:
-            f.write(line)
+    _write(category, message)

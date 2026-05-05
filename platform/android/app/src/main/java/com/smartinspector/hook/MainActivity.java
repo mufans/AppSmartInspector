@@ -1,10 +1,11 @@
 package com.smartinspector.hook;
 
-import android.app.Activity;
+import android.content.Intent;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.widget.Button;
 import android.widget.FrameLayout;
 
 import androidx.fragment.app.FragmentActivity;
@@ -14,6 +15,7 @@ import androidx.recyclerview.widget.RecyclerView;
 import com.smartinspector.hook.adapter.DemoAdapter;
 import com.smartinspector.hook.model.Item;
 import com.smartinspector.hook.repository.DataRepository;
+import com.smartinspector.hook.ui.ComposeDemoActivity;
 import com.smartinspector.hook.ui.DetailFragment;
 import com.smartinspector.hook.worker.CpuBurnWorker;
 
@@ -34,6 +36,12 @@ public class MainActivity extends FragmentActivity {
 
         rv = findViewById(R.id.recycler_view);
         rv.setLayoutManager(new LinearLayoutManager(this));
+
+        Button composeBtn = findViewById(R.id.btn_compose_demo);
+        composeBtn.setOnClickListener(v -> {
+            Intent intent = new Intent(this, ComposeDemoActivity.class);
+            startActivity(intent);
+        });
 
         cpuBurner.start(4);
         cpuBurner.startMainThreadWork(handler);

@@ -19,5 +19,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Compose demo page for testing ComposeHook recomposition tracking -->
+        <activity
+            android:name=".ui.ComposeDemoActivity"
+            android:exported="false"
+            android:label="Compose Demo" />
     </application>
 </manifest>

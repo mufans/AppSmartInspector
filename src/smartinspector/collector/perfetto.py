@@ -1,5 +1,7 @@
 """PerfettoCollector: adb collect -> SQL query -> unified JSON."""
 
+from __future__ import annotations
+
 import bisect
 import json
 import os
@@ -11,9 +13,7 @@ from pathlib import Path
 from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
 from smartinspector.perfetto_compat import patch
-
-import logging
-logger = logging.getLogger(__name__)
+from smartinspector.debug_log import info_log, debug_log
 
 # Apply macOS IPv4 fix
 patch()
@@ -42,6 +42,24 @@ def _parse_siblock_msg(msg: str) -> list[str]:
     return frames
 
 
+def _map_state_label(raw_state: str) -> str:
+    """Map kernel thread state to human-readable label."""
+    mapping = {
+        "Running": "Running",
+        "R": "Running",
+        "R+": "Running",
+        "S": "Sleeping",
+        "S+": "Sleeping",
+        "D": "DiskSleep",
+        "D+": "DiskSleep",
+        "T": "Stopped",
+        "t": "Traced",
+        "X": "Dead",
+        "Z": "Zombie",
+    }
+    return mapping.get(raw_state, raw_state)
+
+
 @dataclass
 class PerfSummary:
     """Unified performance summary (~2KB JSON)."""
@@ -56,7 +74,9 @@ class PerfSummary:
     metadata: dict = field(default_factory=dict)
     block_events: list[dict] = field(default_factory=list)
     input_events: list[dict] = field(default_factory=list)
+    compose_slices: dict = field(default_factory=dict)
     sys_stats: dict = field(default_factory=dict)
+    thread_state: list[dict] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, ensure_ascii=False)
@@ -65,10 +85,13 @@ class PerfSummary:
 class PerfettoCollector:
     """Collect and analyze Android Perfetto traces."""
 
-    def __init__(self, trace_path: str, shell_path: str | None = None):
+    def __init__(self, trace_path: str, shell_path: str | None = None,
+                 target_process: str | None = None):
         self.trace_path = trace_path
         self.shell_path = shell_path or str(SHELL_BIN)
         self._tp: TraceProcessor | None = None
+        self._target_process_cache: dict | None = None  # cached resolve result
+        self._target_package: str | None = target_process
 
     def _open(self) -> TraceProcessor:
         if self._tp is not None:
@@ -79,6 +102,91 @@ class PerfettoCollector:
         )
         self._tp = TraceProcessor(trace=self.trace_path, config=config)
         return self._tp
+
+    def _resolve_target_process(self, package_name: str | None = None) -> dict:
+        """Resolve target process info (upid, pid, uid) from package name.
+
+        Tries ``process`` table first, falls back to ``package_list`` table
+        for cold-start scenarios where the process table may be empty.
+
+        Args:
+            package_name: Android package name, e.g. "com.example.app".
+                          Falls back to ``self._target_package`` if not provided.
+
+        Returns:
+            Dict with keys: upid, pid, uid, name, source ("process"|"package_list"|"")
+        """
+        package_name = package_name or self._target_package
+        if not package_name:
+            return {}
+        if self._target_process_cache is not None:
+            return self._target_process_cache
+
+        result = {"upid": None, "pid": None, "uid": None, "name": package_name, "source": ""}
+        tp = self._open()
+
+        # Strategy 1: direct lookup in process table
+        try:
+            rows = tp.query(f"""
+                SELECT upid, pid, uid
+                FROM process
+                WHERE name = '{package_name}'
+                LIMIT 1
+            """)
+            for r in rows:
+                result["upid"] = r.upid
+                result["pid"] = r.pid
+                result["uid"] = r.uid
+                result["source"] = "process"
+                break
+        except Exception as e:
+            debug_log("perfetto", f"process table lookup failed: {e}")
+
+        # Strategy 2: fallback to package_list -> uid -> process
+        if not result["upid"]:
+            try:
+                uid = None
+                pl_rows = tp.query(f"""
+                    SELECT uid
+                    FROM package_list
+                    WHERE package_name = '{package_name}'
+                    LIMIT 1
+                """)
+                for r in pl_rows:
+                    uid = r.uid
+                    break
+
+                if uid is not None:
+                    result["uid"] = uid
+                    # Find process by uid
+                    proc_rows = tp.query(f"""
+                        SELECT upid, pid, name
+                        FROM process
+                        WHERE uid = {uid}
+                        LIMIT 1
+                    """)
+                    for r in proc_rows:
+                        result["upid"] = r.upid
+                        result["pid"] = r.pid
+                        result["name"] = r.name
+                        result["source"] = "package_list"
+                        break
+
+                    if not result["upid"]:
+                        # package_list found UID but process not in process table yet
+                        # (cold start: process hasn't started during trace)
+                        result["source"] = "package_list_uid_only"
+                        debug_log("perfetto", f"package_list fallback: found uid={uid} for {package_name} but no process entry")
+            except Exception as e:
+                debug_log("perfetto", f"package_list fallback failed: {e}")
+
+        if result["source"]:
+            debug_log("perfetto", f"resolved target process: {package_name} -> upid={result['upid']}, pid={result['pid']}, uid={result['uid']} (via {result['source']})")
+        else:
+            debug_log("perfetto", f"could not resolve target process: {package_name}")
+
+        self._target_process_cache = result
+        return result
 
     def close(self):
         if self._tp:
@@ -142,7 +250,7 @@ class PerfettoCollector:
                     "occurrences": r.occurrences,
                 })
         except Exception as e:
-            logger.debug("sched_blocked_reason query failed: %s", e)
+            debug_log("perfetto", f"sched_blocked_reason query failed: {e}")
 
         result = {"hot_threads": hot_threads}
         if blocked_reasons:
@@ -171,7 +279,7 @@ class PerfettoCollector:
                 LIMIT 20
             """)
         except Exception as e:
-            logger.debug("CPU hotspot query failed: %s", e)
+            debug_log("perfetto", f"CPU hotspot query failed: {e}")
             return []
 
         if not rows:
@@ -188,7 +296,7 @@ class PerfettoCollector:
             for r in cs_rows:
                 callsite_map[r.id] = (r.name, r.parent_id)
         except Exception as e:
-            logger.debug("callsite_map query failed: %s", e)
+            debug_log("perfetto", f"callsite_map query failed: {e}")
 
         hotspots = []
         for r in rows:
@@ -243,7 +351,7 @@ class PerfettoCollector:
             for r in exp_rows:
                 expected_map[r.display_frame_token] = round(r.expected_dur_ns / 1e6, 2)
         except Exception as e:
-            logger.debug("Expected frame timeline query failed: %s", e)
+            debug_log("perfetto", f"Expected frame timeline query failed: {e}")
 
         try:
             rows = tp.query("""
@@ -260,7 +368,7 @@ class PerfettoCollector:
                 ORDER BY frame_ts ASC
             """)
         except Exception as e:
-            logger.debug("Frame timeline query failed: %s", e)
+            debug_log("perfetto", f"Frame timeline query failed: {e}")
             return {}
 
         # User-impacting jank types per Perfetto/SurfaceFlinger docs:
@@ -344,7 +452,7 @@ class PerfettoCollector:
             else:
                 return {}
         except Exception as e:
-            logger.debug("Trace bounds query failed: %s", e)
+            debug_log("perfetto", f"Trace bounds query failed: {e}")
             return {}
 
         trace_dur_ns = trace_end_ns - trace_start_ns
@@ -359,7 +467,7 @@ class PerfettoCollector:
                 num_cpus = max(1, cr.num_cpus)
                 break
         except Exception as e:
-            logger.debug("CPU count query failed: %s", e)
+            debug_log("perfetto", f"CPU count query failed: {e}")
             num_cpus = 1
 
         # Per-thread CPU usage from sched table
@@ -380,7 +488,7 @@ class PerfettoCollector:
                 LIMIT 20
             """)
         except Exception as e:
-            logger.debug("CPU usage query failed: %s", e)
+            debug_log("perfetto", f"CPU usage query failed: {e}")
             return {}
 
         # Total CPU wall-time available = trace_dur * num_cpus
@@ -453,7 +561,7 @@ class PerfettoCollector:
             if samples:
                 result["cpu_idle_samples"] = samples
         except Exception as e:
-            logger.debug("CPU idle samples query failed: %s", e)
+            debug_log("perfetto", f"CPU idle samples query failed: {e}")
 
         # 2. CPU frequency per core
         try:
@@ -476,7 +584,7 @@ class PerfettoCollector:
             if freq_by_core:
                 result["cpu_freq_by_core"] = freq_by_core
         except Exception as e:
-            logger.debug("CPU frequency query failed: %s", e)
+            debug_log("perfetto", f"CPU frequency query failed: {e}")
 
         # 3. Fork rate
         try:
@@ -493,7 +601,7 @@ class PerfettoCollector:
             if forks:
                 result["fork_rate"] = forks
         except Exception as e:
-            logger.debug("Fork rate query failed: %s", e)
+            debug_log("perfetto", f"Fork rate query failed: {e}")
 
         return result
 
@@ -538,39 +646,56 @@ class PerfettoCollector:
             if processes:
                 return {"processes": processes}
         except Exception as e:
-            logger.debug("Process memory query failed: %s", e)
+            debug_log("perfetto", f"Process memory query failed: {e}")
 
         return {}
 
     def collect_memory(self) -> dict:
-        """Collect Java heap memory from android.java_hprof data."""
-        tp = self._open()
-        try:
-            rows = tp.query("""
-                SELECT
-                  c.name AS class_name,
-                  COUNT(*) AS obj_count,
-                  SUM(o.self_size) AS total_bytes
-                FROM heap_graph_object o
-                JOIN heap_graph_class c ON o.type_id = c.id
-                WHERE o.reachable = 1
-                GROUP BY c.name
-                ORDER BY total_bytes DESC
-                LIMIT 15
-            """)
-        except Exception as e:
-            # heap_graph tables may not exist if no Java heap dump
-            logger.debug("Heap graph query failed: %s", e)
-            return {}
+        """Collect Java heap memory from android.java_hprof data.
 
-        allocs = []
-        for r in rows:
-            allocs.append({
-                "class_name": r.class_name,
-                "obj_count": r.obj_count,
-                "total_size_kb": round(r.total_bytes / 1024, 1),
-            })
-        return {"heap_graph_classes": allocs}
+        Uses heap_graph tables for detailed allocation analysis including
+        leak suspects and dominator trees.
+        """
+        from smartinspector.collector.memory import collect_heap_graph_analysis
+
+        tp = self._open()
+
+        # Resolve target upid for process-scoped queries
+        target_upid = None
+        if self._target_process_cache:
+            target_upid = self._target_process_cache.get("upid")
+
+        # Detailed heap graph analysis
+        result = collect_heap_graph_analysis(tp, target_upid)
+
+        # Fallback: if heap_graph_analysis returned nothing, try basic query
+        if not result:
+            try:
+                rows = tp.query("""
+                    SELECT
+                      c.name AS class_name,
+                      COUNT(*) AS obj_count,
+                      SUM(o.self_size) AS total_bytes
+                    FROM heap_graph_object o
+                    JOIN heap_graph_class c ON o.type_id = c.id
+                    WHERE o.reachable = 1
+                    GROUP BY c.name
+                    ORDER BY total_bytes DESC
+                    LIMIT 15
+                """)
+                allocs = []
+                for r in rows:
+                    allocs.append({
+                        "class_name": r.class_name,
+                        "obj_count": r.obj_count,
+                        "total_size_kb": round(r.total_bytes / 1024, 1),
+                    })
+                if allocs:
+                    result["heap_graph_classes"] = allocs
+            except Exception as e:
+                debug_log("perfetto", f"Basic heap graph query failed: {e}")
+
+        return result
 
     def collect_threads(self) -> list[dict]:
         """Collect thread info."""
@@ -661,11 +786,11 @@ class PerfettoCollector:
                             """)
                             rows = list(rows) + [r for r in gp_rows if not r.name.startswith("SI$touch#")]
                         except Exception as e:
-                            logger.debug("Grandparent slice query failed: %s", e)
+                            debug_log("perfetto", f"Grandparent slice query failed: {e}")
                 except Exception as e:
-                    logger.debug("Parent slice query failed: %s", e)
+                    debug_log("perfetto", f"Parent slice query failed: {e}")
         except Exception as e:
-            logger.debug("View slices query failed: %s", e)
+            debug_log("perfetto", f"View slices query failed: {e}")
             return {}
 
         slices = []
@@ -820,12 +945,67 @@ class PerfettoCollector:
                 "breakdown": breakdown,
             })
 
-        return {
+        # ---- P1-5: Annotate slices with target process info ----
+        target_process_info = {}
+        # Extract target process from metadata if available
+        target_pkg = self._target_process_cache.get("name", "") if self._target_process_cache else ""
+        if target_pkg:
+            target_process_info = self._resolve_target_process(target_pkg)
+        elif self._target_process_cache is None:
+            # Try to detect target process from slowest slices
+            # SI$ slices contain class names that include the package name
+            for s in slowest[:3]:
+                name = s.get("name", "")
+                if name.startswith("SI$"):
+                    # e.g. SI$com.example.app.Class.method
+                    body = name[3:]
+                    # Extract potential package from class name
+                    parts = body.split(".")
+                    if len(parts) >= 3:
+                        candidate_pkg = ".".join(parts[:3])
+                        info = self._resolve_target_process(candidate_pkg)
+                        if info.get("upid"):
+                            target_process_info = info
+                            break
+
+        # Annotate slowest slices with their process name (via track_id)
+        if target_process_info.get("upid"):
+            target_upid = target_process_info["upid"]
+            try:
+                # Build track_id -> upid mapping for the slowest slices
+                track_ids = set(s.get("track_id") for s in slowest if s.get("track_id"))
+                if track_ids:
+                    id_list = ",".join(str(tid) for tid in track_ids)
+                    track_proc_map = {}
+                    for r in tp.query(f"""
+                        SELECT t.id AS track_id, p.upid, p.name AS process_name
+                        FROM thread_track t
+                        JOIN thread th ON t.utid = th.utid
+                        JOIN process p ON th.upid = p.upid
+                        WHERE t.id IN ({id_list})
+                    """):
+                        track_proc_map[r.track_id] = {"upid": r.upid, "name": r.process_name}
+
+                    for s in slowest:
+                        proc_info = track_proc_map.get(s.get("track_id"))
+                        if proc_info:
+                            s["process_name"] = proc_info["name"]
+                            s["is_target"] = proc_info["upid"] == target_upid
+            except Exception as e:
+                debug_log("perfetto", f"track-process annotation failed: {e}")
+
+        result = {
             "summary": sorted(name_stats.values(), key=lambda x: -x["total_ms"]),
             "slowest_slices": slowest,
             "rv_instances": rv_sorted,
             "call_chains": call_chains,
         }
+
+        # Include target process resolution info for downstream consumers
+        if target_process_info:
+            result["target_process"] = target_process_info
+
+        return result
 
     def collect_io_slices(self) -> dict:
         """Collect IO slices (SI$net#/SI$db#/SI$img#) from all threads.
@@ -844,7 +1024,7 @@ class PerfettoCollector:
                 ORDER BY ts ASC
             """)
         except Exception as e:
-            logger.debug("IO slices query failed: %s", e)
+            debug_log("perfetto", f"IO slices query failed: {e}")
             return {}
 
         slices = []
@@ -904,7 +1084,7 @@ class PerfettoCollector:
                 ORDER BY ts ASC
             """)
         except Exception as e:
-            logger.debug("Input events query failed: %s", e)
+            debug_log("perfetto", f"Input events query failed: {e}")
             return []
 
         events = []
@@ -948,7 +1128,7 @@ class PerfettoCollector:
                 ORDER BY ts ASC
             """)
         except Exception as e:
-            logger.debug("Block events query failed: %s", e)
+            debug_log("perfetto", f"Block events query failed: {e}")
             return []
 
         block_slices = []
@@ -999,7 +1179,7 @@ class PerfettoCollector:
                     "msg": r.msg or "",
                 })
         except Exception as e:
-            logger.debug("SIBlock logcat query failed: %s", e)
+            debug_log("perfetto", f"SIBlock logcat query failed: {e}")
 
         # 3. Correlate slices with log entries by timestamp (bisect, O(n log n + m log m))
         MATCH_WINDOW_NS = 500_000_000  # 500ms
@@ -1035,6 +1215,278 @@ class PerfettoCollector:
 
         return block_slices
 
+    def collect_thread_state(self) -> list[dict]:
+        """Analyze per-slice thread state distribution with blocking details.
+
+        For each SI$ slow slice, queries the __intrinsic_thread_state table
+        to determine how much time the thread spent in each state during the
+        slice's execution window, along with blocking context (blocked_function,
+        io_wait, waker_name). Falls back to legacy thread_state table when
+        __intrinsic_thread_state is not available.
+
+        Returns a list of dicts with:
+          - slice_name: the SI$ slice name
+          - dur_ms: total slice duration
+          - state_distribution: {state: percentage} e.g. {"Running": 85.2, "Sleeping": 14.8}
+          - dominant_state: the state with the highest percentage
+          - blocked_function: kernel function where thread was blocked (or None)
+          - io_wait: whether the thread was waiting for IO (bool)
+          - waker_name: name of the thread that woke this one (or None)
+        """
+        tp = self._open()
+
+        # Resolve main thread utid
+        main_utid = self._resolve_main_utid(tp)
+        if main_utid is None:
+            return []
+
+        # Get SI$ slow slices (top 20 by duration)
+        try:
+            slice_rows = tp.query("""
+                SELECT name, ts, dur
+                FROM slice
+                WHERE name LIKE 'SI$%'
+                  AND name NOT LIKE 'SI$net#%'
+                  AND name NOT LIKE 'SI$db#%'
+                  AND name NOT LIKE 'SI$img#%'
+                  AND name NOT LIKE 'SI$touch#%'
+                  AND dur > 1000000
+                ORDER BY dur DESC
+                LIMIT 20
+            """)
+        except Exception as e:
+            debug_log("perfetto", f"thread_state: slice query failed: {e}")
+            return []
+
+        # Check if __intrinsic_thread_state table is available
+        has_intrinsic_ts = self._check_intrinsic_thread_state(tp)
+
+        if not has_intrinsic_ts:
+            debug_log("perfetto", "thread_state: __intrinsic_thread_state not available, using fallback")
+            return self._collect_thread_state_fallback(tp, main_utid, slice_rows)
+
+        # --- Primary path: __intrinsic_thread_state ---
+        results = []
+        for sr in slice_rows:
+            slice_ts = sr.ts
+            slice_end = sr.ts + sr.dur
+            slice_name = sr.name
+            dur_ms = round(sr.dur / 1e6, 2)
+
+            if dur_ms < 1.0:
+                continue
+
+            try:
+                state_rows = tp.query(f"""
+                    SELECT
+                        state,
+                        SUM(dur) AS total_ns,
+                        blocked_function,
+                        io_wait,
+                        waker_utid
+                    FROM __intrinsic_thread_state
+                    WHERE utid = {main_utid}
+                      AND ts < {slice_end}
+                      AND ts + dur > {slice_ts}
+                    GROUP BY state, blocked_function, io_wait, waker_utid
+                    ORDER BY total_ns DESC
+                """)
+            except Exception as e:
+                debug_log("perfetto", f"thread_state: __intrinsic_thread_state query failed for {slice_name}: {e}")
+                # Fall back to single-slice legacy query
+                results.append(self._query_thread_state_legacy(tp, main_utid, slice_name, slice_ts, sr.dur, dur_ms))
+                continue
+
+            # Collect waker names in a separate step (subquery in GROUP BY is unreliable)
+            state_entries = list(state_rows)
+            if not state_entries:
+                # No thread_state coverage — sleeping threads can't produce slices
+                results.append({
+                    "slice_name": slice_name,
+                    "dur_ms": dur_ms,
+                    "state_distribution": {"Running": 100.0},
+                    "dominant_state": "Running",
+                    "blocked_function": None,
+                    "io_wait": False,
+                    "waker_name": None,
+                })
+                continue
+
+            total_ns = sum(r.total_ns for r in state_entries)
+            pct_dist: dict[str, float] = {}
+            blocked_fn = None
+            io_wait = False
+            waker_name = None
+
+            for r in state_entries:
+                state_label = _map_state_label(r.state)
+                pct = round(r.total_ns / total_ns * 100, 1)
+                pct_dist[state_label] = pct_dist.get(state_label, 0) + pct
+
+                # Record blocking details from first non-Running entry
+                if state_label != "Running" and blocked_fn is None:
+                    blocked_fn = r.blocked_function
+                    io_wait = bool(r.io_wait) if r.io_wait is not None else False
+                    # Resolve waker name
+                    if r.waker_utid is not None:
+                        try:
+                            waker_rows = tp.query(f"""
+                                SELECT name FROM thread WHERE utid = {r.waker_utid} LIMIT 1
+                            """)
+                            for wr in waker_rows:
+                                waker_name = wr.name
+                                break
+                        except Exception:
+                            pass
+
+            dominant = max(pct_dist, key=pct_dist.get) if pct_dist else "unknown"
+            results.append({
+                "slice_name": slice_name,
+                "dur_ms": dur_ms,
+                "state_distribution": pct_dist,
+                "dominant_state": dominant,
+                "blocked_function": blocked_fn,
+                "io_wait": io_wait,
+                "waker_name": waker_name,
+            })
+
+        return results
+
+    def _resolve_main_utid(self, tp) -> int | None:
+        """Resolve the main thread's utid from the thread table.
+
+        Tries multiple strategies:
+          1. Thread named 'main'
+          2. Thread named after the target package (common on Android)
+          3. Thread with the lowest tid in the target process (main thread is always tid 1 in-process)
+        """
+        # Strategy 1: name = 'main'
+        try:
+            rows = tp.query("SELECT utid FROM thread WHERE name = 'main' LIMIT 1")
+            for r in rows:
+                return r.utid
+        except Exception as e:
+            debug_log("perfetto", f"thread_state: strategy 1 (name=main) failed: {e}")
+
+        # Strategy 2: thread named after target package
+        if self._target_package:
+            try:
+                rows = tp.query(f"SELECT utid FROM thread WHERE name = '{self._target_package}' LIMIT 1")
+                for r in rows:
+                    return r.utid
+            except Exception:
+                pass
+
+        # Strategy 3: lowest-tid thread in target process
+        proc = self._resolve_target_process()
+        upid = proc.get("upid")
+        if upid is not None:
+            try:
+                rows = tp.query(f"""
+                    SELECT t.utid FROM thread t
+                    JOIN process p ON t.upid = p.upid
+                    WHERE t.upid = {upid}
+                    ORDER BY t.tid ASC
+                    LIMIT 1
+                """)
+                for r in rows:
+                    return r.utid
+            except Exception as e:
+                debug_log("perfetto", f"thread_state: strategy 3 (lowest tid) failed: {e}")
+
+        debug_log("perfetto", "thread_state: could not resolve main thread utid")
+        return None
+
+    def _check_intrinsic_thread_state(self, tp) -> bool:
+        """Check if __intrinsic_thread_state table is available."""
+        try:
+            tp.query("SELECT 1 FROM __intrinsic_thread_state LIMIT 1")
+            return True
+        except Exception:
+            return False
+
+    def _collect_thread_state_fallback(self, tp, main_utid: int, slice_rows) -> list[dict]:
+        """Fallback: use legacy thread_state table (sched-based) when __intrinsic_thread_state is unavailable.
+
+        Preserves the original overlap-based calculation logic.
+        """
+        results = []
+        for sr in slice_rows:
+            slice_ts = sr.ts
+            slice_dur = sr.dur
+            slice_name = sr.name
+            dur_ms = round(slice_dur / 1e6, 2)
+
+            if dur_ms < 1.0:
+                continue
+
+            result = self._query_thread_state_legacy(tp, main_utid, slice_name, slice_ts, slice_dur, dur_ms)
+            results.append(result)
+
+        return results
+
+    def _query_thread_state_legacy(self, tp, main_utid: int, slice_name: str,
+                                    slice_ts: int, slice_dur: int, dur_ms: float) -> dict:
+        """Query single slice using legacy thread_state table."""
+        slice_end = slice_ts + slice_dur
+        try:
+            state_rows = tp.query(f"""
+                SELECT
+                  state,
+                  SUM(
+                    MIN(
+                      CASE WHEN dur < 0 THEN {slice_end} ELSE ts + dur END,
+                      {slice_end}
+                    ) -
+                    MAX(ts, {slice_ts})
+                  ) AS state_dur_ns
+                FROM thread_state
+                WHERE utid = {main_utid}
+                  AND ts < {slice_end}
+                  AND (dur < 0 OR ts + dur > {slice_ts})
+                GROUP BY state
+                ORDER BY state_dur_ns DESC
+            """)
+
+            state_dist = {}
+            total_state_ns = 0
+            for st in state_rows:
+                ns = st.state_dur_ns or 0
+                total_state_ns += ns
+                state_name = _map_state_label(st.state)
+                state_dist[state_name] = state_dist.get(state_name, 0) + ns
+
+            if total_state_ns > 0:
+                pct_dist = {
+                    k: round(v / total_state_ns * 100, 1)
+                    for k, v in state_dist.items()
+                }
+            else:
+                pct_dist = state_dist
+
+            dominant = max(pct_dist, key=pct_dist.get) if pct_dist else "unknown"
+
+            return {
+                "slice_name": slice_name,
+                "dur_ms": dur_ms,
+                "state_distribution": pct_dist,
+                "dominant_state": dominant,
+                "blocked_function": None,
+                "io_wait": False,
+                "waker_name": None,
+            }
+        except Exception as e:
+            debug_log("perfetto", f"thread_state: legacy query failed for {slice_name}: {e}")
+            return {
+                "slice_name": slice_name,
+                "dur_ms": dur_ms,
+                "state_distribution": {},
+                "dominant_state": "unknown",
+                "blocked_function": None,
+                "io_wait": False,
+                "waker_name": None,
+            }
+
     def _diagnose_tables(self) -> dict:
         """Check which key tables have data, for diagnosing empty results."""
         tp = self._open()
@@ -1043,6 +1495,7 @@ class PerfettoCollector:
             "heap_graph_object": "SELECT COUNT(*) as c FROM heap_graph_object",
             "actual_frame_timeline_slice": "SELECT COUNT(*) as c FROM actual_frame_timeline_slice",
             "sched": "SELECT COUNT(*) as c FROM sched",
+            "package_list": "SELECT COUNT(*) as c FROM package_list",
         }
         result = {}
         for table, sql in checks.items():
@@ -1054,9 +1507,85 @@ class PerfettoCollector:
                 else:
                     result[table] = 0
             except Exception as e:
-                logger.debug("Table %s query failed: %s", table, e)
+                debug_log("perfetto", f"Table {table} query failed: {e}")
                 result[table] = -1  # table doesn't exist
         return result
+
+    def collect_compose_slices(self) -> dict:
+        """Collect Jetpack Compose recomposition slices (SI$compose#).
+
+        Tag format from ComposeHook.kt:
+          SI$compose#ComposableName#first     — first composition
+          SI$compose#ComposableName#recompose — recomposition
+
+        Returns aggregated recomposition stats per composable.
+        """
+        tp = self._open()
+        try:
+            rows = tp.query("""
+                SELECT name, ts, dur, depth, track_id
+                FROM slice
+                WHERE name LIKE 'SI$compose#%'
+                ORDER BY ts ASC
+            """)
+        except Exception as e:
+            debug_log("perfetto", f"Compose slices query failed: {e}")
+            return {}
+
+        slices = []
+        # Aggregate per-composable: {name: {first_count, recompose_count, total_ms, max_ms}}
+        composable_stats: dict[str, dict] = {}
+
+        for r in rows:
+            dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
+            name = r.name
+            slices.append({
+                "name": name,
+                "ts_ns": r.ts,
+                "dur_ms": dur_ms,
+                "depth": r.depth,
+            })
+
+            # Parse: SI$compose#ComposableName#first/recompose
+            body = name[len("SI$compose#"):]
+            last_hash = body.rfind("#")
+            if last_hash >= 0:
+                composable_name = body[:last_hash]
+                compose_type = body[last_hash + 1:]  # "first" or "recompose"
+            else:
+                composable_name = body
+                compose_type = "unknown"
+
+            if composable_name not in composable_stats:
+                composable_stats[composable_name] = {
+                    "name": composable_name,
+                    "first_count": 0,
+                    "recompose_count": 0,
+                    "total_ms": 0.0,
+                    "max_ms": 0.0,
+                }
+            stats = composable_stats[composable_name]
+            if compose_type == "first":
+                stats["first_count"] += 1
+            elif compose_type == "recompose":
+                stats["recompose_count"] += 1
+            stats["total_ms"] += dur_ms
+            stats["max_ms"] = max(stats["max_ms"], dur_ms)
+
+        if not slices:
+            return {}
+
+        # Sort composables by total recomposition time (descending)
+        sorted_stats = sorted(
+            composable_stats.values(),
+            key=lambda x: -x["total_ms"],
+        )
+
+        return {
+            "total_count": len(slices),
+            "composables": sorted_stats,
+            "slowest": sorted(slices, key=lambda x: -x["dur_ms"])[:20],
+        }
 
     def summarize(self) -> PerfSummary:
         """Run all analyses and return a unified summary."""
@@ -1065,11 +1594,12 @@ class PerfettoCollector:
         # Metadata
         tp = self._open()
         try:
-            meta = tp.query("SELECT key, str_value FROM metadata")
+            meta = tp.query("SELECT name, str_value FROM metadata")
             for r in meta:
-                summary.metadata[r.key] = r.str_value
+                val = r.str_value if hasattr(r, 'str_value') else ""
+                summary.metadata[r.name] = val
         except Exception as e:
-            logger.debug("Metadata query failed: %s", e)
+            debug_log("perfetto", f"Metadata query failed: {e}")
 
         # Table diagnosis — help understand why data may be missing
         try:
@@ -1083,10 +1613,19 @@ class PerfettoCollector:
                 notes.append("Java heap (android.java_hprof): no data. Need target_process for heap dump.")
             if diag.get("actual_frame_timeline_slice", -1) <= 0:
                 notes.append("Frame timeline: no data. Device may not support SurfaceFlinger jank tracking.")
+            if diag.get("package_list", -1) < 0:
+                notes.append("package_list table not available. Cold-start process resolution disabled.")
             if notes:
                 summary.metadata["diagnosis"] = notes
         except Exception as e:
-            logger.debug("Table diagnosis failed: %s", e)
+            debug_log("perfetto", f"Table diagnosis failed: {e}")
+
+        # P1-5: Resolve target process with package_list fallback for cold-start support
+        if self._target_package:
+            resolved = self._resolve_target_process(self._target_package)
+            if resolved.get("source"):
+                summary.metadata["target_process"] = resolved
+                debug_log("perfetto", f"target process resolved via {resolved['source']}: {resolved}")
 
         # Scheduling
         try:
@@ -1148,13 +1687,41 @@ class PerfettoCollector:
         except Exception as e:
             summary.input_events = [{"error": str(e)}]
 
+        # Compose slices (SI$compose# — recomposition tracking)
+        try:
+            summary.compose_slices = self.collect_compose_slices()
+        except Exception as e:
+            summary.compose_slices = {"error": str(e)}
+
         # System-level stats (CPU idle, frequency, fork rate)
         try:
             sys_stats = self.collect_sys_stats()
             if sys_stats:
                 summary.sys_stats = sys_stats
         except Exception as e:
-            logger.debug("sys_stats collection failed: %s", e)
+            debug_log("perfetto", f"sys_stats collection failed: {e}")
+
+        # Thread state analysis (Running/S/D per SI$ slice)
+        try:
+            summary.thread_state = self.collect_thread_state()
+            debug_log("perfetto", f"thread_state: collected {len(summary.thread_state)} entries")
+            if not summary.thread_state:
+                # Diagnose why thread_state is empty
+                try:
+                    tp = self._open()
+                    ts_count = 0
+                    for r in tp.query("SELECT COUNT(*) as c FROM thread_state"):
+                        ts_count = r.c
+                        break
+                    ts_main = 0
+                    for r in tp.query("SELECT COUNT(*) as c FROM thread_state WHERE utid IN (SELECT utid FROM thread WHERE name = 'main')"):
+                        ts_main = r.c
+                        break
+                    debug_log("perfetto", f"thread_state diagnosis: total={ts_count}, main_thread={ts_main}")
+                except Exception as e2:
+                    debug_log("perfetto", f"thread_state diagnosis failed: {e2}")
+        except Exception as e:
+            debug_log("perfetto", f"thread_state collection failed: {e}")
 
         return summary
 
@@ -1168,6 +1735,7 @@ class PerfettoCollector:
         cpu_sampling_interval_ms: int = 1,
         collect_cpu_callstacks: bool = True,
         collect_java_heap: bool = True,
+        on_record_start: callable | None = None,
     ) -> str:
         """Pull a Perfetto trace from connected Android device via adb.
 
@@ -1182,6 +1750,8 @@ class PerfettoCollector:
             cpu_sampling_interval_ms: CPU sampling interval in ms (1-10).
             collect_cpu_callstacks: Enable CPU callstack profiling (requires target_process).
             collect_java_heap: Enable Java heap profiling (requires target_process).
+            on_record_start: Optional callback invoked after Perfetto recording starts
+                             on device (useful for cold start app launch).
 
         Returns:
             Path to the downloaded trace file.
@@ -1312,18 +1882,165 @@ class PerfettoCollector:
 
         config_text = "\n".join(config_lines)
 
-        # Run perfetto via stdin pipe — no file push to device needed
+        # --- P1-6 + P1-7: Trace collection with SELinux fallback and auto-degradation ---
+        timeout_sec = duration_ms // 1000 + 30
+        collection_error = None
+
+        # Strategy 1: Config mode via stdin pipe (preferred)
         try:
-            result = subprocess.run(
-                ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
-                input=config_text,
-                check=True, capture_output=True, text=True,
-                timeout=duration_ms // 1000 + 30,
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"perfetto failed (exit {e.returncode}): {e.stderr.strip() or e.stdout.strip() or 'no output'}"
-            ) from e
+            if on_record_start:
+                # Use Popen so we can invoke callback while Perfetto is recording
+                import threading
+                import time
+
+                proc = subprocess.Popen(
+                    ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    proc.stdin.write(config_text)
+                    proc.stdin.flush()
+                    proc.stdin.close()
+                except (BrokenPipeError, OSError) as e:
+                    info_log("perfetto", f"WARNING: Failed to write config to perfetto stdin: {e}")
+
+                # Read stdout/stderr in background threads to avoid pipe
+                # buffer deadlock (communicate() is unsafe here because
+                # stdin was already closed above — it would raise
+                # "ValueError: I/O operation on closed file").
+                stdout_chunks: list[str] = []
+                stderr_chunks: list[str] = []
+
+                def _pipe_reader(stream, chunks: list[str]) -> None:
+                    try:
+                        chunks.append(stream.read())
+                    except (ValueError, OSError):
+                        chunks.append("")
+
+                t_out = threading.Thread(
+                    target=_pipe_reader, args=(proc.stdout, stdout_chunks), daemon=True,
+                )
+                t_err = threading.Thread(
+                    target=_pipe_reader, args=(proc.stderr, stderr_chunks), daemon=True,
+                )
+                t_out.start()
+                t_err.start()
+
+                # Give Perfetto a moment to start recording, then invoke callback
+                time.sleep(0.5)
+
+                # Run on_record_start in a thread so pipe I/O is not blocked
+                callback_error = None
+
+                def _run_callback():
+                    nonlocal callback_error
+                    try:
+                        on_record_start()
+                    except Exception as exc:
+                        callback_error = exc
+                        info_log("perfetto", f"WARNING: on_record_start callback failed: {exc}")
+
+                cb_thread = threading.Thread(target=_run_callback, daemon=True)
+                cb_thread.start()
+                # Wait for callback to finish, but cap at a reasonable timeout
+                cb_thread.join(timeout=10.0)
+                if cb_thread.is_alive():
+                    info_log("perfetto", "WARNING: on_record_start callback timed out after 10s")
+
+                # Wait for perfetto recording to complete
+                proc.wait(timeout=timeout_sec)
+                t_out.join(timeout=5)
+                t_err.join(timeout=5)
+
+                stdout = stdout_chunks[0] if stdout_chunks else ""
+                stderr = stderr_chunks[0] if stderr_chunks else ""
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(
+                        proc.returncode, proc.args, stdout, stderr,
+                    )
+                if callback_error:
+                    info_log("perfetto", f"WARNING: Trace collected but on_record_start had errors: {callback_error}")
+            else:
+                subprocess.run(
+                    ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
+                    input=config_text,
+                    check=True, capture_output=True, text=True,
+                    timeout=timeout_sec,
+                )
+            collection_error = None
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            err_msg = ""
+            if isinstance(e, subprocess.CalledProcessError):
+                err_msg = e.stderr.strip() or e.stdout.strip() or f"exit {e.returncode}"
+            else:
+                err_msg = "timeout"
+            debug_log("perfetto", f"config mode (stdin pipe) failed: {err_msg}")
+            collection_error = f"stdin-pipe: {err_msg}"
+
+            # Strategy 2: P1-6 SELinux fallback — push config file, use cat pipe
+            try:
+                config_device_path = "/data/local/tmp/si_perfetto_config.pbtx"
+                # Push config text to device
+                subprocess.run(
+                    ["adb", "push", "/dev/stdin", config_device_path],
+                    input=config_text,
+                    check=True, capture_output=True, text=True,
+                    timeout=10,
+                )
+                # Use cat pipe to bypass SELinux restrictions
+                subprocess.run(
+                    ["adb", "shell", f"cat {config_device_path} | perfetto -c - --txt -o {device_path}"],
+                    check=True, capture_output=True, text=True,
+                    timeout=timeout_sec,
+                )
+                collection_error = None
+                debug_log("perfetto", "SELinux fallback (cat pipe) succeeded")
+                # Cleanup config file
+                subprocess.run(
+                    ["adb", "shell", "rm", config_device_path],
+                    capture_output=True, text=True,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e2:
+                err_msg2 = ""
+                if isinstance(e2, subprocess.CalledProcessError):
+                    err_msg2 = e2.stderr.strip() or e2.stdout.strip() or f"exit {e2.returncode}"
+                else:
+                    err_msg2 = str(e2)
+                debug_log("perfetto", f"SELinux fallback (cat pipe) failed: {err_msg2}")
+                collection_error = f"stdin-pipe + cat-pipe: {err_msg} / {err_msg2}"
+
+                # Strategy 3: P1-7 Auto-degradation — command-line mode
+                # Simpler perfetto invocation without config file,
+                # using inline -t and atrace categories only
+                try:
+                    duration_sec = duration_ms // 1000
+                    cmdline = (
+                        f"perfetto -o {device_path} -t {duration_sec}s "
+                        f"--atrace-categories={cats}"
+                    )
+                    if target_process:
+                        cmdline += f" --target-cmdline={target_process}"
+                    subprocess.run(
+                        ["adb", "shell", cmdline],
+                        check=True, capture_output=True, text=True,
+                        timeout=timeout_sec,
+                    )
+                    collection_error = None
+                    debug_log("perfetto", "auto-degradation to cmdline mode succeeded")
+                    print("  [collector] Degraded to cmdline mode (no config)", flush=True)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e3:
+                    err_msg3 = ""
+                    if isinstance(e3, subprocess.CalledProcessError):
+                        err_msg3 = e3.stderr.strip() or e3.stdout.strip() or f"exit {e3.returncode}"
+                    else:
+                        err_msg3 = str(e3)
+                    collection_error = f"all modes failed: stdin({err_msg}) / cat-pipe({err_msg2}) / cmdline({err_msg3})"
+
+        if collection_error:
+            raise RuntimeError(f"perfetto collection failed: {collection_error}")
 
         # Pull trace from device
         subprocess.run(
@@ -1379,7 +2096,7 @@ class TraceServer:
         while time.monotonic() < deadline:
             try:
                 urllib.request.urlopen(f"http://127.0.0.1:{self.port}/status", timeout=1)
-                logger.info("TraceServer ready on :%d", self.port)
+                info_log("perfetto", f"TraceServer ready on :{self.port}")
                 return True
             except (urllib.error.URLError, OSError):
                 if self.process.poll() is not None:
@@ -1443,14 +2160,32 @@ def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
     )
     tp = TraceProcessor(trace=trace_path, config=config)
     try:
-        # Slices overlapping the selected time range
-        slice_rows = tp.query(f"""
+        # Slices overlapping the selected time range.
+        # SI$block# slices have dur≈0 (beginSection+endSection are adjacent),
+        # so a single ORDER BY dur DESC would squeeze them out.  Query in two
+        # batches: all SI$ slices first, then top non-SI$ slices by duration.
+        si_rows = tp.query(f"""
             SELECT id, name, ts, dur, depth, track_id, cat, parent_id
             FROM slice
             WHERE ts <= {ts_ns + dur_ns} AND ts + dur >= {ts_ns}
-            ORDER BY dur DESC
-            LIMIT 50
+              AND name LIKE 'SI$%%'
         """)
+        si_ids = set()
+        si_slices_raw = []
+        for r in si_rows:
+            si_ids.add(r.id)
+            si_slices_raw.append(r)
+
+        remaining = 50 - len(si_slices_raw)
+        other_rows = tp.query(f"""
+            SELECT id, name, ts, dur, depth, track_id, cat, parent_id
+            FROM slice
+            WHERE ts <= {ts_ns + dur_ns} AND ts + dur >= {ts_ns}
+              AND name NOT LIKE 'SI$%%'
+            ORDER BY dur DESC
+            LIMIT {max(remaining, 0)}
+        """)
+        slice_rows = list(si_slices_raw) + list(other_rows)
         slices = []
         for r in slice_rows:
             slices.append({
@@ -1500,6 +2235,10 @@ def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
             if chain:
                 call_chains.append(chain)
 
+        # Correlate SI$block# slices with SIBlock logcat entries for stack traces.
+        # This mirrors the bisect-based correlation in collect_block_events().
+        _correlate_block_stacks_from_logcat(tp, slices, ts_ns, ts_ns + dur_ns)
+
         return {
             "ts_ns": ts_ns,
             "dur_ns": dur_ns,
@@ -1510,6 +2249,68 @@ def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
         }
     finally:
         tp.close()
+
+
+def _correlate_block_stacks_from_logcat(tp, slices: list[dict],
+                                          range_start_ns: int, range_end_ns: int):
+    """Correlate SI$block# slices with SIBlock logcat entries for stack traces.
+
+    Modifies slices in-place, adding 'stack_trace' field to block slices.
+    This mirrors the bisect-based correlation in collect_block_events().
+    """
+    import bisect
+
+    block_slices = [s for s in slices if s["name"].startswith("SI$block#")]
+    if not block_slices:
+        return
+
+    # Query android.log for SIBlock entries within the expanded time range
+    try:
+        log_rows = tp.query(f"""
+            SELECT ts, msg
+            FROM android.log
+            WHERE msg LIKE 'SIBlock|%|%'
+              AND ts >= {range_start_ns - 500_000_000}
+              AND ts <= {range_end_ns + 500_000_000}
+            ORDER BY ts ASC
+        """)
+        log_entries = []
+        for r in log_rows:
+            log_entries.append({"ts_ns": r.ts, "msg": r.msg or ""})
+    except Exception:
+        for s in block_slices:
+            s["stack_trace"] = []
+        return
+
+    if not log_entries:
+        for s in block_slices:
+            s["stack_trace"] = []
+        return
+
+    log_ts_list = sorted(
+        [(log["ts_ns"], log) for log in log_entries],
+        key=lambda x: x[0],
+    )
+    log_timestamps = [t for t, _ in log_ts_list]
+    MATCH_WINDOW_NS = 500_000_000  # 500ms
+
+    for block in block_slices:
+        block_ts = block["ts_ns"]
+        idx = bisect.bisect_left(log_timestamps, block_ts)
+        best_match = None
+        best_dist = MATCH_WINDOW_NS + 1
+
+        for candidate_idx in (idx - 1, idx):
+            if 0 <= candidate_idx < len(log_ts_list):
+                dist = abs(log_ts_list[candidate_idx][0] - block_ts)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_match = log_ts_list[candidate_idx][1]
+
+        if best_match and best_dist <= MATCH_WINDOW_NS:
+            block["stack_trace"] = _parse_siblock_msg(best_match["msg"])
+        else:
+            block["stack_trace"] = []
 
 
 def _walk_call_chain(tp, slice_id: int, seen: set[int]) -> dict:

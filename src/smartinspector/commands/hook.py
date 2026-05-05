@@ -9,6 +9,7 @@ import subprocess
 
 from smartinspector.ws.server import SIServer
 from smartinspector.config import get_ws_port
+from smartinspector.debug_log import info_log
 
 # Valid Java identifier pattern (allows dots for FQN, $ for inner classes)
 _SAFE_IDENTIFIER_RE = re.compile(r'^[A-Za-z_$][\w.$]*$')
@@ -28,7 +29,7 @@ def _ensure_server(state: dict) -> SIServer:
             )
             print(f"  WS server started, adb forward tcp:{port} → tcp:{port}")
         except Exception as e:
-            print(f"  Warning: adb forward failed: {e}")
+            info_log("hook", f"WARNING: adb forward failed: {e}")
     return server
 
 

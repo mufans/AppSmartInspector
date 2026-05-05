@@ -8,13 +8,17 @@ AI 驱动的跨平台移动端性能分析 CLI 工具。通过自然语言交互
 
 - 🧠 **自然语言交互** — 用中文描述性能问题，AI 自动路由到对应分析流程
 - 📊 **全量分析流水线** — 自动采集 → 分析 → 源码归因 → 报告生成
-- 🔍 **SI$ 源码归因** — 通过 TraceHook tag 将性能热点精确归因到源码位置
+- 🔍 **SI$ 源码归因** — 通过 TraceHook tag 将性能热点精确归因到源码位置（含 IO 切片归因）
 - 🛡️ **健壮性保障** — 全链路异常处理，Agent 崩溃不丢会话状态
-- ⚡ **Token 效率优化** — 消息窗口裁剪、路由 token 限制、流式输出
+- ⚡ **Token 效率优化** — SQL 结果智能压缩（统计摘要+异常采样）、消息窗口裁剪、路由 token 限制、流式输出
+- ✅ **分析质量验证** — L1 格式检查 + L2 一致性验证，自动检测 LLM 输出遗漏和不一致，支持重试补充
 - 🔒 **Release 零开销** — Release 变体为纯 no-op stubs，编译器内联后零运行时开销
 - 💬 **实时通信** — WebSocket CLI↔App 双向通信，支持心跳检测和断线重连
 - 🖥️ **Perfetto UI 交互** — 自托管 Perfetto UI + SI Bridge 插件，框选时间范围即可 AI 分析
 - ⌨️ **交互增强** — Tab 补全、全局异常保护、启动前置条件检查
+- 🚀 **冷启动分析** — 自动识别启动阶段（进程启动→Application.onCreate→Activity.onCreate→首帧），定位启动瓶颈
+- 🤖 **Headless/CI 模式** — 非交互式运行全量分析流水线，支持 JSON 结构化输出，可直接集成 CI/CD
+- 🌐 **IO 追踪** — 默认启用网络/数据库/图片加载 IO Hook，独立收集 IO 切片并归因到源码
 
 ## 快速开始
 
@@ -27,7 +31,7 @@ cp .env.example .env
 # 编辑 .env: SI_API_KEY=your-api-key
 
 # 启动 CLI（自动检查 adb/API key，启动 WS server + adb reverse）
-uv run smartinspector --source-dir /path/to/your/app/source
+uv run smartinspector --src /path/to/your/app/source
 
 # adb连接手机
 
@@ -36,8 +40,25 @@ uv run smartinspector --source-dir /path/to/your/app/source
 you> 分析冷启动耗时
 # 指令开启采集分析
 you> /full
-# 打开perfetto ui 
+# 冷启动分析（跳过等待，直接开始采集）
+you> /full --no-wait
+# 打开perfetto ui
 you> /open
+```
+
+### CI/Headless 模式
+
+非交互式运行全量分析流水线，适合 CI/CD 集成：
+
+```bash
+# 分析已有 trace 文件，输出 JSON 报告到 stdout
+uv run smartinspector --ci --trace trace.pb --format json --src ./app/src
+
+# 从设备采集 trace 并生成 Markdown 报告到文件
+uv run smartinspector --ci --target com.example.app --duration 5000 --output report.md
+
+# JSON 格式输出示例（适合自动化解析）
+uv run smartinspector --ci --trace trace.pb --format json | jq '.issues[] | select(.severity == "P0")'
 ```
 
 ## 架构概览
@@ -54,7 +75,9 @@ you> /open
 全量分析流水线（LangGraph 图节点编排）：
 
 ```
-collector (设备 trace 采集) → analyzer (LLM 性能解读) → attributor (源码归因) → reporter (生成 Markdown 报告)
+collector (设备 trace 采集) → analyzer (LLM 性能解读) → attributor (源码归因) → reporter (生成 Markdown/JSON 报告)
+                                      ↓
+                                startup (冷启动分析，阶段切分 + 瓶颈识别)
 ```
 
 ### Perfetto UI 交互分析
@@ -166,17 +189,23 @@ smartinspector/
 │   │           ├── __init__.py     #         reporter_node 入口 (流式输出)
 │   │           ├── generator.py    #         LLM 报告生成 (流式+重试)
 │   │           ├── formatter.py    #         数据格式化 (perf+归因→Markdown)
+│   │           ├── json_formatter.py #       JSON 结构化报告格式化
 │   │           └── persistence.py  #         报告文件保存
 │   │
 │   ├── agents/                     #   Agent 定义 (LLM + Tools)
 │   │   ├── android.py              #     Android Expert Agent
 │   │   ├── explorer.py             #     Code Explorer Agent
-│   │   ├── perf_analyzer.py        #     Perf Analyzer (单次 LLM 调用)
+│   │   ├── perf_analyzer.py        #     Perf Analyzer (单次 LLM 调用 + 验证重试)
 │   │   ├── attributor.py           #     源码归因 Agent (run_attribution)
 │   │   ├── frame_analyzer.py       #     帧分析 Agent (Perfetto UI 交互归因)
-│   │   └── deterministic.py        #     确定性预计算 (减少 LLM token)
+│   │   ├── deterministic.py        #     确定性预计算 + SQL Summarizer (减少 LLM token)
+│   │   └── verifier.py             #     分析质量验证 (L1 格式 + L2 一致性, 0 token)
 │   │
 │   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU, context manager)
+│   ├── collector/startup.py        #   冷启动分析器 (启动阶段切分, 关键路径提取, 瓶颈识别)
+│   ├── collector/memory.py         #   内存分配分析器 (heap_graph, 泄漏检测, 内存趋势)
+│   ├── headless.py                 #   Headless/CI 非交互式运行器 (全量流水线, JSON/Markdown 输出)
+│   ├── storage/store.py            #   报告存储层 (基线管理, 历史查询, 对比数据源)
 │   ├── commands/                   #   Slash 命令 (注册表模式)
 │   │   ├── __init__.py             #     命令注册表 (handle_slash_command)
 │   │   ├── attribution.py          #     SI$ tag 解析 + 归因提取
@@ -199,6 +228,7 @@ smartinspector/
 │   └── android/tracelib/           #   Android SDK (AAR)
 │       └── src/main/java/.../tracelib/
 │           ├── TraceHook.java          # Pine AOP 方法 hook (深度保护, Tag截断, 系统widget过滤)
+│           ├── ComposeHook.kt          # Compose 重组追踪 (TracerImpl hook, API 31+)
 │           ├── BlockMonitor.java       # 主线程卡顿检测 (容量限制防OOM, Fragment泄漏修复)
 │           ├── SIClient.java           # WebSocket 客户端
 │           ├── HookConfig.java         # 配置模型 (JSON 序列化, BuildConfig.DEBUG守卫)
@@ -231,9 +261,10 @@ SDK 通过 Pine AOP 框架 hook 框架方法，用 `SI$` 前缀的 `Trace.beginS
 | View Traverse      | OFF | `SI$view#[ViewClass].measure`                  | View measure/layout/draw       |
 | Handler Dispatch   | OFF | `SI$handler#[msgClass]`                        | Handler 消息分发                   |
 | Block Monitor      | ON  | `SI$block#[MsgClass]#[dur]ms`                  | 主线程卡顿检测 (≥100ms)               |
-| Network IO         | OFF | `SI$net#[Class].execute`                       | OkHttp / HttpURLConnection     |
-| Database IO        | OFF | `SI$db#[Class].query#[table]`                  | SQLiteDatabase / Room          |
-| Image Load         | OFF | `SI$img#[Class].into`                          | Glide / Coil                   |
+| Network IO         | ON  | `SI$net#[Class].execute`                       | OkHttp / HttpURLConnection     |
+| Database IO        | ON  | `SI$db#[Class].query#[table]`                  | SQLiteDatabase / Room          |
+| Image Load         | ON  | `SI$img#[Class].into`                          | Glide / Coil                   |
+| Compose Recomposition | ON | `SI$compose#[Composable]#recompose`          | Compose 重组追踪 (API 31+)        |
 
 
 **IO Hook 说明**：Network/DB/Image hook 在所有线程执行，使用独立前缀 (`SI$net#`/`SI$db#`/`SI$img#`)，Python 端单独收集到 `io_slices`，不污染主线程 `view_slices` 分析。
@@ -251,12 +282,31 @@ Trace → SI$ slices → 过滤系统类 → 提取 class+method → Glob→Grep
 
 ## CLI 命令
 
+### CI/Headless 模式参数
+
+```bash
+uv run smartinspector --ci [选项]
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--ci` | 启用非交互式 CI 模式 |
+| `--trace <path>` | 指定已有 trace 文件（跳过设备采集） |
+| `--target <package>` | 目标进程包名 |
+| `--duration <ms>` | 采集时长（默认 10000ms） |
+| `--output <path>` | 输出文件路径 |
+| `--format markdown\|json` | 报告格式（默认 markdown） |
+| `--src <path>` | 源码目录 |
+| `--debug` | 启用 debug 日志 |
+
 ### Slash 命令
 
 
 | 命令                            | 说明                                                       |
 | ----------------------------- | -------------------------------------------------------- |
 | `/full [--no-wait]`           | 全量分析流水线 (采集→分析→归因→报告)。`--no-wait` 跳过等待 App 连接，适用于冷启动耗时分析 |
+| `/quick`                      | 快速分析（纯确定性，不调用 LLM，秒级完成）。无 API Key 时自动降级 |
+| `/compare <r1> <r2>`          | 对比两份报告，生成 before/after 趋势报告 |
 | `/trace [duration_ms] [pkg]`  | 采集 + 自动分析 Perfetto trace                                 |
 | `/record [duration_ms] [pkg]` | 只采集不分析，返回 .pb 文件路径                                       |
 | `/analyze [path]`             | 分析 trace 文件（无参数时分析上次采集结果）                                |
@@ -293,6 +343,7 @@ Orchestrator 通过 LLM 分类将用户请求路由到对应 Agent：
 - **性能解读** (`analyze`): "解读这份数据" / "分析一下刚才采集的数据" / "解读一下这个 perf_summary" → Perf Analyzer
 - **源码搜索** (`explorer`): "搜索 XXX 类源码" / "查看 LazyForEach 的实现" / "定位 DataManager.loadData 方法" → Code Explorer
 - **通用问答** (`end`): "什么是卡顿" / "怎么优化列表滑动" / "你好" → Fallback 回复
+- **指标追问** (`metric_qa`): "CPU 占用率怎么样" / "帧率怎么样" / "内存有没有泄漏" / "性能怎么样" → Metric QA（需要先完成分析）
 
 ## 报告示例
 
@@ -412,7 +463,7 @@ TOTAL                   65.6k     5.0k    70.6k     27
 | Android Trace     | Perfetto + atrace (ftrace + CPU callstack + Java heap) |
 | HarmonyOS Trace   | hiperf + hitrace (规划)                                  |
 | 方法 Hook (Android) | Pine AOP Framework                                     |
-| CLI 交互            | prompt_toolkit (Tab 补全, REPL)                          |
+| CLI 交互            | prompt_toolkit (Tab 补全, REPL) + argparse (CI 模式)     |
 | 通信                | WebSocket (CLI ↔ App, 心跳检测, 动态端口)                      |
 | Trace 分析          | trace_processor_shell (SQL)                            |
 | 状态管理              | LangGraph MemorySaver (get_state)                      |
@@ -466,36 +517,119 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 - **HarmonyOS**: hdc 已加入 PATH (规划)
 - **iOS**: Xcode + Instruments (规划)
 
-## Todo
+## 路线图
 
-### 高优先级
+### P1 — 已完成 (2026-04-24)
 
-- 帧严重度阈值区分刷新率 (120Hz 设备帧预算 8.33ms)
-- 输入事件关联 (touch event → frame jank 因果)
-- 系统类模式补充: `WindowCallback`, `IdleHandler`, Jetpack Compose 类
-
-### 中优先级
-
-- RV Instance 区分 create vs bind 开销
-- attributor agent 内部类 `$数字` 跳过 Glob 直接 grep 外部类
-- Perfetto `android.surfaceflinger.frame` 维度 (CPU vs GPU 瓶颈)
-- 自适应阈值 (基于设备能力动态调整)
-- 报告缺少对比基线 (before/after)
+| # | 项目 | 说明 | 状态 |
+|---|------|------|------|
+| P1-1 | Compose 重组追踪 | 追踪 Jetpack Compose 重组次数和耗时，定位不必要的 recomposition | ✅ 已完成 |
+| P1-2 | 内存分配分析 | 基于 `heap_graph` 数据源分析内存分配热点，定位内存抖动和泄漏 | ✅ 已完成 |
+| P1-3 | 历史对比与趋势 | 多次分析结果对比，生成 before/after 报告和性能趋势图 | ✅ 已完成 |
+| P1-4 | 智能一键分析 | 纯确定性快速分析，不调用 LLM，30 秒内完成轻量分析 | ✅ 已完成 |
+| P1-5 | ExtraHook 参数自动推断 | 自动推断所有重载签名，无需手动配置方法参数 | ✅ 已完成 |
+| P1-6 | SQL Summarizer | 压缩 SQL 查询结果为统计摘要+异常采样，降低 60-80% token 消耗 | ✅ 已完成 |
+| P1-7 | Analysis Verifier | L1 格式检查 + L2 一致性验证，自动检测遗漏和不一致，支持重试 | ✅ 已完成 |
 
 ### 平台扩展
 
 - HarmonyOS collector (hdc + hiperf/hitrace)
 - iOS Instruments 集成
-- Jetpack Compose 性能 hook
 - Native C/C++ 代码覆盖
-- 内存分配热点追踪 (当前仅 RSS)
 
 ### 工程优化
 
-- LRU 文件缓存减少重复 Read
-- 工具结果截断 (10K 字符上限)
-- 更多复杂 trace 测试 (Kotlin、多文件)
-- CI/CD 集成
+- 帧严重度阈值区分刷新率 (120Hz 设备帧预算 8.33ms)
+- 输入事件关联 (touch event → frame jank 因果)
+- RV Instance 区分 create vs bind 开销
+- Perfetto `android.surfaceflinger.frame` 维度 (CPU vs GPU 瓶颈)
+- 自适应阈值 (基于设备能力动态调整)
+- ~~thread_state N+1 查询优化~~ → 已完成：重写为 `__intrinsic_thread_state` 表，支持 `blocked_function`/`io_wait`/`waker_utid`
+- LLM 实例统一管理 (LLMFactory)
+
+### ✅ 已完成 (2026-04-24 P1 改进)
+
+**P1-1: Compose 重组追踪**
+
+- `ComposeHook.kt`: Hook Compose Runtime 的 `TracerImpl` 和 `startRestartGroup/endRestartGroup`
+- 切片前缀 `SI$compose#`，Tag 格式：`SI$compose#ComposableName#recompose` / `SI$compose#ComposableName#first`
+- Python 端新增 `collect_compose_slices()` 查询和重组分析
+
+**P1-2: 内存分配分析**
+
+- `collector/memory.py`: `MemoryAnalyzer` 基于 `heap_graph` 表分析 Java 堆内存
+- 按类名聚合对象数量和总大小，检测 Activity/Fragment 泄漏嫌疑
+- 内存增长趋势追踪（RSS / anon 随时间变化）
+
+**P1-3: 历史对比与趋势**
+
+- `commands/compare.py`: `/compare` 命令，多次分析结果对比
+- `storage/store.py`: 报告存储层，支持基线管理和历史查询
+- 生成 before/after 报告，自动标注回归项和改善项
+
+**P1-4: 智能一键分析**
+
+- `commands/quick.py`: `/quick` 命令，纯确定性快速分析（不调用 LLM）
+- 仅运行 fast-path 归因 + `compute_hints`，秒级完成
+- 无 API Key 时自动降级为 quick 模式
+
+**P1-5: ExtraHook 参数自动推断**
+
+- `TraceHook.java` 改进 `hookExtraClasses()`：自动推断所有重载签名
+- 遍历 `getDeclaredMethods()` 匹配方法名，替代原先的只尝试无参签名
+
+**P1-6: SQL Summarizer**
+
+- `deterministic.py` 新增 `summarize_sql_result()` — 将 SQL 查询结果压缩为统计摘要 (count/min/max/avg/p95/p99) + 分布直方图 + 异常采样 + 去重聚合
+- `deterministic.py` 新增 `compress_perf_json()` — 对 perf JSON 中的大列表字段 (slowest_slices/block_events/frame_timeline/thread_state) 自动应用压缩
+- 集成到 `perf_analyzer.py` (perf_json 传入前压缩) 和 `frame_analyzer.py` (slices 列表压缩)
+- Token 消耗降低 60-80%，减少 LLM 在大量数据中的幻觉
+
+**P1-7: Analysis Verifier**
+
+- `agents/verifier.py` 新增分层验证系统 (0 token，纯规则)
+- L1 格式检查：数值存在性、方法名引用、长度合理、P0/P1/P2 分级
+- L2 一致性验证：P0 问题覆盖、关键数据点数值一致性 (±20%)、热点方法覆盖
+- 集成到 `perf_analyzer.py` 和 `frame_analyzer.py`，L2 失败时自动重试一次补充遗漏
+- `VerificationResult` 包含 score/issues/warnings/l1_passed/l2_passed 属性
+
+### ✅ 已完成 (2026-04-24 P0 改进)
+
+**P0-1: IO Hooks 启用**
+
+- Network/DB/Image IO Hook 默认开启
+- IO 切片独立收集到 `io_slices`，不污染主线程 `view_slices` 分析
+- `collect_io_slices()` 方法从所有线程收集 `SI$net#`/`SI$db#`/`SI$img#` 切片
+
+**P0-2: 冷启动专项分析**
+
+- `collector/startup.py`: `StartupAnalyzer` 将启动序列切分为 4 个阶段
+  - pre-main (进程启动 → Application.attachBaseContext)
+  - Application.onCreate → first Activity.onCreate
+  - Activity.onCreate → 首帧 doFrame
+  - 首帧渲染
+- `graph/nodes/startup.py`: 图节点集成，输出 Markdown 格式的启动分析报告
+- 关键路径提取 + 瓶颈识别 + 自动优化建议
+
+**P0-3: Headless/CI 模式**
+
+- `headless.py`: `HeadlessRunner` 非交互式运行全量分析流水线
+- CLI 参数: `--ci` 启用，`--trace`/`--target`/`--duration`/`--output`/`--format`/`--debug`
+- 支持 Markdown 和 JSON 两种输出格式
+- 无 API Key 时降级为纯确定性分析（跳过 LLM）
+
+**P0-4: JSON 报告格式**
+
+- `graph/nodes/reporter/json_formatter.py`: 结构化 JSON 报告
+- 包含 `summary`（FPS/CPU/jank）、`issues`（P0/P1/P2 分级）、`metrics`（详细指标）
+- 自动关联 attribution 结果到 issue 的 `source` 字段
+- 适合 CI/CD 自动化解析
+
+**P0-5: IO 切片归因**
+
+- `agents/attributor.py` 支持 IO 类型切片（`SI$net#`/`SI$db#`/`SI$img#`）归因
+- `commands/attribution.py` 解析 IO tag 提取 class/method 用于源码搜索
+- 归因结果包含 `io_type` 字段（network/database/image）
 
 ### ✅ 已完成 (2026-04-05 重构)
 

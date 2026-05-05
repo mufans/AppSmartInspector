@@ -3,6 +3,7 @@
 from langchain_core.messages import AIMessage
 
 from smartinspector.agents.perf_analyzer import analyze_perf
+from smartinspector.debug_log import info_log
 from smartinspector.graph.state import AgentState, node_error_handler
 
 
@@ -51,9 +52,9 @@ def analyzer_node(state: AgentState) -> dict:
             "_trace_path": state.get("_trace_path", ""),
         }
 
-    print("  [analyzer] Analyzing performance...", flush=True)
+    info_log("analyzer", "Analyzing performance...")
     analysis = analyze_perf(perf_json)
-    print(f"  [analyzer] Analysis complete ({len(analysis)} chars)", flush=True)
+    info_log("analyzer", f"Analysis complete ({len(analysis)} chars)")
 
     return {
         "messages": [AIMessage(content=analysis)],

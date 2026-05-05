@@ -3,7 +3,7 @@
 from langchain_core.messages import AIMessage
 
 from smartinspector.config import get_report_max_tokens
-from smartinspector.debug_log import debug_log
+from smartinspector.debug_log import debug_log, info_log
 
 from smartinspector.graph.state import AgentState
 from smartinspector.graph.nodes.reporter.formatter import (
@@ -18,12 +18,16 @@ def reporter_node(state: AgentState) -> dict:
     """Generate the final performance report using LLM with streaming output."""
     from smartinspector.prompts import load_prompt
     from smartinspector.commands.orchestrate import _build_report_header
+    from smartinspector.graph.state import RouteDecision
 
     report_prompt = load_prompt("report-generator")
 
     perf_json = state.get("perf_summary", "")
     perf_analysis = state.get("perf_analysis", "")
     attribution_result = state.get("attribution_result", "")
+    route = state.get("_route", "")
+
+    is_startup = route in (RouteDecision.STARTUP, RouteDecision.STARTUP.value)
 
     # Build user content with all available data
     # IMPORTANT: attribution section MUST come first (before header/analysis)
@@ -40,7 +44,7 @@ def reporter_node(state: AgentState) -> dict:
 
         # Pre-generate report header tables
         trace_path = state.get("_trace_path", "")
-        print(f"  [reporter] trace_path from state: '{trace_path}'", flush=True)
+        debug_log("reporter", f"trace_path from state: '{trace_path}'")
 
         header_md = _build_report_header(perf_json, trace_path)
         # Insert header after attribution and perf sections
@@ -58,11 +62,11 @@ def reporter_node(state: AgentState) -> dict:
             "attribution_result": attribution_result,
         }
 
-    print("\n  [reporter] Generating report...", flush=True)
+    print("\n  [reporter] Generating report...", flush=True)  # noqa: LOG — user-facing progress
     if state.get("_trace_path"):
-        print(f"  [reporter] Trace file: {state['_trace_path']}", flush=True)
+        info_log("reporter", f"Trace file: {state['_trace_path']}")
     else:
-        print("  [reporter] WARNING: no trace_path in state", flush=True)
+        info_log("reporter", "WARNING: no trace_path in state")
 
     user_content = "\n\n".join(user_parts)
 
@@ -93,10 +97,28 @@ def reporter_node(state: AgentState) -> dict:
     # Prepend pre-generated header (LLM does not output header per prompt instructions)
     complete_report = (header_md + "\n" + full_content) if perf_json else full_content
 
+    # Startup route: append the structured startup analysis after LLM report
+    # so startup phases/bottlenecks/suggestions are always present verbatim
+    if is_startup and perf_analysis:
+        complete_report += f"\n\n{perf_analysis}"
+
     # Save report to file
     report_path = save_report(complete_report)
     if report_path:
         complete_report += f"\n\n---\n报告已保存至: {report_path}"
+
+    # Auto-save analysis result for historical comparison
+    try:
+        from smartinspector.storage.store import save_analysis_result
+        analysis_path = save_analysis_result(
+            perf_summary=perf_json,
+            perf_analysis=perf_analysis,
+            attribution_result=attribution_result,
+            trace_path=state.get("_trace_path", ""),
+        )
+        info_log("reporter", f"Auto-saved analysis result for comparison: {analysis_path}")
+    except Exception as e:
+        debug_log("reporter", f"Auto-save analysis result failed: {e}")
 
     return {
         "messages": [AIMessage(content=complete_report)],
@@ -105,3 +127,4 @@ def reporter_node(state: AgentState) -> dict:
         "attribution_data": state.get("attribution_data", ""),
         "attribution_result": attribution_result,
     }
+

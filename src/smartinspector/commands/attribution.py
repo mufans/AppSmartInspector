@@ -47,37 +47,46 @@ def _extract_method_from_anonymous(fqn: str) -> str:
     - OuterClass$MethodName$1$2 → multi-level anonymous, MethodName is the method
     - OuterClass$$inlined$lambda$0 → Kotlin inlined lambda, no method context
 
-    Heuristic: the segment immediately before the trailing $number is the
-    method name if it starts with a lowercase letter (Java/Kotlin convention)
-    and is not a Kotlin compiler artifact.
+    Heuristic: walk $-segments from the end, skipping numeric (anonymous index)
+    segments, until we find a segment that looks like a method name (starts with
+    a lowercase letter and is not a Kotlin compiler artifact).
     """
     m = _ANON_SUFFIX.search(fqn)
     if not m:
         return ""
     prefix = fqn[:m.start()]
     # Need at least one $ in prefix to have a segment before the trailing $N
-    # (e.g. OuterClass$Method$1 has prefix "OuterClass$Method")
     if "$" not in prefix:
         return ""
-    # Take the segment between the last two $ signs
-    last_seg = prefix.rsplit("$", 1)[-1]
-    # Method names start with lowercase in Java/Kotlin
-    if not last_seg or not last_seg[0].islower():
-        return ""
-    # Filter out Kotlin compiler artifacts
-    if last_seg == "lambda":
-        return ""
-    # Segments containing "$" are compiler-generated, not user method names
-    if "$" in last_seg:
-        return ""
-    # Check if the segment is preceded by "lambda$" in the original prefix
-    # (e.g. Outer$lambda$click$1 → "click" is part of a lambda descriptor)
-    if "$lambda$" in prefix:
-        # The last_seg after $lambda$ is a lambda descriptor, not a method name
-        lambda_idx = prefix.rfind("$lambda$")
-        if lambda_idx >= 0 and prefix[lambda_idx + 8:].startswith(last_seg):
-            return ""
-    return last_seg
+
+    # Walk $-segments from the end, skipping numeric anonymous indices
+    # e.g. "Outer$doWork$1" → segments ["Outer", "doWork", "1"]
+    #      "Outer$doWork$1$2" → after first peel: "Outer$doWork$1"
+    #        → segments ["Outer", "doWork", "1"] → skip "1" → "doWork"
+    remaining = prefix
+    while "$" in remaining:
+        last_seg = remaining.rsplit("$", 1)[-1]
+        remaining = remaining.rsplit("$", 1)[0]
+        # Skip numeric anonymous indices (e.g. "1", "2")
+        if last_seg.isdigit():
+            continue
+        # Method names start with lowercase in Java/Kotlin
+        if not last_seg or not last_seg[0].islower():
+            continue
+        # Filter out Kotlin compiler artifacts
+        if last_seg in ("lambda", "inlined"):
+            continue
+        # Segments containing "$" are compiler-generated, not user method names
+        if "$" in last_seg:
+            continue
+        # Check if the segment is preceded by "lambda$" in the original prefix
+        # (e.g. Outer$lambda$click$1 → "click" is part of a lambda descriptor)
+        if "$lambda$" in prefix:
+            lambda_idx = prefix.rfind("$lambda$")
+            if lambda_idx >= 0 and prefix[lambda_idx + 8:].startswith(last_seg):
+                continue
+        return last_seg
+    return ""
 
 
 def _extract_method_from_stack(stack_trace: list[str]) -> str:
@@ -103,6 +112,39 @@ def _extract_method_from_stack(stack_trace: list[str]) -> str:
     if "." in method or "/" in method:
         return ""
     return method
+
+
+def _extract_caller_from_stack(stack_trace: list[str], target_class: str) -> str:
+    """Find the method in target_class that called the anonymous class.
+
+    Walks the stack from bottom (outermost caller) to top (innermost),
+    looking for frames from target_class that are NOT the anonymous
+    class itself (i.e. no $ in the class part).
+
+    Returns the method name, e.g. "loadAndDisplayItems".
+    """
+    if not stack_trace or not target_class:
+        return ""
+    for frame in reversed(stack_trace):
+        # Format: "at com.example.ClassName.method(File.java:42)"
+        # or "at com.example.ClassName$1.run(File.java:52)"
+        if target_class + "." not in frame:
+            continue
+        # Skip anonymous inner class frames ($N)
+        if f"{target_class}$" in frame:
+            continue
+        # Extract method from this frame
+        paren = frame.rfind("(")
+        if paren < 0:
+            continue
+        before_paren = frame[:paren]
+        dot = before_paren.rfind(".")
+        if dot < 0:
+            continue
+        method = before_paren[dot + 1:]
+        if "." not in method and "/" not in method:
+            return method
+    return ""
 
 
 def extract_class(name: str) -> str:
@@ -280,6 +322,11 @@ _SYSTEM_CLASS_PATTERNS = (
     "View",                   # android.view.View (short match)
     "ViewGroup",              # android.view.ViewGroup
     "RecyclerView",           # androidx.recyclerview.widget.RecyclerView
+    "GapWorker",              # androidx.recyclerview.widget.GapWorker
+    "LinearLayoutManager",    # androidx.recyclerview.widget.LinearLayoutManager
+    "GestureDetector",        # android.view.GestureDetector
+    "InputMethodManager",     # android.view.inputmethod.InputMethodManager
+    "PhoneWindow",            # com.android.internal.policy.PhoneWindow
 )
 
 # RV pipeline method names — these belong to RecyclerView/LayoutManager, not user code
@@ -444,13 +491,21 @@ def _is_block_system_class(raw_name: str) -> bool:
     hash_idx = body.rfind("#")
     if hash_idx >= 0 and body[hash_idx:].endswith("ms"):
         body = body[:hash_idx]
-    # body is now: app.FragmentManager$5 or view.Choreographer$FrameDisplayEventReceiver
+    # body is now: "view.Choreographer$FrameDisplayEventReceiver.run"
+    #   or: "app.FragmentManager$5"
+    # Use _split_fqn_method to properly separate FQN from method name,
+    # since block tags may include a trailing ".method" that simple
+    # rsplit(".", 1) would mistake for the class name segment.
+    fqn, _method = _split_fqn_method(body)
+    # If _split_fqn_method didn't split (method segment looks like a class),
+    # fall back to using the full body as the FQN.
+    if not fqn:
+        fqn = body
     # Take segment after last dot (the class+inner part)
-    if "." in body:
-        body = body.rsplit(".", 1)[-1]
-    # body is now: FragmentManager$5 or Choreographer$FrameDisplayEventReceiver
+    short_name = fqn.rsplit(".", 1)[-1] if "." in fqn else fqn
+    # short_name is now: Choreographer$FrameDisplayEventReceiver or FragmentManager$5
     for pattern in _SYSTEM_CLASS_PATTERNS:
-        if body == pattern or body.startswith(pattern + "$"):
+        if short_name == pattern or short_name.startswith(pattern + "$"):
             return True
     return False
 
@@ -482,16 +537,43 @@ def _attach_block_stacks(attributable: list[dict], block_events: list[dict]) -> 
         dur_ms = block.get("dur_ms", 0)
         stack = block.get("stack_trace", [])
 
-        # For anonymous inner classes, the actual method (e.g. "run") is
-        # in the stack trace, not in the class name.  Use it as the primary
-        # method name and store the context method (e.g. "startMainThreadWork")
-        # for search hints.
+        # For anonymous inner classes ($N suffix in FQN), the method name
+        # derived from the FQN (via _extract_method_from_anonymous) is the
+        # enclosing method that *defines* the anonymous class (e.g.
+        # "startMainThreadWork" from CpuBurnWorker$startMainThreadWork$1),
+        # NOT the method actually executed (e.g. "run").
+        # Strategy:
+        #   - Always treat the FQN-derived method as context_method.
+        #   - Get the real executed method from stack trace.
+        #   - If no stack trace, keep method_name as-is (enclosing method
+        #     from extract_method) — fast path will use context_method to
+        #     locate the correct code.
         context_method = ""
-        if "$" in raw_name and stack:
-            stack_method = _extract_method_from_stack(stack)
-            if stack_method and stack_method != method_name:
-                context_method = method_name
-                method_name = stack_method
+        if "$" in raw_name:
+            # Extract FQN from block tag: SI$block#pkg.Class$Enclosing$N#NNms
+            block_body = raw_name[9:]  # strip "SI$block#"
+            hash_idx = block_body.rfind("#")
+            if hash_idx >= 0 and block_body[hash_idx:].endswith("ms"):
+                fqn = block_body[:hash_idx]
+            else:
+                fqn = block_body
+            enclosing = _extract_method_from_anonymous(fqn)
+            if enclosing:
+                context_method = enclosing
+                # Only override method_name if we have a stack trace
+                if stack:
+                    stack_method = _extract_method_from_stack(stack)
+                    if stack_method and stack_method != enclosing:
+                        method_name = stack_method
+            elif method_name == "unknown" and stack:
+                # Pure anonymous class ($1, $2) with no enclosing method in FQN.
+                # Walk the stack trace to find the caller from the same class
+                # (e.g. stack has "at MainActivity.loadAndDisplayItems" which
+                # is the method that created this anonymous class).
+                caller = _extract_caller_from_stack(stack, class_name)
+                if caller:
+                    context_method = caller
+                    method_name = "run"  # anonymous inner class executes run()
 
         key = f"{class_name}.{method_name}"
 
@@ -616,6 +698,16 @@ def _summarize_si_tag(tag: str) -> str:
         fqn, method = _split_fqn_method(fqn_part)
         cls = fqn.rsplit(".", 1)[-1] if fqn else fqn_part
         return f"handler({cls}.{method or '?'})"
+
+    # IO tags
+    for prefix, label in (("net#", "网络IO"), ("db#", "数据库IO"), ("img#", "图片加载")):
+        if body.startswith(prefix):
+            rest = body[len(prefix):]
+            parts = rest.split("#")
+            fqn_method = parts[0]
+            fqn, method = _split_fqn_method(fqn_method)
+            cls = fqn.rsplit(".", 1)[-1] if fqn else fqn_method
+            return f"{label}({cls}.{method or '?'})"
 
     if body.startswith("Activity.lifecycle"):
         return "Activity生命周期"
@@ -838,8 +930,110 @@ def extract_attributable_slices(perf_summary_json: str, min_dur_ms: float = 1.0)
     if block_events:
         _attach_block_stacks(attributable, block_events)
 
+    # ── IO slices: extract from io_slices (SI$net#/SI$db#/SI$img#) ──
+    io_slices_data = data.get("io_slices", {})
+    io_summary = io_slices_data.get("summary", []) if io_slices_data else []
+    for s in io_summary:
+        name = s.get("name", "")
+        if not name.startswith("SI$"):
+            continue
+        if classify_search_type(name) == "system":
+            continue
+
+        class_name = extract_class(name)
+        method_name = extract_method(name)
+        dur_ms = s.get("max_ms", 0)
+        count = s.get("count", 0)
+        total_ms = s.get("total_ms", 0)
+
+        # Determine IO type for tagging
+        body = name[3:]
+        io_type = "unknown"
+        if body.startswith("net#"):
+            io_type = "network"
+        elif body.startswith("db#"):
+            io_type = "database"
+        elif body.startswith("img#"):
+            io_type = "image"
+
+        entry = {
+            "raw_name": name,
+            "class_name": class_name,
+            "method_name": method_name,
+            "dur_ms": dur_ms,
+            "type": "io_slice",
+            "search_type": "java",
+            "instance": None,
+            "io_type": io_type,
+            "count": count,
+            "total_ms": total_ms,
+        }
+        attributable.append(entry)
+
     # Remove entries marked as system classes by block event matching
     attributable = [e for e in attributable if not e.get("_system")]
+
+    # ── CPU hotspots: extract from cpu_hotspots (perf_sample stack profiles) ──
+    # These are function-level CPU usage from stack sampling, not SI$ slices.
+    cpu_hotspots = data.get("cpu_hotspots", [])
+    existing_keys = {f"{e['class_name']}.{e['method_name']}" for e in attributable}
+    for hs in cpu_hotspots:
+        if hs.get("error"):
+            continue
+        func = hs.get("function", "")
+        if not func or func.startswith("/") or func.startswith("[") or "::" in func:
+            continue  # Skip native/library/C++ functions
+
+        # Parse function name: "com.example.ClassName.method" -> (ClassName, method)
+        parts = func.rsplit(".", 1)
+        if len(parts) != 2:
+            continue
+        class_path, method = parts
+
+        # Get simple class name from FQN
+        simple_class = class_path.rsplit(".", 1)[-1] if "." in class_path else class_path
+
+        # Skip system classes by prefix
+        if any(class_path.startswith(p) for p in _SYSTEM_PREFIXES):
+            continue
+        # Skip known system class patterns
+        if simple_class in _SYSTEM_CLASS_PATTERNS:
+            continue
+
+        pct = hs.get("pct", 0)
+        if pct < 3:
+            continue  # Only include significant hotspots (>3% CPU)
+
+        # Skip if already attributed via SI$ slices (more precise timing)
+        key = f"{simple_class}.{method}"
+        if key in existing_keys:
+            continue
+
+        # Estimate dur_ms from CPU percentage (assuming ~10s trace)
+        estimated_ms = pct * 100
+
+        entry = {
+            "raw_name": f"CPU$hotspot#{class_path}.{method}",
+            "class_name": simple_class,
+            "method_name": method,
+            "dur_ms": estimated_ms,
+            "type": "cpu_hotspot",
+            "search_type": "java",
+            "instance": None,
+            "count": hs.get("samples", 0),
+            "total_ms": estimated_ms,
+        }
+
+        # Add callchain context for the LLM
+        callchain = hs.get("callchain", [])
+        if callchain:
+            entry["call_context"] = " → ".join(
+                n.rsplit(".", 1)[-1] if "." in n else n
+                for n in callchain[:5]
+            )
+
+        attributable.append(entry)
+        existing_keys.add(key)
 
     # Filter by minimum duration threshold
     attributable = [e for e in attributable if e["dur_ms"] >= min_dur_ms]
