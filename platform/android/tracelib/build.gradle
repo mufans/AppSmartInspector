@@ -1,10 +1,11 @@
 plugins {
     id 'com.android.library'
+    id 'org.jetbrains.kotlin.android'
 }
 
 android {
     namespace 'com.smartinspector.tracelib'
-    compileSdk 35
+    compileSdk 36
 
     defaultConfig {
         minSdk 24
@@ -21,9 +22,14 @@ android {
         sourceCompatibility JavaVersion.VERSION_11
         targetCompatibility JavaVersion.VERSION_11
     }
+    kotlinOptions {
+        jvmTarget = '11'
+    }
 }
 
 dependencies {
+    implementation 'androidx.core:core-ktx:1.18.0'
+
     // Pine hook framework — debug only
     debugApi 'top.canyie.pine:core:0.3.0'
     // release does not declare pine dependency, uses no-op stubs

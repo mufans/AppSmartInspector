@@ -188,7 +188,7 @@ public class TraceHook {
 
         if (HookConfigManager.isEnabled("compose_tracking")) {
             try {
-                ComposeHook.hook();
+                ComposeHook.INSTANCE.hook();
             } catch (Exception e) {
                 Log.e(TAG, "Compose hook failed", e);
             }
