@@ -10,6 +10,8 @@ AI-powered Android performance analysis CLI. Collects Perfetto traces from devic
 ```
 src/smartinspector/          # Main Python package (installed via hatchling)
   agents/                    # LLM agent logic (attribution, analysis, frame analysis)
+    base.py                  #   BaseAgent ABC — unified LLM singleton, verification, token tracking
+    truncator.py             #   SmartTruncator — token-budget-aware section-based truncation
     deterministic.py         #   Pre-computed hints (no LLM) — severity, call chain, thread state, SQL summarizer
     verifier.py              #   Analysis quality verification (L1 heuristic + L2 consistency, 0 tokens)
   commands/                  # Slash command handlers
@@ -19,7 +21,9 @@ src/smartinspector/          # Main Python package (installed via hatchling)
     device.py                #   /devices, /connect, /status, /disconnect
     session.py               #   /help, /clear, /summary, /tokens
   collector/                 # Perfetto trace collection & SQL analysis
-    perfetto.py              #   PerfettoCollector — 14 collect_*() methods (incl. collect_io_slices)
+    base.py                  #   BaseCollector ABC + PerfSummary dataclass (platform-agnostic)
+    registry.py              #   CollectorRegistry — platform factory (auto-selects collector)
+    perfetto.py              #   PerfettoCollector(BaseCollector) — 14 collect_*() methods
     startup.py               #   StartupAnalyzer — cold start phase splitting & bottleneck ID
   graph/                     # LangGraph orchestration
     nodes/                   #   Graph nodes (orchestrator, collector, attributor, reporter, ...)
@@ -134,6 +138,31 @@ orchestrator → collector → attributor → reporter
                     ↓
               perf_analyzer (for /analyze)
 ```
+
+### Collector Platform Abstraction
+
+```
+BaseCollector (ABC)          # collector/base.py — defines summarize(), close(), get_device_info()
+  └── PerfettoCollector      # collector/perfetto.py — Android Perfetto (14 collect_* methods)
+  └── (future) HitraceCollector  # HarmonyOS hitrace
+  └── (future) XcodeCollector    # iOS Instruments
+CollectorRegistry            # collector/registry.py — factory: CollectorRegistry.create(path, platform=...)
+```
+
+- `PerfSummary` dataclass is platform-agnostic (defined in `collector/base.py`)
+- `CollectorRegistry` auto-discovers built-in collectors at import time
+- Downstream agents (analyzer, attributor, reporter) are platform-agnostic
+
+### Agent API Abstraction
+
+```
+BaseAgent (ABC)              # agents/base.py — defines execute(), get_llm(), run_with_verification()
+  └── (existing agents should migrate to inherit BaseAgent)
+SmartTruncator               # agents/truncator.py — token-budget-aware truncation
+```
+
+- `BaseAgent` provides thread-safe LLM singleton, token tracking, verify-and-retry pattern
+- `SmartTruncator` splits content into priority sections and keeps most important within token budget
 
 ### Graph Node Pattern
 
