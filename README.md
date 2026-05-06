@@ -76,8 +76,21 @@ uv run smartinspector --ci --trace trace.pb --format json | jq '.issues[] | sele
 
 ```
 collector (设备 trace 采集) → analyzer (LLM 性能解读) → attributor (源码归因) → reporter (生成 Markdown/JSON 报告)
-                                      ↓
-                                startup (冷启动分析，阶段切分 + 瓶颈识别)
+         ↓                         ↓
+  PerfettoCollector              startup (冷启动分析)
+  (Mixin 架构: sched|cpu|frame|
+   io|block|thread|sys)
+```
+
+核心抽象层：
+
+```
+LLMFactory (llm/factory.py)     ← 所有 LLM 实例集中创建 & 缓存
+BaseAgent (agents/base.py)      ← Agent ABC: LLM 单例 + token 追踪 + 验证重试
+BaseCollector (collector/base.py) ← 采集器 ABC: summarize() + pull_trace()
+CollectorRegistry               ← 平台工厂: auto-discover, 线程安全
+SmartTruncator (agents/truncator.py) ← 基于 token 预算的优先级截断
+SITag (si_tag.py)               ← 统一 SI$ tag 解析 (单次遍历)
 ```
 
 ### Perfetto UI 交互分析
@@ -172,11 +185,12 @@ REPL 主循环 ─── 全局 try/except，异常后保留 state 继续输入
 smartinspector/
 ├── src/smartinspector/              # Python CLI + Agent
 │   ├── cli.py                      #   CLI 入口 (argparse)
+│   ├── si_tag.py                   #   统一 SI$ tag 解析器 (SITag dataclass, parse_si_tag)
 │   ├── graph/                      #   LangGraph 编排 (模块化包)
 │   │   ├── __init__.py             #     公共导出 (create_graph, run_graph, main)
-│   │   ├── builder.py              #     LangGraph 图构建 (节点+边+条件路由)
+│   │   ├── builder.py              #     LangGraph 图构建 (节点+边+条件路由, 11 个节点)
 │   │   ├── cli.py                  #     CLI REPL 主循环 (prompt_toolkit, Tab补全, 全局异常保护)
-│   │   ├── state.py                #     AgentState + RouteDecision + pass-through
+│   │   ├── state.py                #     AgentState + RouteDecision + _get_perf_data + pass-through
 │   │   ├── streaming.py            #     图流式执行 (_stream_run, MemorySaver, 错误处理)
 │   │   └── nodes/                  #     LangGraph 图节点
 │   │       ├── orchestrator.py     #       路由分类 + fallback (few-shot, 异常处理)
@@ -185,6 +199,8 @@ smartinspector/
 │   │       ├── explorer.py         #       源码搜索 (grep/glob/read)
 │   │       ├── collector.py        #       设备 trace 采集 (PerfettoCollector, WS+SQL block events 合并)
 │   │       ├── attributor.py       #       源码归因 (SI$ slice → 源码定位, 结构化输出)
+│   │       ├── startup.py          #       冷启动分析 (StartupAnalyzer, 阶段切分+瓶颈识别)
+│   │       ├── metric_qa.py        #       自然语言指标问答 (6大类20指标)
 │   │       └── reporter/           #       报告生成
 │   │           ├── __init__.py     #         reporter_node 入口 (流式输出)
 │   │           ├── generator.py    #         LLM 报告生成 (流式+重试)
@@ -193,27 +209,46 @@ smartinspector/
 │   │           └── persistence.py  #         报告文件保存
 │   │
 │   ├── agents/                     #   Agent 定义 (LLM + Tools)
+│   │   ├── base.py                 #     BaseAgent ABC — 统一 LLM 单例, token 追踪, 验证重试
+│   │   ├── truncator.py            #     SmartTruncator — 基于 token 预算的优先级截断
 │   │   ├── android.py              #     Android Expert Agent
 │   │   ├── explorer.py             #     Code Explorer Agent
 │   │   ├── perf_analyzer.py        #     Perf Analyzer (单次 LLM 调用 + 验证重试)
-│   │   ├── attributor.py           #     源码归因 Agent (run_attribution)
+│   │   ├── attributor.py           #     源码归因 Agent (fast-path + LLM fallback)
 │   │   ├── frame_analyzer.py       #     帧分析 Agent (Perfetto UI 交互归因)
 │   │   ├── deterministic.py        #     确定性预计算 + SQL Summarizer (减少 LLM token)
 │   │   └── verifier.py             #     分析质量验证 (L1 格式 + L2 一致性, 0 token)
 │   │
-│   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU, context manager)
-│   ├── collector/startup.py        #   冷启动分析器 (启动阶段切分, 关键路径提取, 瓶颈识别)
-│   ├── collector/memory.py         #   内存分配分析器 (heap_graph, 泄漏检测, 内存趋势)
+│   ├── llm/                        #   LLM 实例管理
+│   │   └── factory.py              #     LLMFactory — 集中创建 & 缓存 (替代各 agent 独立单例)
+│   │
+│   ├── collector/                  #   Perfetto trace 采集 & SQL 分析 (模块化 Mixin)
+│   │   ├── base.py                 #     BaseCollector ABC + PerfSummary/DeviceInfo dataclass (平台无关)
+│   │   ├── registry.py             #     CollectorRegistry — 平台工厂 (自动发现, 线程安全)
+│   │   ├── perfetto.py             #     PerfettoCollector — 核心类 (Mixin 组合, summarize + pull_trace)
+│   │   ├── _helpers.py             #     共享工具 (_parse_siblock_msg, _map_state_label)
+│   │   ├── sched.py                #     SchedMixin — collect_sched()
+│   │   ├── cpu.py                  #     CpuMixin — collect_cpu_hotspots(), collect_cpu_usage()
+│   │   ├── frame.py                #     FrameMixin — collect_frame_timeline(), collect_view_slices(), collect_compose_slices()
+│   │   ├── io.py                   #     IoMixin — collect_io_slices(), collect_input_events()
+│   │   ├── block.py                #     BlockMixin — collect_block_events()
+│   │   ├── thread.py               #     ThreadMixin — collect_thread_state()
+│   │   ├── sys.py                  #     SysMixin — collect_sys_stats(), collect_threads()
+│   │   ├── memory.py               #     内存分配分析器 (heap_graph, 泄漏检测)
+│   │   └── startup.py              #     冷启动分析器 (启动阶段切分, 关键路径提取, 瓶颈识别)
+│   │
 │   ├── headless.py                 #   Headless/CI 非交互式运行器 (全量流水线, JSON/Markdown 输出)
 │   ├── storage/store.py            #   报告存储层 (基线管理, 历史查询, 对比数据源)
 │   ├── commands/                   #   Slash 命令 (注册表模式)
-│   │   ├── __init__.py             #     命令注册表 (handle_slash_command)
-│   │   ├── attribution.py          #     SI$ tag 解析 + 归因提取
-│   │   ├── device.py               #     设备管理 (/devices, /connect)
-│   │   ├── hook.py                 #     Hook 配置 (/config, /hooks)
-│   │   ├── orchestrate.py          #     编排命令 (/full, /report)
-│   │   ├── session.py              #     会话管理 (/help, /clear)
-│   │   └── trace.py                #     Trace 采集 (/trace, /record, /open, /close, /frame)
+│   │   ├── __init__.py             #     命令注册表 (handle_slash_command, 18 个命令)
+│   │   ├── attribution.py          #     SI$ tag 归因提取 (使用 si_tag.parse_si_tag)
+│   │   ├── device.py               #     设备管理 (/devices, /connect, /status, /disconnect)
+│   │   ├── hook.py                 #     Hook 配置 (/config, /hooks, /hook, /debug)
+│   │   ├── orchestrate.py          #     编排命令 (/full, /startup, /report)
+│   │   ├── session.py              #     会话管理 (/help, /clear, /summary, /tokens)
+│   │   ├── trace.py                #     Trace 采集 (/trace, /record, /analyze, /frame, /open, /close)
+│   │   ├── compare.py              #     报告对比 (/compare)
+│   │   └── quick.py                #     快速分析 (/quick, 纯确定性)
 │   │
 │   ├── tools/                      #   LangChain 工具 (grep/glob/read/perfetto)
 │   │   └── path_utils.py           #     共享路径校验 (防目录遍历)
@@ -221,7 +256,8 @@ smartinspector/
 │   ├── ws/bridge_server.py         #   Perfetto UI Bridge Server (自托管 UI + WS 桥接)
 │   ├── prompts.py                  #   Prompt 文件加载器
 │   ├── config.py                   #   全局配置 (LLM 模型, source dir, hook config 持久化, 环境变量覆盖)
-│   ├── token_tracker.py            #   LLM Token 使用量追踪
+│   ├── token_tracker.py            #   LLM Token 使用量追踪 (线程安全)
+│   ├── debug_log.py                #   统一日志 (info_log + debug_log)
 │   └── perfetto_compat.py          #   macOS IPv4 兼容修复
 │
 ├── platform/                       # 平台 SDK
@@ -537,6 +573,31 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 - iOS Instruments 集成
 - Native C/C++ 代码覆盖
 
+### ✅ 已完成 (2026-05-06 Phase 1-3 重构)
+
+**Phase 1: SI$ tag 统一解析 + 测试基础设施**
+
+- `si_tag.py`: 新建统一 tag 解析器，`SITag` dataclass + `parse_si_tag()` 单次遍历解析所有字段
+- 替代 `commands/attribution.py` 中 `extract_class()` + `extract_method()` + `extract_fqn()` 三次独立解析
+- 新增 `tests/test_si_tag.py` 覆盖 12+ 种 tag 模式（含匿名内部类）
+
+**Phase 2: Collector 模块化 + LLMFactory + AgentState 优化**
+
+- `collector/perfetto.py` 从 2,345 行拆分为 Mixin 架构：
+  - `sched.py` (SchedMixin), `cpu.py` (CpuMixin), `frame.py` (FrameMixin), `io.py` (IoMixin)
+  - `block.py` (BlockMixin), `thread.py` (ThreadMixin), `sys.py` (SysMixin)
+  - `_helpers.py` 共享工具函数
+- `llm/factory.py`: LLMFactory 集中管理所有 LLM 实例，替代 6 个 agent 各自维护全局单例
+- `graph/state.py`: 新增 `perf_summary_raw` (dict) 避免重复 `json.loads()`，新增 `_get_perf_data()` 辅助函数
+- Pass-through keys 新增 `perf_summary_raw` 字段
+
+**Phase 3: 平台抽象层 + Agent API 统一 + 智能截断**
+
+- `collector/base.py`: BaseCollector ABC + PerfSummary/DeviceInfo dataclass（平台无关）
+- `collector/registry.py`: CollectorRegistry 工厂（自动发现内置 collector，线程安全）
+- `agents/base.py`: BaseAgent ABC — 统一 LLM 单例管理、token 追踪、验证重试模式
+- `agents/truncator.py`: SmartTruncator — 基于 token 预算的优先级截断（替代盲截 `text[:N]`）
+
 ### 工程优化
 
 - 帧严重度阈值区分刷新率 (120Hz 设备帧预算 8.33ms)
@@ -545,7 +606,9 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 - Perfetto `android.surfaceflinger.frame` 维度 (CPU vs GPU 瓶颈)
 - 自适应阈值 (基于设备能力动态调整)
 - ~~thread_state N+1 查询优化~~ → 已完成：重写为 `__intrinsic_thread_state` 表，支持 `blocked_function`/`io_wait`/`waker_utid`
-- LLM 实例统一管理 (LLMFactory)
+- ~~LLM 实例统一管理 (LLMFactory)~~ → 已完成：Phase 2 实现 `llm/factory.py`
+- ~~Collector 巨型文件拆分~~ → 已完成：Phase 2 拆分为 7 个 Mixin + 核心类
+- ~~SI$ tag 重复解析~~ → 已完成：Phase 1 统一为 `si_tag.py`
 
 ### ✅ 已完成 (2026-04-24 P1 改进)
 

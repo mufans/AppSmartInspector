@@ -46,6 +46,7 @@ src/smartinspector/          # Main Python package (installed via hatchling)
         generator.py         #     LLM report generation
         persistence.py       #     Markdown report file output
     state.py                 #   AgentState TypedDict, _pass_through(), _get_perf_data(), node_error_handler()
+  si_tag.py                  # Unified SI$ tag parser — SITag dataclass, parse_si_tag()
   tools/                     # File search tools (glob, grep, read) — used by agents
   ws/                        # WebSocket server for app communication
   headless.py                # Headless/CI non-interactive runner
@@ -145,9 +146,10 @@ debug_log("collector", f"thread_state: {name} running={running_ms:.1f}ms")
 ### LangGraph Pipeline
 
 ```
-orchestrator → collector → attributor → reporter
-                    ↓
-              perf_analyzer (for /analyze)
+orchestrator → collector → analyzer → attributor → reporter
+                    ↓           ↓
+              perf_analyzer  startup (cold start)
+              (standalone)
 ```
 
 ### Collector Platform Abstraction
@@ -202,6 +204,8 @@ Agents are separate from graph nodes. They contain the business logic:
 - `agents/perf_analyzer.py` — Performance analysis
 - `agents/explorer.py` — Code exploration
 - `agents/android.py` — Android expert
+- `agents/base.py` — BaseAgent ABC (unified LLM singleton, token tracking, verify-and-retry)
+- `agents/truncator.py` — SmartTruncator (token-budget-aware section-based truncation)
 
 ### LLM Instance Management
 
@@ -220,9 +224,6 @@ llm_tools = LLMFactory.get_with_tools("attributor", [grep, glob, read], temperat
 Roles: `default`, `attributor`, `router`, `perf_analyzer`, `frame_analyzer`, `metric_qa`, `reporter`, `android_expert`, `explorer`.
 
 **Do NOT** create `ChatOpenAI()` instances directly in agent code. Use `LLMFactory.get()` instead.
-- `agents/frame_analyzer.py` — Frame-level analysis
-- `agents/perf_analyzer.py` — Performance analysis
-- `agents/explorer.py` — Code exploration
 
 ### AgentState Fields
 
@@ -244,12 +245,12 @@ Roles: `default`, `attributor`, `router`, `perf_analyzer`, `frame_analyzer`, `me
 
 ```
 full_analysis  → collector → analyzer → attributor → reporter
-startup        → collector → analyzer → startup_analyzer (cold start with ADB force-stop/launch)
+startup        → collector → analyzer → startup → attributor → reporter
 android        → android_expert
 analyze        → collector → perf_analyzer
 explorer       → explorer
 trace          → collector → analyzer → END
-quick          → deterministic analysis (no LLM)
+quick          → collector → analyzer → attributor → reporter (deterministic, no LLM)
 metric_qa      → metric_qa node (natural language metric query, format: metric_qa:<id>)
 end            → END
 ```
@@ -310,6 +311,9 @@ uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--dura
 
 | Command | Description |
 |---------|-------------|
+| `/startup [--no-wait]` | Cold start analysis (auto force-stop + launch + trace + analyze) |
+| `/quick` | Quick deterministic analysis (no LLM, no API key needed) |
+| `/compare <r1> <r2>` | Compare two reports, generate before/after trend |
 | `/trace <package>` | Record and load a trace |
 | `/record [duration]` | Start perfetto recording on device |
 | `/analyze` | Analyze loaded trace |
@@ -418,7 +422,6 @@ Methods remaining in `perfetto.py`: `collect_memory()`, `collect_process_memory(
 | `collect_threads()` | Thread list for target process | `thread`, `process` |
 | `collect_view_slices()` | View system slices (doFrame, measure, layout, draw, RV) with parent chains | `slice`, `args` |
 | `collect_io_slices()` | IO-related slices (net/db/img) from all threads | `slice` |
-| `collect_io_slices()` | IO-related slices (net/db/img) | `slice` |
 | `collect_input_events()` | Touch/input event data | `slice` |
 | `collect_block_events()` | SI$block slices merged with logcat SIBlock stack traces | `slice`, `android_logs` |
 

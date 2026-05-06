@@ -18,15 +18,15 @@
               │  (LLM intent classify)  │
               │  few-shot + max_tokens=5│
               │  try/except → fallback  │
-              └──┬──────┬──────┬──┬──┬──┘
-                 │      │      │  │  │
-      ┌──────────▼┐ ┌──▼──┐ ┌▼─┐│ ┌▼───────┐
-      │ collector  │ │Perf │ │Ex││ │Fallback │
-      │ (pipeline) │ │Anal.│ │pl││ │         │
-      └──────┬─────┘ └──┬──┘ └┬─┘│ └─────────┘
-             │           │     │  │
-             ▼           ▼     ▼  ▼
-      ┌──────────┐      END  END END
+              └──┬──────┬──────┬──┬──┬──┬──┬──┐
+                 │      │      │  │  │  │  │  │
+      ┌──────────▼┐ ┌──▼──┐ ┌▼─┐│ ┌▼──┐│ ┌▼───┐
+      │ collector  │ │Perf │ │Ex││ │Met││ │Fall │
+      │ (pipeline) │ │Anal.│ │pl││ QA ││ │back │
+      └──────┬─────┘ └──┬──┘ └┬─┘└──┬┘│ └─────┘
+             │           │     │     │ │
+             ▼           ▼     ▼     ▼ ▼
+      ┌──────────┐      END  END   END END
       │ analyzer │
       └────┬─────┘
            │
@@ -43,6 +43,7 @@
   State: MemorySaver checkpointer (get_state() 替代手动合并)
   Streaming: reporter 真正流式输出，其他节点静默处理
   Error: node_error_handler 装饰器统一捕获 + graph.stream try/except
+  LLM: LLMFactory 集中管理所有实例，替代各 agent 独立单例
 
 ## Directory Structure
 
@@ -50,17 +51,18 @@
 smartinspector/
 ├── src/smartinspector/
 │   ├── cli.py                   # CLI entry point (argparse)
-│   ├── main.py                  # Legacy entry (deprecated)
+│   ├── si_tag.py                # Unified SI$ tag parser (SITag dataclass, parse_si_tag)
 │   ├── prompts.py               # Prompt file loader
 │   ├── perfetto_compat.py       # macOS IPv4 fix for perfetto lib
 │   ├── config.py                # Global config (LLM models, source dir, hook config persistence, env var overrides)
 │   ├── token_tracker.py         # LLM token usage tracking
+│   ├── debug_log.py             # Unified logging (info_log + debug_log)
 │   │
 │   ├── graph/                   # LangGraph orchestration (modular package)
 │   │   ├── __init__.py          #   Public exports (create_graph, run_graph, main)
-│   │   ├── builder.py           #   Graph construction (nodes + edges + conditional routing)
+│   │   ├── builder.py           #   Graph construction (nodes + edges + conditional routing, 11 nodes)
 │   │   ├── cli.py               #   CLI REPL loop (prompt_toolkit, Tab补全, WS auto-start, 全局异常保护)
-│   │   ├── state.py             #   AgentState, RouteDecision enum, _pass_through()
+│   │   ├── state.py             #   AgentState, RouteDecision, _pass_through(), _get_perf_data(), node_error_handler()
 │   │   ├── streaming.py         #   _stream_run() — streaming graph execution, MemorySaver, error handling
 │   │   └── nodes/               #   LangGraph graph nodes
 │   │       ├── orchestrator.py  #     LLM routing + fallback node (few-shot, error handling)
@@ -69,6 +71,8 @@ smartinspector/
 │   │       ├── explorer.py      #     Code Explorer: grep/glob/read
 │   │       ├── collector.py     #     Trace collection node (pipeline step 1, WS+SQL block events merge)
 │   │       ├── attributor.py    #     Source attribution node (pipeline step 3, structured output)
+│   │       ├── startup.py       #     Cold start analysis (StartupAnalyzer, phase splitting)
+│   │       ├── metric_qa.py     #     Natural language metric query (6 categories, 20 metrics)
 │   │       └── reporter/        #     Report generation (pipeline step 4)
 │   │           ├── __init__.py  #       reporter_node entry (streaming output)
 │   │           ├── generator.py #       LLM report generation (streaming + retry + token estimation)
@@ -77,26 +81,46 @@ smartinspector/
 │   │           └── persistence.py #     Report file saving (./reports/)
 │   │
 │   ├── agents/                  # Agent definitions (LLM + tools)
+│   │   ├── base.py              #   BaseAgent ABC — unified LLM singleton, token tracking, verify-and-retry
+│   │   ├── truncator.py         #   SmartTruncator — token-budget-aware section-based truncation
 │   │   ├── android.py           #   Android Expert: trace collect + analyze
 │   │   ├── explorer.py          #   Code Explorer: grep/glob/read
 │   │   ├── perf_analyzer.py     #   Perf Analyzer: single-shot LLM interpretation
 │   │   ├── attributor.py        #   Source attribution: run_attribution()
 │   │   ├── frame_analyzer.py    #   Frame Analyzer: Perfetto UI 交互帧分析 (query→attribution→LLM)
-│   │   └── deterministic.py     #   Deterministic pre-computation (reduces LLM tokens)
+│   │   ├── deterministic.py     #   Deterministic pre-computation (reduces LLM tokens)
+│   │   └── verifier.py          #   Analysis quality verification (L1 heuristic + L2 consistency)
 │   │
-│   ├── collector/               # Data collection & processing
-│   │   ├── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON (CPU调用链, 系统级CPU, WS+SQL合并, context manager, IO slices)
+│   ├── llm/                     # LLM instance management
+│   │   └── factory.py           #   LLMFactory — centralized creation & caching (thread-safe)
+│   │
+│   ├── collector/               # Data collection (modular Mixin architecture)
+│   │   ├── base.py              #   BaseCollector ABC + PerfSummary/DeviceInfo dataclass (platform-agnostic)
+│   │   ├── registry.py          #   CollectorRegistry — platform factory (auto-discover, thread-safe)
+│   │   ├── perfetto.py          #   PerfettoCollector (Mixin composition: sched+cpu+frame+io+block+thread+sys)
+│   │   ├── _helpers.py          #   Shared helpers (_parse_siblock_msg, _map_state_label)
+│   │   ├── sched.py             #   SchedMixin — collect_sched()
+│   │   ├── cpu.py               #   CpuMixin — collect_cpu_hotspots(), collect_cpu_usage()
+│   │   ├── frame.py             #   FrameMixin — collect_frame_timeline(), collect_view_slices(), collect_compose_slices()
+│   │   ├── io.py                #   IoMixin — collect_io_slices(), collect_input_events()
+│   │   ├── block.py             #   BlockMixin — collect_block_events()
+│   │   ├── thread.py            #   ThreadMixin — collect_thread_state()
+│   │   ├── sys.py               #   SysMixin — collect_sys_stats(), collect_threads()
+│   │   ├── memory.py            #   Heap graph analysis (heap_graph_object + heap_graph_class)
 │   │   └── startup.py           #   StartupAnalyzer: cold start phase splitting + bottleneck identification
 │   │
 │   ├── headless.py              # HeadlessRunner: non-interactive CI mode (full pipeline, JSON/Markdown output)
-│   ├── commands/                # Slash command implementations
+│   ├── storage/store.py         # Report storage (baseline management, history query, compare)
+│   ├── commands/                # Slash command implementations (18 commands)
 │   │   ├── __init__.py          #   Command registry (SLASH_COMMANDS dict + handle_slash_command)
-│   │   ├── attribution.py       #   SI$ tag parsing + attribution extraction
+│   │   ├── attribution.py       #   SI$ tag attribution extraction (uses si_tag.parse_si_tag)
 │   │   ├── device.py            #   /devices, /connect, /status, /disconnect
 │   │   ├── hook.py              #   /config, /hooks, /hook, /debug
-│   │   ├── orchestrate.py       #   /full, /report (文件输出)
+│   │   ├── orchestrate.py       #   /full, /startup, /report (文件输出)
 │   │   ├── session.py           #   /help, /clear (全字段清理), /summary, /tokens
-│   │   └── trace.py             #   /trace, /record, /analyze, /frame, /open, /close
+│   │   ├── trace.py             #   /trace, /record, /analyze, /frame, /open, /close
+│   │   ├── compare.py           #   /compare (before/after trend report)
+│   │   └── quick.py             #   /quick (deterministic, no LLM)
 │   │
 │   ├── tools/                   # LangChain @tool functions
 │   │   ├── perfetto.py          #   analyze_perfetto, collect_android_trace
@@ -115,16 +139,13 @@ smartinspector/
 │   └── build.sh                 #   构建脚本 (clone Perfetto + 复制插件 + build)
 │
 ├── prompts/                     # System prompts (text files)
-│   ├── main.txt                 #   Main persona (HarmonyOS perf tool)
-│   ├── android-expert.txt       #   Android agent prompt
-│   ├── perf-analyzer.txt        #   Perf analysis prompt
-│   ├── code-explorer.txt        #   Code search prompt
+│   ├── attributor.txt           #   Source attribution instructions
+│   ├── report-generator.txt     #   Report generation instructions
+│   ├── perf-analyzer.txt        #   Performance analysis prompt
 │   ├── frame-analyzer.txt       #   Frame analysis prompt (Perfetto UI /frame)
-│   ├── report-generator.txt     #   Report format prompt
-│   ├── compaction.txt           #   Context compression prompt
-│   ├── monkey-driver.txt        #   Monkey test driver prompt
-│   ├── reference-hdc-commands.txt
-│   └── reference-opencode-prompts.txt
+│   ├── android-expert.txt       #   Android agent prompt
+│   ├── code-explorer.txt        #   Code search prompt
+│   └── ...                      #   Other prompt files
 │
 ├── platform/android/            # Android trace hook library
 │   ├── app/                     #   Demo app
@@ -149,18 +170,25 @@ smartinspector/
 class RouteDecision(str, Enum):
     """Routing decisions returned by the orchestrator node."""
     FULL_ANALYSIS = "full_analysis"   # full pipeline: collector → analyzer → attributor → reporter
+    STARTUP = "startup"               # cold start: collector → analyzer → startup → attributor → reporter
     ANDROID = "android"               # android expert agent
     ANALYZE = "analyze"               # standalone perf analysis
     EXPLORER = "explorer"             # source code search
     END = "end"                       # general Q&A / fallback
     TRACE = "trace"                   # /trace command: collector → analyzer
+    QUICK = "quick"                   # /quick command: deterministic, no LLM
+    METRIC_QA = "metric_qa"           # natural language metric query (format: metric_qa:<id>)
 
 class AgentState(TypedDict):
     messages: Annotated[list, operator.add]   # Accumulated conversation
-    perf_summary: str                          # JSON: PerfettoCollector summary
+    perf_summary: str                          # JSON: PerfettoCollector summary (backward compat for LLM prompts)
+    perf_summary_raw: dict                     # Dict: structured perf data (avoids repeated json.loads)
     perf_analysis: str                         # Markdown: LLM performance analysis
     attribution_data: str                      # JSON: list of attributable SI$ slices
     attribution_result: str                    # JSON: attribution results with source snippets
+    trace_duration_ms: int                     # CLI override: trace duration in ms
+    trace_target_process: str                  # CLI override: target process name
+    skip_wait: bool                            # CLI flag: skip waiting for app connection
     _route: str                                # internal: RouteDecision value
     _trace_path: str                           # internal: trace file path from collector
 ```
@@ -169,16 +197,18 @@ State flows through the graph, each node returns a partial state update:
 
 ```
 orchestrator  → { _route: "android", messages: [] }
-android_expert → { messages: [...], perf_summary: "{...json...}" }
-collector     → { messages: [...], perf_summary: "{...json...}", _trace_path: "/tmp/xxx.pb" }
+android_expert → { messages: [...], perf_summary: "{...json...}", perf_summary_raw: {...dict...} }
+collector     → { messages: [...], perf_summary: "{...json...}", perf_summary_raw: {...dict...}, _trace_path: "/tmp/xxx.pb" }
 analyzer      → { messages: [AIMessage], perf_analysis: "..." }
 attributor    → { messages: [...], attribution_data: "[...]", attribution_result: "[...]" }
 reporter      → { messages: [AIMessage (full report)] }
+startup       → { messages: [...], perf_analysis: "..." }
+metric_qa     → { messages: [AIMessage] }
 explorer      → { messages: [...] }
 fallback      → { messages: [AIMessage] }
 ```
 
-Pass-through fields (`perf_summary`, `perf_analysis`, `attribution_data`, `attribution_result`) are forwarded by every node via `_pass_through(state)` so they persist across graph executions until `/clear`.
+Pass-through fields (`perf_summary`, `perf_summary_raw`, `perf_analysis`, `attribution_data`, `attribution_result`) are forwarded by every node via `_pass_through(state)` so they persist across graph executions until `/clear`. The `_get_perf_data(state)` helper prefers `perf_summary_raw` (dict) when available, falling back to parsing `perf_summary` (JSON string) for backward compatibility.
 
 The CLI loop in `_stream_run()` (graph/streaming.py) uses `graph.get_state(config)` with MemorySaver checkpointer to retrieve the final state after graph execution, instead of manual state merging.
 
@@ -197,10 +227,13 @@ All graph nodes are protected by a `node_error_handler` decorator that catches e
 | Route | Keywords | Target Node |
 |-------|----------|-------------|
 | `full_analysis` | 全面分析/完整分析/全量分析/full/归因/冷启动/启动耗时/启动时间/启动分析/启动优化/应用启动/app启动/cold start/启动性能 | collector (pipeline entry) |
+| `startup` | 冷启动分析/启动性能/cold start | collector (→ startup) |
 | `android` | trace/adb/采集/perfetto/FPS/CPU/内存指标 | android_expert |
 | `analyze` | 解读perf_summary/分析这份数据/解读一下这个 | perf_analyzer |
 | `explorer` | 源码/代码/搜索/查看/定位/函数/grep/.ets/.ts/.java | explorer |
 | `end` | 什么是/怎么优化/如何/为什么/general Q&A | fallback |
+| `quick` | /quick command | collector (deterministic) |
+| `metric_qa` | CPU/帧率/内存指标追问 | metric_qa |
 | `trace` | /trace command | collector (→ analyzer → END) |
 
 **Graph routing** (graph/builder.py):
@@ -208,9 +241,12 @@ All graph nodes are protected by a `node_error_handler` decorator that catches e
 ```
 orchestrator → route_from_orchestrator():
     full_analysis → collector → analyzer → attributor → reporter → END
+    startup       → collector → analyzer → startup → attributor → reporter → END
     trace         → collector → analyzer → END
     android       → android_expert → (analyzer | END)
     analyze       → perf_analyzer → END
+    quick         → collector → analyzer → attributor → reporter → END
+    metric_qa     → metric_qa → END
     explorer      → explorer → END
     end           → fallback → END
 ```
@@ -286,6 +322,9 @@ you> /debug         → 打开设备端 Hook 调试配置面板
 | 指令 | 功能 |
 |------|------|
 | `/full [--no-wait]` | 一键完整流程:采集 → 分析 → 源码归因 → 报告。 `--no-wait` 跳过等待 App 连接，适用于冷启动耗时分析 |
+| `/startup [--no-wait]` | 冷启动分析:自动 force-stop → 采集 → 阶段切分 → 瓶颈识别 → 报告 |
+| `/quick` | 快速确定性分析 (不调用 LLM，不需要 API Key) |
+| `/compare <r1> <r2>` | 对比两份报告，生成 before/after 趋势报告 |
 | `/report [path]` | 对当前会话生成正式性能分析报告 |
 
 ### 实现位置
@@ -297,7 +336,9 @@ from smartinspector.commands.device import cmd_devices, cmd_connect, cmd_status,
 from smartinspector.commands.trace import cmd_trace, cmd_record, cmd_analyze, cmd_frame, cmd_open, cmd_close
 from smartinspector.commands.hook import cmd_config, cmd_hooks, cmd_hook, cmd_debug
 from smartinspector.commands.session import cmd_help, cmd_clear, cmd_summary, cmd_tokens
-from smartinspector.commands.orchestrate import cmd_full, cmd_report
+from smartinspector.commands.orchestrate import cmd_full, cmd_startup, cmd_report
+from smartinspector.commands.compare import cmd_compare
+from smartinspector.commands.quick import cmd_quick
 
 SLASH_COMMANDS = {
     "/help": cmd_help,
@@ -319,7 +360,10 @@ SLASH_COMMANDS = {
     "/summary": cmd_summary,
     "/tokens": cmd_tokens,
     "/full": cmd_full,
+    "/startup": cmd_startup,
     "/report": cmd_report,
+    "/compare": cmd_compare,
+    "/quick": cmd_quick,
 }
 
 def handle_slash_command(user_input: str, state: dict) -> dict:
@@ -506,6 +550,37 @@ def handle_slash_command(user_input: str, state: dict) -> dict:
 **Output**: Short, friendly response with natural capability hints.
 
 ## Data Collection Layer
+
+### Architecture
+
+```
+BaseCollector (ABC)                    # collector/base.py
+  ├── PerfSummary (dataclass)          # Platform-agnostic summary
+  ├── DeviceInfo (dataclass)           # Platform-agnostic device description
+  └── abstract methods:
+        summarize() → PerfSummary
+        close()
+        get_device_info() → DeviceInfo
+
+PerfettoCollector(BaseCollector,       # collector/perfetto.py — Mixin composition
+    SchedMixin, CpuMixin, FrameMixin,
+    IoMixin, BlockMixin, ThreadMixin,
+    SysMixin)
+
+CollectorRegistry                      # collector/registry.py — thread-safe factory
+  └── auto-discovers built-in collectors at import time
+  └── CollectorRegistry.get("android") → PerfettoCollector
+
+Mixin modules (domain-specific):
+  collector/sched.py   → SchedMixin — collect_sched()
+  collector/cpu.py     → CpuMixin — collect_cpu_hotspots(), collect_cpu_usage()
+  collector/frame.py   → FrameMixin — collect_frame_timeline(), collect_view_slices(), collect_compose_slices()
+  collector/io.py      → IoMixin — collect_io_slices(), collect_input_events()
+  collector/block.py   → BlockMixin — collect_block_events()
+  collector/thread.py  → ThreadMixin — collect_thread_state()
+  collector/sys.py     → SysMixin — collect_sys_stats(), collect_threads()
+  collector/_helpers.py → _parse_siblock_msg(), _map_state_label() (shared utilities)
+```
 
 ### PerfettoCollector (`collector/perfetto.py`)
 
@@ -867,6 +942,21 @@ orchestrator → explorer → END
 orchestrator → collector → analyzer → END
 ```
 
+**Quick Analysis** (`/quick` command):
+```
+orchestrator → collector → analyzer → attributor → reporter → END (deterministic, no LLM)
+```
+
+**Cold Start** (`startup` route):
+```
+orchestrator → collector → analyzer → startup → attributor → reporter → END
+```
+
+**Metric QA** (`metric_qa` route):
+```
+orchestrator → metric_qa → END
+```
+
 ## Key Design Decisions
 
 1. **Graph-based pipeline** — `graph.py` refactored into `graph/` package with `builder.py` (graph construction), `cli.py` (REPL loop), `state.py` (state + routing), `streaming.py` (execution). Pipeline nodes (collector → analyzer → attributor → reporter) are first-class LangGraph nodes, not CLI-loop orchestration.
@@ -874,7 +964,7 @@ orchestrator → collector → analyzer → END
 3. **Raw trace stays local** — Only ~2KB structured JSON summary is sent to LLM
 4. **Streaming first** — reporter streams tokens in real-time; other nodes process silently
 5. **Lazy hook** — RV Adapter/LayoutManager hooked dynamically when set; extra_hooks configured at init
-6. **Command registry** — Slash commands refactored into `commands/` package with registry pattern (`SLASH_COMMANDS` dict + `handle_slash_command`). Each command file is self-contained.
+6. **Command registry** — Slash commands refactored into `commands/` package with registry pattern (`SLASH_COMMANDS` dict + `handle_slash_command`). Each command file is self-contained. 18 commands registered.
 7. **Programmatic extraction** — Class/method names extracted from JSON by code, search strategy by AI
 8. **CS architecture** — Agent (WS server) ↔ App (WS client)，按需懒加载，每个平台 expert 独立管理自己的 WS server
 9. **debug/release variants** — Zero-cost abstraction: release = pure no-op stubs (no WS, no hooks), same API surface
@@ -885,12 +975,18 @@ orchestrator → collector → analyzer → END
 14. **SDK safety** — Trace nesting depth protection; Tag truncation at 127 bytes; BlockMonitor capacity limit; system widget filtering; BuildConfig.DEBUG guards
 15. **WS reliability** — Ping/pong heartbeat; startup exception propagation; dynamic port via get_ws_port(); config msg_id + ACK; hook config persistence to local file; ready event to prevent startup race condition
 16. **Configurable limits** — Hardcoded values (tool timeout, read limits, report tokens, WS ping timeout) centralized in `config.py` with `SI_*` environment variable overrides
-17. **Thread-safe singletons** — LLM client singletons in agents use double-checked locking pattern (`threading.Lock`) for thread-safe lazy initialization
+17. **LLMFactory** — All LLM instances centralized in `llm/factory.py` with thread-safe caching. Replaces 6 scattered per-agent global singletons. Roles: default, attributor, router, perf_analyzer, frame_analyzer, metric_qa, reporter, android_expert, explorer.
 18. **Shared path validation** — Tools share `path_utils.validate_search_path()` to prevent directory traversal attacks
 19. **IO slice separation** — IO slices (`SI$net#/SI$db#/SI$img#`) collected independently from view slices, avoiding pollution of main-thread analysis; IO hooks enabled by default for comprehensive tracing
 20. **Cold start phase splitting** — `StartupAnalyzer` identifies 4 startup phases (pre-main → Application.onCreate → Activity.onCreate → first frame) and extracts critical path + bottlenecks
 21. **Headless/CI mode** — `HeadlessRunner` provides non-interactive pipeline execution with JSON output for CI/CD integration; graceful degradation without LLM API key
 22. **JSON report format** — Structured JSON output with severity classification (P0/P1/P2), issue categorization, and source attribution, designed for automated parsing
+23. **Collector Mixin architecture** — `PerfettoCollector` split into 7 domain Mixins (`SchedMixin`, `CpuMixin`, `FrameMixin`, `IoMixin`, `BlockMixin`, `ThreadMixin`, `SysMixin`), reducing single file from 2,345 lines to ~300 (core) + ~200 per mixin. Enables independent testing per collect method.
+24. **BaseCollector platform abstraction** — `BaseCollector` ABC in `collector/base.py` defines platform-agnostic interface (`summarize()`, `close()`, `get_device_info()`). `CollectorRegistry` provides factory pattern for multi-platform support. `PerfSummary` dataclass is platform-independent.
+25. **BaseAgent API unification** — `BaseAgent` ABC in `agents/base.py` provides unified calling convention: thread-safe LLM singleton, token tracking, verify-and-retry pattern. All agents should migrate to inherit BaseAgent.
+26. **SmartTruncator** — Token-budget-aware section-based truncation replaces blind `text[:N]` slicing. Splits content into priority sections (attribution=1, thread_state=2, frame_timeline=2, ...) and keeps most important within budget.
+27. **Unified SI$ tag parsing** — `si_tag.py` provides `SITag` dataclass and `parse_si_tag()` single-pass parser. Replaces 3 separate parsing functions (`extract_class`, `extract_method`, `extract_fqn`) that each independently traversed the same tag.
+28. **AgentState data optimization** — `perf_summary_raw` (dict) avoids repeated `json.loads()` in downstream nodes. `_get_perf_data()` helper provides backward-compatible access.
 
 ---
 

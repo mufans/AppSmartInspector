@@ -617,3 +617,97 @@ AppSmartInspector 的核心架构（LangGraph pipeline + deterministic pre-compu
 3. **LLM 实例统一管理**（6 处碎片化 → LLMFactory）：是扩展性的前提
 
 **最具价值的改进路径**: 先建立测试 → 再重构 Collector → 再统一 Agent 管理。这条路径确保每一步都有安全网，每一步都使代码更易于维护和扩展。
+
+---
+
+## 八、Phase 1-3 实施结果（2026-05-06）
+
+> 以下记录了基于本报告的改进方案实施结果。实施分三个阶段完成。
+
+### Phase 1: SI$ Tag 统一解析 + 测试基础设施 ✅ 已完成
+
+| # | 项目 | 原始问题 | 实施结果 |
+|---|------|----------|----------|
+| 1 | SI$ Tag 统一解析 | P1-1: 三个独立解析函数重复遍历 | `si_tag.py` 新建，`SITag` dataclass + `parse_si_tag()` 单次遍历替代 3 个独立函数 |
+| 2 | 测试基础设施 | P0-4: 测试覆盖率 ~9% | 新增 `tests/test_si_tag.py` 覆盖 12+ 种 tag 模式（含匿名内部类） |
+
+**解决**: P1-1 (SI$ tag 重复解析)
+
+### Phase 2: Collector 模块化 + LLMFactory + AgentState 优化 ✅ 已完成
+
+| # | 项目 | 原始问题 | 实施结果 |
+|---|------|----------|----------|
+| 3 | Collector 模块化拆分 | P0-1: `perfetto.py` 2,345 行巨型文件 | 拆分为 7 个 Mixin 模块 + 核心类 ~300 行。每个 Mixin 100-200 行，可独立测试 |
+| 4 | LLMFactory 统一管理 | P0-3: 6 处 LLM 实例碎片化管理 | `llm/factory.py` 集中管理，thread-safe caching，支持 role-based 配置 |
+| 5 | AgentState 数据类型优化 | P0-2: `perf_summary` JSON 字符串重复解析 | 新增 `perf_summary_raw` (dict)，`_get_perf_data()` 辅助函数避免重复 `json.loads()` |
+| 6 | SI$ tag 解析去重 | P1-1: tag 解析逻辑重复 | `commands/attribution.py` 使用 `si_tag.parse_si_tag()` 统一入口 |
+| 7 | compute_hints 缓存 | P1-3: `compute_hints()` 被调用两次 | 通过 `perf_summary_raw` 共享 dict，下游直接使用 |
+
+**解决**: P0-1 (巨型文件), P0-2 (JSON 字符串重复解析), P0-3 (LLM 实例碎片化), P1-1 (tag 解析重复), P1-3 (compute_hints 重复调用)
+
+**新增文件**:
+- `collector/base.py` — BaseCollector ABC + PerfSummary dataclass
+- `collector/registry.py` — CollectorRegistry 工厂
+- `collector/_helpers.py` — 共享工具函数
+- `collector/sched.py` — SchedMixin
+- `collector/cpu.py` — CpuMixin
+- `collector/frame.py` — FrameMixin
+- `collector/io.py` — IoMixin
+- `collector/block.py` — BlockMixin
+- `collector/thread.py` — ThreadMixin
+- `collector/sys.py` — SysMixin
+- `llm/factory.py` — LLMFactory
+- `si_tag.py` — 统一 SI$ tag 解析器
+
+### Phase 3: 平台抽象层 + Agent API 统一 + 智能截断 ✅ 已完成
+
+| # | 项目 | 原始问题 | 实施结果 |
+|---|------|----------|----------|
+| 8 | BaseCollector 平台抽象层 | 改进六: 为 HarmonyOS/iOS 扩展建立基础 | `BaseCollector` ABC 定义标准接口 (`summarize`, `close`, `get_device_info`)。`PerfSummary`/`DeviceInfo` dataclass 平台无关。`CollectorRegistry` 工厂支持自动发现 |
+| 9 | BaseAgent API 统一 | P1-5: 三种 Agent 实现模式并存 | `BaseAgent` ABC 提供统一模式：thread-safe LLM singleton, token tracking, verify-and-retry |
+| 10 | SmartTruncator 智能截断 | P2-1/P2-4: 盲截 `text[:3000]` 可能丢失关键数据 | `SmartTruncator` 基于 token 预算 + 优先级 section 截断，attribution=1 > thread_state=2 > metadata=5 |
+
+**解决**: P1-5 (Agent API 不一致), P2-1 (武断截断), P2-4 (智能截断)
+
+### 问题解决状态汇总
+
+| 问题 | 严重度 | 状态 |
+|------|--------|------|
+| P0-1: `perfetto.py` 巨型文件 (2,345 行) | P0 | ✅ 已解决 — Mixin 拆分 |
+| P0-2: `perf_summary` JSON 字符串重复解析 | P0 | ✅ 已解决 — `perf_summary_raw` dict |
+| P0-3: LLM 实例管理碎片化 | P0 | ✅ 已解决 — LLMFactory |
+| P0-4: 测试覆盖率极低 (~9%) | P0 | 🔶 部分改善 — 新增 si_tag 测试 |
+| P1-1: SI$ Tag 解析逻辑重复 | P1 | ✅ 已解决 — `si_tag.py` 统一解析 |
+| P1-2: SQL 注入风险 | P1 | ⬚ 未解决 |
+| P1-3: `compute_hints()` 重复调用 | P1 | ✅ 已解决 — perf_summary_raw 共享 |
+| P1-4: Bridge Server 全局状态管理 | P1 | ⬚ 未解决 |
+| P1-5: Agent API 不一致 | P1 | ✅ 已解决 — BaseAgent ABC |
+| P2-1: `perf_analyzer.py` 武断截断 | P2 | ✅ 已解决 — SmartTruncator |
+| P2-2: config.py 重复模式 | P2 | ⬚ 未解决 |
+| P2-3: 函数内部 import | P2 | ⬚ 未解决 |
+| P2-4: perf_analyzer 智能截断 | P2 | ✅ 已解决 — SmartTruncator |
+
+**改进方案实施状态**:
+
+| 改进 | 状态 |
+|------|------|
+| 改进一: Collector 模块化拆分 | ✅ 已完成 |
+| 改进二: AgentState 数据类型优化 | ✅ 已完成 |
+| 改进三: 统一 LLM 实例管理 (LLMFactory) | ✅ 已完成 |
+| 改进四: SI$ Tag 统一解析 | ✅ 已完成 |
+| 改进五: 测试基础设施搭建 | 🔶 部分完成 (si_tag 测试) |
+| 改进六: 平台抽象层 (BaseCollector) | ✅ 已完成 |
+| 改进七: Orchestrator 路由 Prompt 外置 | ⬚ 未完成 |
+
+### 架构评分更新
+
+| 指标 | 重构前 | 重构后 |
+|------|--------|--------|
+| `collector/perfetto.py` 行数 | 2,345 | ~300 (核心类) |
+| Collector 文件数 | 1 | 9 (core + 7 mixins + helpers) |
+| LLM 实例管理 | 6 处独立 | 1 处集中 (LLMFactory) |
+| SI$ tag 解析 | 3 个独立函数 | 1 个统一解析器 |
+| Agent API | 3 种模式 | 1 种统一模式 (BaseAgent) |
+| 截断策略 | 盲截 `text[:N]` | 基于 token 预算优先级截断 |
+| AgentState | 仅 str JSON | str JSON + dict 直传 |
+| 平台扩展 | 硬编码 Android | BaseCollector ABC + CollectorRegistry |
