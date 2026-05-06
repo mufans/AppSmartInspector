@@ -1,92 +1,21 @@
 """Source code attribution: extract SI$ slices from perf_summary for explorer."""
 
 import json
-import re
 
-
-# Matches trailing $number (anonymous inner class index), e.g. $1, $2
-_ANON_SUFFIX = re.compile(r'\$(\d+)$')
+from smartinspector.si_tag import (
+    SITag,
+    parse_si_tag,
+    _split_fqn_method,
+    _extract_method_from_anonymous,
+    SYSTEM_PREFIXES as _SYSTEM_PREFIXES,
+    SYSTEM_CLASS_PATTERNS as _SYSTEM_CLASS_PATTERNS,
+    RV_PIPELINE_METHODS as _RV_PIPELINE_METHODS,
+)
 
 
 # ---------------------------------------------------------------------------
-# SI$ tag parsing
+# SI$ tag parsing — thin wrappers around parse_si_tag()
 # ---------------------------------------------------------------------------
-
-def _split_fqn_method(body: str) -> tuple[str, str]:
-    """Split 'com.example.ClassName.method' into (fqn, method).
-
-    The last dot-separated segment is the method name, everything before it
-    is the fully-qualified class name.
-
-    Handles edge cases where there is no separate method segment and the
-    entire string is a class FQN (e.g. block tags whose msgClass is the
-    full FQN like ``com.smartinspector.hook.worker.CpuBurnWorker$startMainThreadWork$1``).
-    Java method names always start with a lowercase letter by convention,
-    so if the last segment starts with an uppercase letter or contains '$'
-    it is part of the class name, not a method.
-    """
-    if "." in body:
-        fqn, method = body.rsplit(".", 1)
-        # Java methods start with lowercase.  If the last segment looks
-        # like a class (starts uppercase or contains '$' for inner
-        # classes / lambdas), the whole body is the FQN — there is no
-        # separate method name.
-        if method[:1].isupper() or "$" in method:
-            return body, ""
-        return fqn, method
-    return "", body
-
-
-def _extract_method_from_anonymous(fqn: str) -> str:
-    """Extract context method name from an anonymous inner class FQN.
-
-    JVM anonymous inner class naming (compiled Java/Kotlin):
-    - OuterClass$1 → anonymous inner class, no method context
-    - OuterClass$MethodName$1 → Kotlin method-scoped anonymous class
-    - OuterClass$Inner$1 → named inner class Inner's anonymous, no method context
-    - OuterClass$MethodName$1$2 → multi-level anonymous, MethodName is the method
-    - OuterClass$$inlined$lambda$0 → Kotlin inlined lambda, no method context
-
-    Heuristic: walk $-segments from the end, skipping numeric (anonymous index)
-    segments, until we find a segment that looks like a method name (starts with
-    a lowercase letter and is not a Kotlin compiler artifact).
-    """
-    m = _ANON_SUFFIX.search(fqn)
-    if not m:
-        return ""
-    prefix = fqn[:m.start()]
-    # Need at least one $ in prefix to have a segment before the trailing $N
-    if "$" not in prefix:
-        return ""
-
-    # Walk $-segments from the end, skipping numeric anonymous indices
-    # e.g. "Outer$doWork$1" → segments ["Outer", "doWork", "1"]
-    #      "Outer$doWork$1$2" → after first peel: "Outer$doWork$1"
-    #        → segments ["Outer", "doWork", "1"] → skip "1" → "doWork"
-    remaining = prefix
-    while "$" in remaining:
-        last_seg = remaining.rsplit("$", 1)[-1]
-        remaining = remaining.rsplit("$", 1)[0]
-        # Skip numeric anonymous indices (e.g. "1", "2")
-        if last_seg.isdigit():
-            continue
-        # Method names start with lowercase in Java/Kotlin
-        if not last_seg or not last_seg[0].islower():
-            continue
-        # Filter out Kotlin compiler artifacts
-        if last_seg in ("lambda", "inlined"):
-            continue
-        # Segments containing "$" are compiler-generated, not user method names
-        if "$" in last_seg:
-            continue
-        # Check if the segment is preceded by "lambda$" in the original prefix
-        # (e.g. Outer$lambda$click$1 → "click" is part of a lambda descriptor)
-        if "$lambda$" in prefix:
-            lambda_idx = prefix.rfind("$lambda$")
-            if lambda_idx >= 0 and prefix[lambda_idx + 8:].startswith(last_seg):
-                continue
-        return last_seg
-    return ""
 
 
 def _extract_method_from_stack(stack_trace: list[str]) -> str:
@@ -150,6 +79,8 @@ def _extract_caller_from_stack(stack_trace: list[str], target_class: str) -> str
 def extract_class(name: str) -> str:
     """Extract simple class name from an SI$ tag.
 
+    Delegates to :func:`parse_si_tag` for unified single-pass parsing.
+
     Formats (with fully-qualified class names from getName()):
         SI$com.example.ClassName.method           → ClassName
         SI$RV#viewId#com.example.Adapter.method    → Adapter
@@ -161,184 +92,33 @@ def extract_class(name: str) -> str:
 
     Returns the simple class name (last segment of the FQN).
     """
-    body = name
-    if body.startswith("SI$"):
-        body = body[3:]
-
-    if body.startswith("block#"):
-        # SI$block#com.example.ClassName.method#250ms → extract class from msg part
-        rest = body[6:]  # "com.example.ClassName.method#250ms"
-        # Strip duration suffix (#NNNms)
-        hash_idx = rest.rfind("#")
-        if hash_idx >= 0 and rest[hash_idx:].endswith("ms"):
-            rest = rest[:hash_idx]
-        fqn, _ = _split_fqn_method(rest)
-        simple = fqn.rsplit(".", 1)[-1] if fqn else rest
-        # Anonymous inner class: take outer class name before $ for Glob search
-        if "$" in simple:
-            simple = simple.split("$")[0]
-        return simple
-
-    if body.startswith("RV#"):
-        # SI$RV#viewId#com.example.Adapter.method
-        parts = body.split("#")
-        if len(parts) >= 3:
-            fqn, _ = _split_fqn_method(parts[2])
-            return fqn.rsplit(".", 1)[-1] if fqn else parts[2]
-        return body.rsplit(".", 1)[-1] if "." in body else body
-
-    if body.startswith("inflate#"):
-        # SI$inflate#layout_name#parent_class → return layout_name
-        parts = body[8:].split("#")
-        return parts[0] if parts else "LayoutInflater"
-
-    if body.startswith("view#"):
-        # SI$view#com.example.ClassName.method
-        rest = body[5:]
-        fqn, _ = _split_fqn_method(rest)
-        return fqn.rsplit(".", 1)[-1] if fqn else rest
-
-    if body.startswith("handler#"):
-        rest = body[8:]
-        fqn_part = rest.split("#")[0] if "#" in rest else rest
-        fqn, _ = _split_fqn_method(fqn_part)
-        return fqn.rsplit(".", 1)[-1] if fqn else fqn_part
-
-    if body.startswith("db#"):
-        # SI$db#com.example.DBHelper.query#table_name
-        rest = body[3:]
-        hash_idx = rest.rfind("#")
-        if hash_idx >= 0:
-            rest = rest[:hash_idx]
-        fqn, _ = _split_fqn_method(rest)
-        return fqn.rsplit(".", 1)[-1] if fqn else rest
-
-    if body.startswith("net#"):
-        # SI$net#com.example.ApiClient.execute
-        rest = body[4:]
-        fqn, _ = _split_fqn_method(rest)
-        return fqn.rsplit(".", 1)[-1] if fqn else rest
-
-    if body.startswith("img#"):
-        # SI$img#com.example.GlideLoader.into
-        rest = body[4:]
-        fqn, _ = _split_fqn_method(rest)
-        return fqn.rsplit(".", 1)[-1] if fqn else rest
-
-    # Default: SI$com.example.ClassName.method
-    fqn, _ = _split_fqn_method(body)
-    return fqn.rsplit(".", 1)[-1] if fqn else body
+    tag = parse_si_tag(name)
+    if tag is None:
+        # Not an SI$ tag — best-effort fallback
+        fqn, _ = _split_fqn_method(name)
+        return fqn.rsplit(".", 1)[-1] if fqn else name
+    return tag.class_name
 
 
 def extract_fqn(name: str) -> str:
     """Extract the fully-qualified class name from an SI$ tag.
 
+    Delegates to :func:`parse_si_tag` for unified single-pass parsing.
+
     Returns empty string if no package info available.
     Used for system class detection before LLM search.
     """
-    body = name
-    if body.startswith("SI$"):
-        body = body[3:]
-
-    if body.startswith("RV#"):
-        parts = body.split("#")
-        if len(parts) >= 3:
-            fqn, _ = _split_fqn_method(parts[2])
-            return fqn
-        return ""
-
-    if body.startswith("inflate#"):
-        return ""
-
-    if body.startswith("view#"):
-        fqn, _ = _split_fqn_method(body[5:])
+    tag = parse_si_tag(name)
+    if tag is None:
+        fqn, _ = _split_fqn_method(name)
         return fqn
-
-    if body.startswith("handler#"):
-        rest = body[8:]
-        fqn_part = rest.split("#")[0] if "#" in rest else rest
-        fqn, _ = _split_fqn_method(fqn_part)
-        return fqn
-
-    if body.startswith("block#"):
-        rest = body[6:]
-        hash_idx = rest.rfind("#")
-        if hash_idx >= 0 and rest[hash_idx:].endswith("ms"):
-            rest = rest[:hash_idx]
-        fqn, _ = _split_fqn_method(rest)
-        return fqn
-
-    if body.startswith("db#"):
-        rest = body[3:]
-        hash_idx = rest.rfind("#")
-        if hash_idx >= 0:
-            rest = rest[:hash_idx]
-        fqn, _ = _split_fqn_method(rest)
-        return fqn
-
-    if body.startswith("net#"):
-        fqn, _ = _split_fqn_method(body[4:])
-        return fqn
-
-    if body.startswith("img#"):
-        fqn, _ = _split_fqn_method(body[4:])
-        return fqn
-
-    fqn, _ = _split_fqn_method(body)
-    return fqn
-
-
-# Known Android/system package prefixes — skip source search for these
-_SYSTEM_PREFIXES = (
-    "android.", "androidx.", "java.", "javax.", "kotlin.",
-    "kotlinx.", "dalvik.", "libcore.", "com.android.", "com.google.",
-)
-
-# Known system class name patterns (short names, no package prefix)
-# These appear when Perfetto atrace truncates the FQN prefix
-_SYSTEM_CLASS_PATTERNS = (
-    "Choreographer",          # android.view.Choreographer
-    "FragmentManager",        # android.app.FragmentManager / androidx.fragment.app.FragmentManager
-    "LayoutInflater",         # android.view.LayoutInflater
-    "Handler",                # android.os.Handler (only when no user package)
-    "ActivityThread",         # android.app.ActivityThread
-    "ViewRootImpl",           # android.view.ViewRootImpl
-    "InputEventReceiver",     # android.view.InputEventReceiver
-    "ViewImpl",               # android.view.View
-    "Window",                 # android.view.Window
-    "Binder",                 # android.os.Binder
-    "Looper",                 # android.os.Looper
-    "MessageQueue",           # android.os.MessageQueue
-    "HandlerThread",          # android.os.HandlerThread
-    "FragmentActivity",       # androidx.fragment.app.FragmentActivity
-    "AppCompatActivity",      # androidx.appcompat.app.AppCompatActivity
-    "AppCompatDelegateImpl",  # androidx.appcompat.app.AppCompatDelegateImpl
-    "ComponentActivity",      # androidx.activity.ComponentActivity
-    "AppCompatViewInflater",  # androidx.appcompat.app.AppCompatViewInflater
-    "ActionBarActivity",      # androidx.appcompat.app.ActionBarActivity
-    "ActionBarImpl",          # androidx.appcompat.app.ActionBarImpl
-    "KeyEvent",               # android.view.KeyEvent
-    "MotionEvent",            # android.view.MotionEvent
-    "View",                   # android.view.View (short match)
-    "ViewGroup",              # android.view.ViewGroup
-    "RecyclerView",           # androidx.recyclerview.widget.RecyclerView
-    "GapWorker",              # androidx.recyclerview.widget.GapWorker
-    "LinearLayoutManager",    # androidx.recyclerview.widget.LinearLayoutManager
-    "GestureDetector",        # android.view.GestureDetector
-    "InputMethodManager",     # android.view.inputmethod.InputMethodManager
-    "PhoneWindow",            # com.android.internal.policy.PhoneWindow
-)
-
-# RV pipeline method names — these belong to RecyclerView/LayoutManager, not user code
-_RV_PIPELINE_METHODS = frozenset({
-    "dispatchLayoutStep1", "dispatchLayoutStep2", "dispatchLayoutStep3",
-    "onLayoutChildren", "onDraw", "onScrollStateChanged",
-    "prefetch", "gapWorker",
-})
+    return tag.fqn
 
 
 def is_system_class(name: str) -> bool:
     """Check if an SI$ tag refers to a system/framework class.
+
+    Delegates to :func:`parse_si_tag` and uses :attr:`SITag.is_system`.
 
     Two-level check:
     1. FQN starts with known system package prefixes (android., androidx., etc.)
@@ -346,92 +126,39 @@ def is_system_class(name: str) -> bool:
        FragmentManager, etc.) — catches cases where Perfetto atrace truncates
        the full package path in the tag.
     """
-    fqn = extract_fqn(name)
-    if fqn and "." in fqn:
-        if any(fqn.startswith(prefix) for prefix in _SYSTEM_PREFIXES):
-            return True
-
-    # Fallback: check short class name against known system patterns
-    class_name = extract_class(name)
-    if class_name:
-        for pattern in _SYSTEM_CLASS_PATTERNS:
-            # Match: "Choreographer", "Choreographer$FrameDisplayEventReceiver"
-            # Also match: "FragmentManager", "FragmentManager$5"
-            if class_name == pattern or class_name.startswith(pattern + "$"):
-                return True
-
-    return False
+    tag = parse_si_tag(name)
+    if tag is None:
+        return False
+    return tag.is_system
 
 
 def is_system_method(name: str) -> bool:
     """Check if an SI$ tag's method belongs to a framework, not user code.
 
+    Delegates to :func:`parse_si_tag` and uses :attr:`SITag.is_system_method`.
+
     This handles RV pipeline methods (dispatchLayoutStep2, onLayoutChildren, etc.)
     which are tagged with the adapter's class name but are actually RecyclerView
     internal methods that should not be searched in user source.
     """
-    method = extract_method(name)
-    return method in _RV_PIPELINE_METHODS
+    tag = parse_si_tag(name)
+    if tag is None:
+        return False
+    return tag.is_system_method
 
 
 def extract_method(name: str) -> str:
-    """Extract method name from an SI$ tag."""
-    body = name
-    if body.startswith("SI$"):
-        body = body[3:]
+    """Extract method name from an SI$ tag.
 
-    if body.startswith("block#"):
-        # SI$block#com.example.ClassName.method#250ms
-        rest = body[6:]
-        # Strip duration suffix
-        hash_idx = rest.rfind("#")
-        if hash_idx >= 0 and rest[hash_idx:].endswith("ms"):
-            rest = rest[:hash_idx]
-        fqn, method = _split_fqn_method(rest)
-        if not method and "$" in fqn:
-            method = _extract_method_from_anonymous(fqn)
+    Delegates to :func:`parse_si_tag` for unified single-pass parsing.
+    For block tags with anonymous inner classes, falls back to
+    :func:`_extract_method_from_anonymous` to resolve the enclosing method.
+    """
+    tag = parse_si_tag(name)
+    if tag is None:
+        _, method = _split_fqn_method(name)
         return method if method else "unknown"
-
-    if body.startswith("RV#"):
-        parts = body.split("#")
-        if len(parts) >= 3:
-            _, method = _split_fqn_method(parts[2])
-            return method
-        return "unknown"
-
-    if body.startswith("inflate#"):
-        return "inflate"
-
-    if body.startswith("view#"):
-        _, method = _split_fqn_method(body[5:])
-        return method if method else "unknown"
-
-    if body.startswith("handler#"):
-        rest = body[8:]
-        fqn_part = rest.split("#")[0] if "#" in rest else rest
-        _, method = _split_fqn_method(fqn_part)
-        return method if method else "unknown"
-
-    if body.startswith("db#"):
-        # SI$db#com.example.DBHelper.query#table_name
-        rest = body[3:]
-        hash_idx = rest.rfind("#")
-        if hash_idx >= 0:
-            rest = rest[:hash_idx]
-        _, method = _split_fqn_method(rest)
-        return method if method else "unknown"
-
-    if body.startswith("net#"):
-        _, method = _split_fqn_method(body[4:])
-        return method if method else "unknown"
-
-    if body.startswith("img#"):
-        _, method = _split_fqn_method(body[4:])
-        return method if method else "unknown"
-
-    # Default: last segment after last dot
-    _, method = _split_fqn_method(body)
-    return method if method else "unknown"
+    return tag.method_name
 
 
 # ---------------------------------------------------------------------------
@@ -441,30 +168,27 @@ def extract_method(name: str) -> str:
 def classify_search_type(raw_name: str) -> str:
     """Classify how an SI$ slice should be searched.
 
+    Delegates to :func:`parse_si_tag` for unified parsing, then checks
+    system class patterns via :attr:`SITag.is_system`.
+
     Returns:
         "java"   — search for .java/.kt source files
         "xml"    — search for layout XML files
         "system" — system class, skip source search
     """
-    # Check system class by package name
-    if is_system_class(raw_name):
-        return "system"
-
-    body = raw_name[3:] if raw_name.startswith("SI$") else raw_name
-
-    if body.startswith("inflate#"):
-        return "xml"
-
-    # IO tags (net/db/img) map to java source — these are API/DB helper classes
-    if body.startswith("net#") or body.startswith("db#") or body.startswith("img#"):
+    tag = parse_si_tag(raw_name)
+    if tag is None:
         return "java"
 
-    # touch# tags are framework input events — not user source code, skip attribution
-    if body.startswith("touch#"):
+    # System class check (FQN prefix + class name pattern)
+    if tag.is_system:
         return "system"
 
-    # block# always maps to java source
-    return "java"
+    # touch# tags are framework input events — skip attribution
+    if tag.tag_type == "touch":
+        return "system"
+
+    return tag.search_type
 
 
 # ---------------------------------------------------------------------------
