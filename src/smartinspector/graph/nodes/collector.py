@@ -377,12 +377,14 @@ def collector_node(state: AgentState) -> dict:
             info_log("collector", f"WARNING: Block events request failed: {e}")
 
         perf_json = summary.to_json()
+        perf_raw = summary.__dict__
 
         info_log("collector", f"Analysis complete ({len(perf_json)} bytes)")
 
         return {
             "messages": [AIMessage(content="[trace collected and analyzed]")],
             "perf_summary": perf_json,
+            "perf_summary_raw": perf_raw,
             "perf_analysis": state.get("perf_analysis", ""),
             "attribution_data": "",
             "attribution_result": "",
@@ -400,6 +402,7 @@ def collector_node(state: AgentState) -> dict:
         return {
             "messages": [AIMessage(content=error_msg)],
             "perf_summary": "",
+            "perf_summary_raw": {},
             "perf_analysis": "",
             "attribution_data": "",
             "attribution_result": "",

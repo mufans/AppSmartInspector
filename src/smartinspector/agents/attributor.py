@@ -17,9 +17,8 @@ from collections import OrderedDict
 from pydantic import BaseModel
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
-from langchain_openai import ChatOpenAI
 
-from smartinspector.config import get_llm_kwargs, get_source_dir
+from smartinspector.config import get_source_dir
 from smartinspector.debug_log import debug_log
 from smartinspector.tools.grep import grep
 from smartinspector.tools.glob import glob
@@ -105,8 +104,8 @@ def _get_llm():
     with _llm_lock:
         if _llm_with_tools is not None:
             return _llm_with_tools, _system_prompt
-        llm = ChatOpenAI(**get_llm_kwargs(role="attributor", temperature=0))
-        _llm_with_tools = llm.bind_tools([grep, glob, read])
+        from smartinspector.llm.factory import LLMFactory
+        _llm_with_tools = LLMFactory.get_with_tools("attributor", [grep, glob, read], temperature=0)
         _system_prompt = load_prompt("attributor")
         # Skip structured output entirely — with_structured_output uses
         # response_format which activates DeepSeek's thinking mode, causing
@@ -551,7 +550,8 @@ def _analyze_snippets(results: list[dict]) -> None:
     )
 
     try:
-        llm = ChatOpenAI(**get_llm_kwargs(role="attributor", temperature=0))
+        from smartinspector.llm.factory import LLMFactory
+        llm = LLMFactory.get("attributor", temperature=0)
         response = llm.invoke([HumanMessage(content=user_msg)])
         get_tracker().record_from_message("attributor", response)
 

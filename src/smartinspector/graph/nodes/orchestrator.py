@@ -1,10 +1,9 @@
 """Orchestrator node: LLM-based routing + fallback node."""
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_openai import ChatOpenAI
 
-from smartinspector.config import get_llm_kwargs
 from smartinspector.debug_log import info_log
+from smartinspector.llm.factory import LLMFactory
 from smartinspector.token_tracker import get_tracker
 from smartinspector.graph.state import AgentState, RouteDecision, _pass_through, node_error_handler
 
@@ -64,15 +63,9 @@ Examples:
 
 Reply with exactly one label: full_analysis explorer android analyze metric_qa:<id> end"""
 
-_route_llm = None
-
 
 def _get_route_llm():
-    global _route_llm
-    if _route_llm is not None:
-        return _route_llm
-    _route_llm = ChatOpenAI(**get_llm_kwargs(temperature=0, max_tokens=5))
-    return _route_llm
+    return LLMFactory.get("router", temperature=0, max_tokens=5)
 
 
 @node_error_handler("orchestrator")

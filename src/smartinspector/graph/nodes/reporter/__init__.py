@@ -5,7 +5,7 @@ from langchain_core.messages import AIMessage
 from smartinspector.config import get_report_max_tokens
 from smartinspector.debug_log import debug_log, info_log
 
-from smartinspector.graph.state import AgentState
+from smartinspector.graph.state import AgentState, _get_perf_data
 from smartinspector.graph.nodes.reporter.formatter import (
     format_perf_sections,
     format_attribution_section,
@@ -23,6 +23,7 @@ def reporter_node(state: AgentState) -> dict:
     report_prompt = load_prompt("report-generator")
 
     perf_json = state.get("perf_summary", "")
+    perf_data = _get_perf_data(state)
     perf_analysis = state.get("perf_analysis", "")
     attribution_result = state.get("attribution_result", "")
     route = state.get("_route", "")
@@ -39,8 +40,8 @@ def reporter_node(state: AgentState) -> dict:
     # Attribution first — highest priority, must not be truncated
     user_parts.extend(format_attribution_section(attribution_result))
 
-    if perf_json:
-        user_parts.extend(format_perf_sections(perf_json))
+    if perf_data:
+        user_parts.extend(format_perf_sections(perf_data))
 
         # Pre-generate report header tables
         trace_path = state.get("_trace_path", "")
@@ -95,7 +96,7 @@ def reporter_node(state: AgentState) -> dict:
     debug_log("reporter", f"attribution_result JSON: {attribution_result}")
 
     # Prepend pre-generated header (LLM does not output header per prompt instructions)
-    complete_report = (header_md + "\n" + full_content) if perf_json else full_content
+    complete_report = (header_md + "\n" + full_content) if perf_data else full_content
 
     # Startup route: append the structured startup analysis after LLM report
     # so startup phases/bottlenecks/suggestions are always present verbatim
@@ -123,6 +124,7 @@ def reporter_node(state: AgentState) -> dict:
     return {
         "messages": [AIMessage(content=complete_report)],
         "perf_summary": perf_json,
+        "perf_summary_raw": perf_data,
         "perf_analysis": perf_analysis,
         "attribution_data": state.get("attribution_data", ""),
         "attribution_result": attribution_result,

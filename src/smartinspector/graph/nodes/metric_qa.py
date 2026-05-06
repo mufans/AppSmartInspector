@@ -1,31 +1,20 @@
 """Metric QA node: natural language queries on specific performance metrics."""
 
 import json
-import threading
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
-from smartinspector.config import get_llm_kwargs
 from smartinspector.debug_log import info_log
-from smartinspector.graph.state import AgentState, _pass_through, node_error_handler
+from smartinspector.graph.state import AgentState, _pass_through, _get_perf_data, node_error_handler
+from smartinspector.llm.factory import LLMFactory
 from smartinspector.prompts import load_prompt
 from smartinspector.token_tracker import get_tracker
 
 _prompt = load_prompt("metric-qa")
-_llm = None
-_llm_lock = threading.Lock()
 
 
 def _get_llm():
-    global _llm
-    if _llm is not None:
-        return _llm
-    with _llm_lock:
-        if _llm is not None:
-            return _llm
-        _llm = ChatOpenAI(**get_llm_kwargs(temperature=0.1))
-    return _llm
+    return LLMFactory.get("metric_qa", temperature=0.1)
 
 
 # Metric ID → display name (Chinese)
@@ -124,20 +113,23 @@ _METRIC_FILTERS: dict[str, callable] = {
 }
 
 
-def extract_metric_data(perf_json_str: str, metric_id: str) -> str:
-    """Extract the data segment for a given metric from perf_summary JSON.
+def extract_metric_data(perf_data: str | dict, metric_id: str) -> str:
+    """Extract the data segment for a given metric from perf_summary.
 
     Args:
-        perf_json_str: Raw perf_summary JSON string.
+        perf_data: Raw perf_summary JSON string OR pre-parsed dict.
         metric_id: One of the keys in METRIC_DATA_MAP.
 
     Returns:
         JSON string of the extracted data segment, or empty string if not found.
     """
-    try:
-        perf = json.loads(perf_json_str)
-    except (json.JSONDecodeError, TypeError):
-        return perf_json_str[:2000] if perf_json_str else ""
+    if isinstance(perf_data, dict):
+        perf = perf_data
+    else:
+        try:
+            perf = json.loads(perf_data)
+        except (json.JSONDecodeError, TypeError):
+            return perf_data[:2000] if perf_data else ""
 
     # overview: aggregate all top-level keys with brief summaries
     if metric_id == "overview":
@@ -188,15 +180,15 @@ def metric_qa_node(state: AgentState) -> dict:
         metric_id = "overview"
 
     # 2. Check perf_summary exists
-    perf_summary = state.get("perf_summary", "")
-    if not perf_summary:
+    perf_data = _get_perf_data(state)
+    if not perf_data:
         return {
             "messages": [AIMessage(content="请先运行 /full 或 /trace 采集数据后再查询指标。")],
             **_pass_through(state),
         }
 
     # 3. Extract metric data
-    data = extract_metric_data(perf_summary, metric_id)
+    data = extract_metric_data(perf_data, metric_id)
     metric_name = METRIC_NAMES.get(metric_id, "性能总览")
 
     if not data:

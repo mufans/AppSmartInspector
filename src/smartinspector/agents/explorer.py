@@ -3,9 +3,8 @@
 import threading
 
 from langchain.agents import create_agent
-from langchain_openai import ChatOpenAI
 
-from smartinspector.config import get_llm_kwargs
+from smartinspector.llm.factory import LLMFactory
 from smartinspector.tools.grep import grep
 from smartinspector.tools.glob import glob
 from smartinspector.tools.read import read
@@ -23,7 +22,7 @@ def _get_agent():
     with _agent_lock:
         if _agent is not None:
             return _agent
-        llm = ChatOpenAI(**get_llm_kwargs(temperature=0.1, streaming=True))
+        llm = LLMFactory.get("explorer", temperature=0.1, streaming=True)
         system_prompt = load_prompt("code-explorer")
         _agent = create_agent(
             model=llm,

@@ -3,9 +3,8 @@
 import threading
 
 from langchain.agents import create_agent
-from langchain_openai import ChatOpenAI
 
-from smartinspector.config import get_llm_kwargs
+from smartinspector.llm.factory import LLMFactory
 from smartinspector.tools.perfetto import analyze_perfetto, collect_android_trace
 from smartinspector.prompts import load_prompt
 
@@ -21,7 +20,7 @@ def get_android_agent():
     with _agent_lock:
         if _agent is not None:
             return _agent
-        llm = ChatOpenAI(**get_llm_kwargs(temperature=0.1, streaming=True))
+        llm = LLMFactory.get("android_expert", temperature=0.1, streaming=True)
         prompt = load_prompt("android-expert")
         _agent = create_agent(
             model=llm,

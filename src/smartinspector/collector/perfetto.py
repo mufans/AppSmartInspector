@@ -1,4 +1,10 @@
-"""PerfettoCollector: adb collect -> SQL query -> unified JSON."""
+"""PerfettoCollector: adb collect -> SQL query -> unified JSON.
+
+The collect_* methods are split into domain-specific mixin modules under
+``collector/``.  This file retains the core class infrastructure, the
+``summarize()`` orchestrator, ``pull_trace_from_device()``, and standalone
+helper functions used across mixins.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +20,16 @@ from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
 from smartinspector.perfetto_compat import patch
 from smartinspector.debug_log import info_log, debug_log
+from smartinspector.collector._helpers import _parse_siblock_msg, _map_state_label
+
+# Import mixin modules
+from smartinspector.collector.sched import SchedMixin
+from smartinspector.collector.cpu import CpuMixin
+from smartinspector.collector.frame import FrameMixin
+from smartinspector.collector.io import IoMixin
+from smartinspector.collector.block import BlockMixin
+from smartinspector.collector.thread import ThreadMixin
+from smartinspector.collector.sys import SysMixin
 
 # Apply macOS IPv4 fix
 patch()
@@ -23,41 +39,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SHELL_BIN = _PROJECT_ROOT / "bin" / "trace_processor_shell"
 
 
-def _parse_siblock_msg(msg: str) -> list[str]:
-    """Parse SIBlock logcat message into stack trace frames.
-
-    Input format: "MsgClass|250ms|at com.example.Foo.run(Foo.java:123)|at com.example.Bar.doX(Bar.java:45)"
-    Output: ["at com.example.Foo.run(Foo.java:123)", "at com.example.Bar.doX(Bar.java:45)"]
-    """
-    if not msg:
-        return []
-
-    parts = msg.split("|")
-    # First two parts are class name and duration, rest are stack frames
-    frames = []
-    for part in parts[2:]:
-        part = part.strip()
-        if part and part.startswith("at "):
-            frames.append(part)
-    return frames
-
-
-def _map_state_label(raw_state: str) -> str:
-    """Map kernel thread state to human-readable label."""
-    mapping = {
-        "Running": "Running",
-        "R": "Running",
-        "R+": "Running",
-        "S": "Sleeping",
-        "S+": "Sleeping",
-        "D": "DiskSleep",
-        "D+": "DiskSleep",
-        "T": "Stopped",
-        "t": "Traced",
-        "X": "Dead",
-        "Z": "Zombie",
-    }
-    return mapping.get(raw_state, raw_state)
+# Re-export helpers for backward compatibility with external importers
+# (e.g., frame_analyzer.py imports _parse_siblock_msg indirectly via query_frame_slices)
 
 
 @dataclass
@@ -82,8 +65,26 @@ class PerfSummary:
         return json.dumps(self.__dict__, indent=2, ensure_ascii=False)
 
 
-class PerfettoCollector:
-    """Collect and analyze Android Perfetto traces."""
+class PerfettoCollector(
+    SchedMixin,
+    CpuMixin,
+    FrameMixin,
+    IoMixin,
+    BlockMixin,
+    ThreadMixin,
+    SysMixin,
+):
+    """Collect and analyze Android Perfetto traces.
+
+    Collect methods are provided by domain-specific mixins:
+      - SchedMixin: collect_sched()
+      - CpuMixin: collect_cpu_hotspots(), collect_cpu_usage()
+      - FrameMixin: collect_frame_timeline(), collect_view_slices(), collect_compose_slices()
+      - IoMixin: collect_io_slices(), collect_input_events()
+      - BlockMixin: collect_block_events()
+      - ThreadMixin: collect_thread_state()
+      - SysMixin: collect_sys_stats(), collect_threads()
+    """
 
     def __init__(self, trace_path: str, shell_path: str | None = None,
                  target_process: str | None = None):
@@ -200,462 +201,32 @@ class PerfettoCollector:
         self.close()
         return False
 
-    def collect_sched(self) -> dict:
-        """Analyze scheduling data with end_state and blocked reasons."""
+    def _diagnose_tables(self) -> dict:
+        """Check which key tables have data, for diagnosing empty results."""
         tp = self._open()
-        rows = tp.query("""
-            SELECT
-              thread.name AS comm,
-              thread.tid AS tid,
-              COUNT(*) AS switches,
-              SUM(sched.dur) AS total_dur_ns,
-              MODE() WITHIN GROUP (ORDER BY sched.end_state) AS dominant_state
-            FROM sched
-            JOIN thread ON sched.utid = thread.utid
-            GROUP BY thread.name, thread.tid
-            ORDER BY switches DESC
-            LIMIT 20
-        """)
-        hot_threads = []
-        for r in rows:
-            entry = {
-                "comm": r.comm,
-                "tid": r.tid,
-                "switches": r.switches,
-                "total_dur_ms": round(r.total_dur_ns / 1e6, 2),
-                "dominant_state": r.dominant_state,
-            }
-            hot_threads.append(entry)
-
-        # Blocked reasons from sched_blocked_reason table
-        blocked_reasons: list[dict] = []
-        try:
-            br_rows = tp.query("""
-                SELECT
-                  t.name AS comm,
-                  br.blocked_reason,
-                  br.io_wait,
-                  COUNT(*) AS occurrences
-                FROM sched_blocked_reason br
-                JOIN thread t ON br.utid = t.utid
-                GROUP BY t.name, br.blocked_reason, br.io_wait
-                ORDER BY occurrences DESC
-                LIMIT 10
-            """)
-            for r in br_rows:
-                blocked_reasons.append({
-                    "comm": r.comm,
-                    "reason": r.blocked_reason,
-                    "io_wait": bool(r.io_wait),
-                    "occurrences": r.occurrences,
-                })
-        except Exception as e:
-            debug_log("perfetto", f"sched_blocked_reason query failed: {e}")
-
-        result = {"hot_threads": hot_threads}
-        if blocked_reasons:
-            result["blocked_reasons"] = blocked_reasons
-
-        return result
-
-    def collect_cpu_hotspots(self) -> list[dict]:
-        """Find CPU hotspots with callchain reconstruction."""
-        tp = self._open()
-        try:
-            rows = tp.query("""
-                SELECT
-                  spf.name AS function_name,
-                  t.name AS thread_name,
-                  ps.callsite_id,
-                  COUNT(*) AS sample_count,
-                  SUM(COUNT(*)) OVER () AS total_samples
-                FROM perf_sample ps
-                JOIN stack_profile_callsite spc ON ps.callsite_id = spc.id
-                JOIN stack_profile_frame spf ON spc.frame_id = spf.id
-                JOIN thread t ON ps.utid = t.utid
-                WHERE ps.callsite_id IS NOT NULL
-                GROUP BY spf.name, t.name, ps.callsite_id
-                ORDER BY sample_count DESC
-                LIMIT 20
-            """)
-        except Exception as e:
-            debug_log("perfetto", f"CPU hotspot query failed: {e}")
-            return []
-
-        if not rows:
-            return []
-
-        # Preload callsite -> frame mapping and parent relationships
-        callsite_map: dict[int, tuple[str, int | None]] = {}  # id -> (frame_name, parent_id)
-        try:
-            cs_rows = tp.query("""
-                SELECT spc.id, spf.name, spc.parent_id
-                FROM stack_profile_callsite spc
-                JOIN stack_profile_frame spf ON spc.frame_id = spf.id
-            """)
-            for r in cs_rows:
-                callsite_map[r.id] = (r.name, r.parent_id)
-        except Exception as e:
-            debug_log("perfetto", f"callsite_map query failed: {e}")
-
-        hotspots = []
-        for r in rows:
-            pct = round(r.sample_count / r.total_samples * 100, 1) if r.total_samples else 0
-
-            # Reconstruct callchain (leaf to root)
-            callchain = []
-            callsite_id = r.callsite_id
-            visited = set()
-            max_depth = 15
-            for _ in range(max_depth):
-                if callsite_id is None or callsite_id in visited:
+        checks = {
+            "perf_sample": "SELECT COUNT(*) as c FROM perf_sample",
+            "heap_graph_object": "SELECT COUNT(*) as c FROM heap_graph_object",
+            "actual_frame_timeline_slice": "SELECT COUNT(*) as c FROM actual_frame_timeline_slice",
+            "sched": "SELECT COUNT(*) as c FROM sched",
+            "package_list": "SELECT COUNT(*) as c FROM package_list",
+        }
+        result = {}
+        for table, sql in checks.items():
+            try:
+                rows = tp.query(sql)
+                for r in rows:
+                    result[table] = r.c
                     break
-                visited.add(callsite_id)
-                entry = callsite_map.get(callsite_id)
-                if entry is None:
-                    break
-                callchain.append(entry[0])  # frame name
-                callsite_id = entry[1]  # parent_id
-
-            hotspots.append({
-                "function": r.function_name,
-                "thread": r.thread_name,
-                "samples": r.sample_count,
-                "pct": pct,
-                "callchain": callchain,  # [leaf, ..., root]
-            })
-
-        return hotspots
-
-    def collect_frame_timeline(self) -> dict:
-        """Analyze frame rendering timeline (jank detection).
-
-        Queries actual_frame_timeline_slice grouped by display_frame_token.
-        Only counts app surface frames (excludes SurfaceFlinger display frames).
-        Uses jank_type from SurfaceFlinger (None = no jank).
-        Adds frame_index (1-based) so jank frames can be identified by number.
-        Includes expected_dur_ms from expected_frame_timeline_slice for comparison.
-        """
-        tp = self._open()
-
-        # Build expected timeline lookup: display_frame_token -> expected dur
-        expected_map: dict[int, float] = {}
-        try:
-            exp_rows = tp.query("""
-                SELECT
-                  display_frame_token,
-                  MAX(dur) AS expected_dur_ns
-                FROM expected_frame_timeline_slice
-                GROUP BY display_frame_token
-            """)
-            for r in exp_rows:
-                expected_map[r.display_frame_token] = round(r.expected_dur_ns / 1e6, 2)
-        except Exception as e:
-            debug_log("perfetto", f"Expected frame timeline query failed: {e}")
-
-        try:
-            rows = tp.query("""
-                SELECT
-                  display_frame_token,
-                  MIN(ts) AS frame_ts,
-                  MAX(dur) AS frame_dur_ns,
-                  GROUP_CONCAT(DISTINCT jank_type) AS jank_types,
-                  GROUP_CONCAT(DISTINCT layer_name) AS layers
-                FROM actual_frame_timeline_slice
-                WHERE dur > 0
-                  AND surface_frame_token > 0
-                GROUP BY display_frame_token
-                ORDER BY frame_ts ASC
-            """)
-        except Exception as e:
-            debug_log("perfetto", f"Frame timeline query failed: {e}")
-            return {}
-
-        # User-impacting jank types per Perfetto/SurfaceFlinger docs:
-        #   App Deadline Missed       = app missed vsync deadline (real jank)
-        #   Dropped Frame             = frame dropped entirely (real jank)
-        #   SurfaceFlinger *Deadline  = SF/HAL jank
-        #   Display HAL               = display HAL jank
-        #   Unknown Jank              = unknown jank
-        # NOT user-perceivable:
-        #   Buffer Stuffing           = pipeline queued state
-        #   Prediction Error          = scheduler drift
-        #   None                      = no jank
-        USER_JANK_TYPES = {
-            "App Deadline Missed", "Dropped Frame",
-            "SurfaceFlinger CPU Deadline Missed", "SurfaceFlinger GPU Deadline Missed",
-            "SurfaceFlinger Scheduling Delay", "Display HAL",
-            "Unknown Jank",
-        }
-
-        frames = []
-        for r in rows:
-            dur_ms = round(r.frame_dur_ns / 1e6, 2)
-            all_jank = [j.strip() for j in (r.jank_types or "").split(",") if j.strip() and j.strip() != "None"]
-            # Only count user-impacting jank (exclude BufferStuffing, PredictionError)
-            jank_list = [j for j in all_jank if j in USER_JANK_TYPES]
-            expected_dur = expected_map.get(r.display_frame_token, 0)
-            frames.append({
-                "ts_ns": r.frame_ts,
-                "dur_ms": dur_ms,
-                "expected_dur_ms": expected_dur,
-                "jank_types": jank_list,
-                "layers": (r.layers or ""),
-                "is_jank": len(jank_list) > 0,
-            })
-
-        if not frames:
-            return {"total_frames": 0}
-
-        # Assign frame_index (1-based)
-        for i, f in enumerate(frames):
-            f["frame_index"] = i + 1
-
-        # Jank = SurfaceFlinger flagged frames (jank_type != None)
-        jank = [f for f in frames if f["is_jank"]]
-
-        # FPS = total app frames / time span
-        fps = 0.0
-        if len(frames) > 1:
-            total_s = (frames[-1]["ts_ns"] - frames[0]["ts_ns"]) / 1e9
-            if total_s > 0:
-                fps = round(len(frames) / total_s, 1)
-
-        # Slowest frames and jank detail (both with frame_index)
-        slowest = sorted(frames, key=lambda x: -x["dur_ms"])[:10]
-        jank_detail = sorted(jank, key=lambda x: -x["dur_ms"])[:10]
-
-        return {
-            "fps": fps,
-            "total_frames": len(frames),
-            "jank_frames": len(jank),
-            "jank_types": list(set(jt for f in jank for jt in f["jank_types"])),
-            "slowest_frames": slowest,
-            "jank_detail": jank_detail,
-        }
-
-    def collect_cpu_usage(self) -> dict:
-        """Calculate CPU usage per thread/process from sched data.
-
-        Returns overall CPU % (normalized by core count), per-process/thread
-        breakdown, and the number of CPU cores detected.
-        """
-        tp = self._open()
-
-        # Get trace time bounds from trace_bounds table
-        try:
-            bounds = tp.query("SELECT start_ts, end_ts FROM trace_bounds")
-            for b in bounds:
-                trace_start_ns = b.start_ts
-                trace_end_ns = b.end_ts
-                break
-            else:
-                return {}
-        except Exception as e:
-            debug_log("perfetto", f"Trace bounds query failed: {e}")
-            return {}
-
-        trace_dur_ns = trace_end_ns - trace_start_ns
-        if trace_dur_ns <= 0:
-            return {}
-
-        # Detect CPU core count from sched table
-        try:
-            cpu_rows = tp.query("SELECT COUNT(DISTINCT cpu) AS num_cpus FROM sched")
-            num_cpus = 1
-            for cr in cpu_rows:
-                num_cpus = max(1, cr.num_cpus)
-                break
-        except Exception as e:
-            debug_log("perfetto", f"CPU count query failed: {e}")
-            num_cpus = 1
-
-        # Per-thread CPU usage from sched table
-        try:
-            rows = tp.query("""
-                SELECT
-                  process.name AS process_name,
-                  process.pid,
-                  thread.name AS thread_name,
-                  thread.tid,
-                  COUNT(*) AS switches,
-                  SUM(sched.dur) AS total_dur_ns
-                FROM sched
-                JOIN thread ON sched.utid = thread.utid
-                JOIN process ON thread.upid = process.upid
-                GROUP BY process.name, process.pid, thread.name, thread.tid
-                ORDER BY total_dur_ns DESC
-                LIMIT 20
-            """)
-        except Exception as e:
-            debug_log("perfetto", f"CPU usage query failed: {e}")
-            return {}
-
-        # Total CPU wall-time available = trace_dur * num_cpus
-        total_wall_ns = trace_dur_ns * num_cpus
-
-        # Group by process — skip kernel threads (pid 0 / no process name)
-        proc_map: dict[str, dict] = {}
-        total_cpu_ns = 0
-        for r in rows:
-            # Skip kernel idle/swapper threads
-            if not r.process_name or r.pid == 0:
-                continue
-            pname = r.process_name
-            dur_ns = r.total_dur_ns or 0
-            total_cpu_ns += dur_ns
-            pct = round(dur_ns / total_wall_ns * 100, 1)
-
-            if pname not in proc_map:
-                proc_map[pname] = {
-                    "process": pname,
-                    "pid": r.pid,
-                    "cpu_pct": 0.0,
-                    "threads": [],
-                    "_dur_ns": 0,
-                }
-            proc_map[pname]["_dur_ns"] += dur_ns
-            proc_map[pname]["threads"].append({
-                "name": r.thread_name or f"tid:{r.tid}",
-                "cpu_pct": pct,
-                "switches": r.switches,
-            })
-
-        # Finalize process-level pct
-        top_processes = sorted(proc_map.values(), key=lambda x: -x["_dur_ns"])
-        for p in top_processes:
-            p["cpu_pct"] = round(p.pop("_dur_ns") / total_wall_ns * 100, 1)
-
-        overall_pct = round(total_cpu_ns / total_wall_ns * 100, 1)
-
-        return {
-            "cpu_usage_pct": overall_pct,
-            "num_cpus": num_cpus,
-            "trace_dur_ms": round(trace_dur_ns / 1e6, 0),
-            "top_processes": top_processes,
-        }
-
-    def collect_sys_stats(self) -> dict:
-        """Collect system-level CPU stats from linux.sys_stats data source.
-
-        Queries cpu_counter_track / counter tables for system-wide CPU usage
-        and frequency data. This data is collected when linux.sys_stats is
-        configured in pull_trace_from_device (stat_period_ms, cpufreq_period_ms).
-        """
-        tp = self._open()
-
-        result: dict = {}
-
-        # 1. System CPU idle time samples
-        try:
-            cpu_rows = tp.query("""
-                SELECT
-                  c.ts,
-                  c.value AS cpu_util
-                FROM counter c
-                JOIN cpu_counter_track cct ON c.track_id = cct.id
-                WHERE cct.name = 'cpuidle_time'
-                ORDER BY c.ts ASC
-            """)
-            samples = [{"ts_ns": r.ts, "value": r.cpu_util} for r in cpu_rows]
-            if samples:
-                result["cpu_idle_samples"] = samples
-        except Exception as e:
-            debug_log("perfetto", f"CPU idle samples query failed: {e}")
-
-        # 2. CPU frequency per core
-        try:
-            freq_rows = tp.query("""
-                SELECT
-                  cct.cpu,
-                  c.ts,
-                  c.value AS freq_khz
-                FROM counter c
-                JOIN cpu_counter_track cct ON c.track_id = cct.id
-                WHERE cct.name = 'cpufreq'
-                ORDER BY cct.cpu, c.ts ASC
-            """)
-            freq_by_core: dict[int, list] = {}
-            for r in freq_rows:
-                freq_by_core.setdefault(r.cpu, []).append({
-                    "ts_ns": r.ts,
-                    "freq_khz": r.freq_khz,
-                })
-            if freq_by_core:
-                result["cpu_freq_by_core"] = freq_by_core
-        except Exception as e:
-            debug_log("perfetto", f"CPU frequency query failed: {e}")
-
-        # 3. Fork rate
-        try:
-            fork_rows = tp.query("""
-                SELECT
-                  c.ts,
-                  c.value AS fork_count
-                FROM counter c
-                JOIN cpu_counter_track cct ON c.track_id = cct.id
-                WHERE cct.name = 'num_forks'
-                ORDER BY c.ts ASC
-            """)
-            forks = [{"ts_ns": r.ts, "forks": r.fork_count} for r in fork_rows]
-            if forks:
-                result["fork_rate"] = forks
-        except Exception as e:
-            debug_log("perfetto", f"Fork rate query failed: {e}")
-
+                else:
+                    result[table] = 0
+            except Exception as e:
+                debug_log("perfetto", f"Table {table} query failed: {e}")
+                result[table] = -1  # table doesn't exist
         return result
-
-    def collect_process_memory(self) -> dict:
-        """Collect process-level memory stats from process_counter_track.
-
-        Perfetto stores per-process memory (RSS, anon, etc.) as counter tracks
-        when proc_stats_poll_ms is configured. Values are in KB.
-        """
-        tp = self._open()
-
-        try:
-            # Pivot: one row per process, columns for avg/max RSS and anon
-            rows = tp.query("""
-                SELECT
-                  p.name,
-                  p.pid,
-                  AVG(CASE WHEN pct.name = 'mem.rss' THEN c.value END) AS avg_rss_kb,
-                  MAX(CASE WHEN pct.name = 'mem.rss' THEN c.value END) AS max_rss_kb,
-                  AVG(CASE WHEN pct.name = 'mem.rss.anon' THEN c.value END) AS avg_anon_kb,
-                  MAX(CASE WHEN pct.name = 'mem.rss.anon' THEN c.value END) AS max_anon_kb
-                FROM process_counter_track pct
-                JOIN counter c ON c.track_id = pct.id
-                JOIN process p ON pct.upid = p.upid
-                WHERE pct.name IN ('mem.rss', 'mem.rss.anon')
-                GROUP BY p.name, p.pid
-                ORDER BY max_rss_kb DESC
-                LIMIT 10
-            """)
-            processes = []
-            for r in rows:
-                entry = {"name": r.name, "pid": r.pid}
-                if r.max_rss_kb is not None:
-                    # Counter values are in bytes, convert to KB
-                    entry["rss_kb"] = round(r.max_rss_kb / 1024)
-                    entry["avg_rss_kb"] = round(r.avg_rss_kb / 1024)
-                if r.max_anon_kb is not None:
-                    entry["rss_anon_kb"] = round(r.max_anon_kb / 1024)
-                    entry["avg_anon_kb"] = round(r.avg_anon_kb / 1024)
-                if entry.get("rss_kb") or entry.get("rss_anon_kb"):
-                    processes.append(entry)
-            if processes:
-                return {"processes": processes}
-        except Exception as e:
-            debug_log("perfetto", f"Process memory query failed: {e}")
-
-        return {}
 
     def collect_memory(self) -> dict:
-        """Collect Java heap memory from android.java_hprof data.
-
-        Uses heap_graph tables for detailed allocation analysis including
-        leak suspects and dominator trees.
-        """
+        """Collect Java heap memory from android.java_hprof data."""
         from smartinspector.collector.memory import collect_heap_graph_analysis
 
         tp = self._open()
@@ -697,895 +268,44 @@ class PerfettoCollector:
 
         return result
 
-    def collect_threads(self) -> list[dict]:
-        """Collect thread info."""
+    def collect_process_memory(self) -> dict:
+        """Collect process-level memory stats from process_counter_track."""
         tp = self._open()
-        rows = tp.query("SELECT tid, name FROM thread ORDER BY tid")
-        threads = []
-        for r in rows:
-            if r.name:
-                threads.append({"tid": r.tid, "name": r.name})
-        return threads
 
-    def collect_view_slices(self) -> dict:
-        """Collect View-level slice data: doFrame, measure, layout, draw, RV events.
-
-        Captures both SI$ custom TraceHook tags AND system atrace tags:
-        - SI$RV#[viewId]#[Adapter].[method]  (RecyclerView pipeline — custom)
-        - SI$Activity.lifecycle methods       (custom)
-        - SI$Fragment.lifecycle methods       (custom)
-        - SI$inflate#[layout]#[parent]        (LayoutInflater — custom)
-        - SI$view#[class].[method]            (View traverse — custom)
-        - SI$handler#[msg_class]              (Handler dispatch — custom)
-        - System tags: doFrame, Choreographer, etc. (not prefixed)
-        """
-        tp = self._open()
         try:
-            # Step 1: Get all SI$ slices (excluding IO tags: net/db/img) + system slices
             rows = tp.query("""
                 SELECT
-                  id,
-                  name,
-                  ts,
-                  dur,
-                  depth,
-                  parent_id,
-                  track_id
-                FROM slice
-                WHERE (name LIKE 'SI$%'
-                       AND name NOT LIKE 'SI$net#%'
-                       AND name NOT LIKE 'SI$db#%'
-                       AND name NOT LIKE 'SI$img#%'
-                       AND name NOT LIKE 'SI$touch#%')
-                   OR name LIKE '%doFrame%'
-                   OR name LIKE '%Choreographer%'
-                   OR name LIKE '%Traversal%'
-                   OR name LIKE '%performDraw%'
-                   OR name LIKE '%performMeasure%'
-                   OR name LIKE '%performLayout%'
-                ORDER BY ts ASC
+                  p.name,
+                  p.pid,
+                  AVG(CASE WHEN pct.name = 'mem.rss' THEN c.value END) AS avg_rss_kb,
+                  MAX(CASE WHEN pct.name = 'mem.rss' THEN c.value END) AS max_rss_kb,
+                  AVG(CASE WHEN pct.name = 'mem.rss.anon' THEN c.value END) AS avg_anon_kb,
+                  MAX(CASE WHEN pct.name = 'mem.rss.anon' THEN c.value END) AS max_anon_kb
+                FROM process_counter_track pct
+                JOIN counter c ON c.track_id = pct.id
+                JOIN process p ON pct.upid = p.upid
+                WHERE pct.name IN ('mem.rss', 'mem.rss.anon')
+                GROUP BY p.name, p.pid
+                ORDER BY max_rss_kb DESC
+                LIMIT 10
             """)
-
-            # Step 2: Collect parent_ids that are not in result set, fetch them
-            rows = list(rows)  # materialize iterator
-            slice_ids_in_set = {r.id for r in rows}
-            missing_parent_ids = set()
+            processes = []
             for r in rows:
-                if r.parent_id and r.parent_id not in slice_ids_in_set:
-                    missing_parent_ids.add(r.parent_id)
-
-            if missing_parent_ids:
-                id_list = ",".join(str(pid) for pid in missing_parent_ids)
-                try:
-                    parent_rows = tp.query(f"""
-                        SELECT id, name, ts, dur, depth, parent_id, track_id
-                        FROM slice
-                        WHERE id IN ({id_list})
-                    """)
-                    # Merge into main results, but exclude touch# slices that leak via parent fetch
-                    filtered_parents = [r for r in parent_rows if not r.name.startswith("SI$touch#")]
-                    rows = list(rows) + filtered_parents
-                    for r in filtered_parents:
-                        slice_ids_in_set.add(r.id)
-                        # Check if these parents also have missing parents (go up one more level)
-                        if r.parent_id and r.parent_id not in slice_ids_in_set:
-                            missing_parent_ids.add(r.parent_id)
-
-                    # One more level up for grandparents
-                    level2_parents = set()
-                    for r in parent_rows:
-                        if r.parent_id and r.parent_id not in slice_ids_in_set:
-                            level2_parents.add(r.parent_id)
-                    if level2_parents:
-                        id_list2 = ",".join(str(pid) for pid in level2_parents)
-                        try:
-                            gp_rows = tp.query(f"""
-                                SELECT id, name, ts, dur, depth, parent_id, track_id
-                                FROM slice
-                                WHERE id IN ({id_list2})
-                            """)
-                            rows = list(rows) + [r for r in gp_rows if not r.name.startswith("SI$touch#")]
-                        except Exception as e:
-                            debug_log("perfetto", f"Grandparent slice query failed: {e}")
-                except Exception as e:
-                    debug_log("perfetto", f"Parent slice query failed: {e}")
+                entry = {"name": r.name, "pid": r.pid}
+                if r.max_rss_kb is not None:
+                    entry["rss_kb"] = round(r.max_rss_kb / 1024)
+                    entry["avg_rss_kb"] = round(r.avg_rss_kb / 1024)
+                if r.max_anon_kb is not None:
+                    entry["rss_anon_kb"] = round(r.max_anon_kb / 1024)
+                    entry["avg_anon_kb"] = round(r.avg_anon_kb / 1024)
+                if entry.get("rss_kb") or entry.get("rss_anon_kb"):
+                    processes.append(entry)
+            if processes:
+                return {"processes": processes}
         except Exception as e:
-            debug_log("perfetto", f"View slices query failed: {e}")
-            return {}
+            debug_log("perfetto", f"Process memory query failed: {e}")
 
-        slices = []
-        slice_by_id: dict[int, dict] = {}
-        for r in rows:
-            dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
-            is_custom = r.name.startswith("SI$")
-            s = {
-                "id": r.id,
-                "name": r.name,
-                "ts_ns": r.ts,
-                "dur_ms": dur_ms,
-                "depth": r.depth,
-                "parent_id": r.parent_id,
-                "is_custom": is_custom,
-            }
-            slices.append(s)
-            slice_by_id[r.id] = s
-
-        if not slices:
-            return {}
-
-        # ---- Jank hotspot: slowest individual slices (max 30) ----
-        # Only include SI$ custom slices — system slices (doFrame etc.) waste slots
-        slowest = sorted(
-            [s for s in slices if s["is_custom"]],
-            key=lambda x: -x["dur_ms"],
-        )[:30]
-
-        # ---- Aggregate by slice name ----
-        name_stats: dict[str, dict] = {}
-        for s in slices:
-            n = s["name"]
-            if n not in name_stats:
-                name_stats[n] = {"name": n, "count": 0, "total_ms": 0.0, "max_ms": 0.0, "is_custom": s["is_custom"]}
-            name_stats[n]["count"] += 1
-            name_stats[n]["total_ms"] += s["dur_ms"]
-            name_stats[n]["max_ms"] = max(name_stats[n]["max_ms"], s["dur_ms"])
-
-        # ---- RV instance grouping (SI$RV#[viewId]#[Adapter]) ----
-        rv_instances: dict[str, dict] = {}
-        for s in slices:
-            n = s["name"]
-            # Match both SI$RV#... and legacy RV#... tags
-            rv_prefix = None
-            if n.startswith("SI$RV#"):
-                rv_prefix = "SI$"
-            elif n.startswith("RV#"):
-                rv_prefix = ""
-            if rv_prefix is None:
-                continue
-            # Strip SI$ prefix for parsing
-            tag_body = n[len(rv_prefix):]  # e.g. "RV#viewId#com.example.Adapter.method"
-            # Parse: RV#viewId#Adapter.method — Adapter may contain dots (FQN)
-            # Find the last dot after the last # to split adapter from method
-            last_hash = tag_body.rfind("#")
-            after_hash = tag_body[last_hash + 1:] if last_hash >= 0 else tag_body
-            last_dot = after_hash.rfind(".")
-            if last_dot >= 0:
-                instance_key = tag_body[:last_hash + 1] + after_hash[:last_dot]
-                method = after_hash[last_dot + 1:]
-            else:
-                instance_key = tag_body
-                method = "unknown"
-            if instance_key not in rv_instances:
-                rv_instances[instance_key] = {
-                    "instance": instance_key,
-                    "total_ms": 0.0,
-                    "count": 0,
-                    "methods": {},
-                    "max_dur_ms": 0.0,
-                    "max_dur_method": "",
-                }
-            inst = rv_instances[instance_key]
-            inst["total_ms"] += s["dur_ms"]
-            inst["count"] += 1
-            if s["dur_ms"] > inst["max_dur_ms"]:
-                inst["max_dur_ms"] = s["dur_ms"]
-                inst["max_dur_method"] = method
-            if method not in inst["methods"]:
-                inst["methods"][method] = {"count": 0, "total_ms": 0.0, "max_ms": 0.0}
-            m = inst["methods"][method]
-            m["count"] += 1
-            m["total_ms"] += s["dur_ms"]
-            m["max_ms"] = max(m["max_ms"], s["dur_ms"])
-
-        rv_sorted = sorted(rv_instances.values(), key=lambda x: -x["total_ms"])
-
-        # ---- Call chain: reconstruct parent chain + child breakdown ----
-
-        # Build child lookup: parent_id -> list of children
-        children_map: dict[int, list[dict]] = {}
-        for s in slices:
-            pid = s.get("parent_id")
-            if pid:
-                if pid not in children_map:
-                    children_map[pid] = []
-                children_map[pid].append(s)
-
-        def _build_chain(slice_id: int) -> list[str]:
-            """Walk up from a slice to its root ancestor via parent_id.
-            Returns the chain bottom-up: [leaf, ..., root].
-            """
-            chain = []
-            visited = set()
-            current_id = slice_id
-            while current_id and current_id not in visited:
-                visited.add(current_id)
-                current = slice_by_id.get(current_id)
-                if not current:
-                    break
-                chain.append(f"{current['name']} [{current['dur_ms']:.2f}ms]")
-                current_id = current.get("parent_id")
-            return chain
-
-        def _get_children_breakdown(parent_id: int) -> list[dict]:
-            """Get direct children sorted by dur desc, with their own breakdown."""
-            kids = children_map.get(parent_id, [])
-            # Sort by dur descending, take top children
-            kids_sorted = sorted(kids, key=lambda x: -x["dur_ms"])
-            result = []
-            seen_methods = set()
-            for k in kids_sorted:
-                name = k["name"]
-                # Deduplicate by name — keep the slowest instance
-                if name in seen_methods:
-                    continue
-                seen_methods.add(name)
-                entry = {"name": name, "dur_ms": k["dur_ms"]}
-                # Recurse one level for sub-children
-                sub = _get_children_breakdown(k["id"])
-                if sub:
-                    entry["children"] = sub
-                result.append(entry)
-            return result
-
-        # Build call chains for the top 10 slowest custom (SI$) slices
-        slowest_custom = sorted(
-            [s for s in slices if s["is_custom"] and s["dur_ms"] >= 1.0],
-            key=lambda x: -x["dur_ms"],
-        )[:10]
-
-        call_chains = []
-        for s in slowest_custom:
-            raw_chain = _build_chain(s["id"])
-            # Get child breakdown for the slice itself
-            breakdown = _get_children_breakdown(s["id"])
-            call_chains.append({
-                "name": s["name"],
-                "dur_ms": s["dur_ms"],
-                "chain": list(reversed(raw_chain)),
-                "breakdown": breakdown,
-            })
-
-        # ---- P1-5: Annotate slices with target process info ----
-        target_process_info = {}
-        # Extract target process from metadata if available
-        target_pkg = self._target_process_cache.get("name", "") if self._target_process_cache else ""
-        if target_pkg:
-            target_process_info = self._resolve_target_process(target_pkg)
-        elif self._target_process_cache is None:
-            # Try to detect target process from slowest slices
-            # SI$ slices contain class names that include the package name
-            for s in slowest[:3]:
-                name = s.get("name", "")
-                if name.startswith("SI$"):
-                    # e.g. SI$com.example.app.Class.method
-                    body = name[3:]
-                    # Extract potential package from class name
-                    parts = body.split(".")
-                    if len(parts) >= 3:
-                        candidate_pkg = ".".join(parts[:3])
-                        info = self._resolve_target_process(candidate_pkg)
-                        if info.get("upid"):
-                            target_process_info = info
-                            break
-
-        # Annotate slowest slices with their process name (via track_id)
-        if target_process_info.get("upid"):
-            target_upid = target_process_info["upid"]
-            try:
-                # Build track_id -> upid mapping for the slowest slices
-                track_ids = set(s.get("track_id") for s in slowest if s.get("track_id"))
-                if track_ids:
-                    id_list = ",".join(str(tid) for tid in track_ids)
-                    track_proc_map = {}
-                    for r in tp.query(f"""
-                        SELECT t.id AS track_id, p.upid, p.name AS process_name
-                        FROM thread_track t
-                        JOIN thread th ON t.utid = th.utid
-                        JOIN process p ON th.upid = p.upid
-                        WHERE t.id IN ({id_list})
-                    """):
-                        track_proc_map[r.track_id] = {"upid": r.upid, "name": r.process_name}
-
-                    for s in slowest:
-                        proc_info = track_proc_map.get(s.get("track_id"))
-                        if proc_info:
-                            s["process_name"] = proc_info["name"]
-                            s["is_target"] = proc_info["upid"] == target_upid
-            except Exception as e:
-                debug_log("perfetto", f"track-process annotation failed: {e}")
-
-        result = {
-            "summary": sorted(name_stats.values(), key=lambda x: -x["total_ms"]),
-            "slowest_slices": slowest,
-            "rv_instances": rv_sorted,
-            "call_chains": call_chains,
-        }
-
-        # Include target process resolution info for downstream consumers
-        if target_process_info:
-            result["target_process"] = target_process_info
-
-        return result
-
-    def collect_io_slices(self) -> dict:
-        """Collect IO slices (SI$net#/SI$db#/SI$img#) from all threads.
-
-        These are NOT main-thread slices — they run on background/IO threads.
-        Kept separate from view_slices to avoid polluting main-thread analysis.
-        """
-        tp = self._open()
-        try:
-            rows = tp.query("""
-                SELECT name, ts, dur, depth, track_id
-                FROM slice
-                WHERE name LIKE 'SI$net#%'
-                   OR name LIKE 'SI$db#%'
-                   OR name LIKE 'SI$img#%'
-                ORDER BY ts ASC
-            """)
-        except Exception as e:
-            debug_log("perfetto", f"IO slices query failed: {e}")
-            return {}
-
-        slices = []
-        name_stats: dict[str, dict] = {}
-        for r in rows:
-            dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
-            name = r.name
-            slices.append({
-                "name": name,
-                "ts_ns": r.ts,
-                "dur_ms": dur_ms,
-                "depth": r.depth,
-            })
-            # Determine IO type from prefix
-            body = name[3:] if name.startswith("SI$") else name
-            io_type = "unknown"
-            if body.startswith("net#"):
-                io_type = "network"
-            elif body.startswith("db#"):
-                io_type = "database"
-            elif body.startswith("img#"):
-                io_type = "image"
-
-            if name not in name_stats:
-                name_stats[name] = {
-                    "name": name,
-                    "io_type": io_type,
-                    "count": 0,
-                    "total_ms": 0.0,
-                    "max_ms": 0.0,
-                }
-            name_stats[name]["count"] += 1
-            name_stats[name]["total_ms"] += dur_ms
-            name_stats[name]["max_ms"] = max(name_stats[name]["max_ms"], dur_ms)
-
-        if not slices:
-            return {}
-
-        return {
-            "total_count": len(slices),
-            "summary": sorted(name_stats.values(), key=lambda x: -x["total_ms"]),
-            "slowest": sorted(slices, key=lambda x: -x["dur_ms"])[:20],
-        }
-
-    def collect_input_events(self) -> list[dict]:
-        """Collect touch input events from SI$touch# slices.
-
-        Tag format: SI$touch#ActivityName#ACTION (e.g. SI$touch#MainActivity#DOWN)
-        These are correlated with jank frames to establish input→jank causality.
-        """
-        tp = self._open()
-        try:
-            rows = tp.query("""
-                SELECT name, ts, dur
-                FROM slice
-                WHERE name LIKE 'SI$touch#%'
-                ORDER BY ts ASC
-            """)
-        except Exception as e:
-            debug_log("perfetto", f"Input events query failed: {e}")
-            return []
-
-        events = []
-        for r in rows:
-            name = r.name
-            # Parse: SI$touch#ActivitySimpleName#ACTION
-            body = name[len("SI$touch#"):]
-            parts = body.split("#")
-            activity = parts[0] if len(parts) >= 1 else "?"
-            action = parts[1] if len(parts) >= 2 else "UNKNOWN"
-            dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
-            events.append({
-                "ts_ns": r.ts,
-                "dur_ms": dur_ms,
-                "activity": activity,
-                "action": action,
-                "raw_name": name,
-            })
-
-        return events
-
-    def collect_block_events(self) -> list[dict]:
-        """Collect block events from SI$block# slices + SIBlock logcat stacks.
-
-        SI$block# slices come from BlockMonitor's Trace.beginSection (via atrace).
-        The Perfetto 'dur' is ~0 because beginSection/endSection are called
-        back-to-back as a marker.  The REAL duration is embedded in the slice
-        name:  SI$block#MsgClass#250ms  →  250ms.
-
-        SIBlock logcat entries come from BlockMonitor's Log.w (via android.log).
-        These are correlated by timestamp to attach stack traces.
-        """
-        tp = self._open()
-
-        # 1. Query SI$block# slices
-        try:
-            slice_rows = tp.query("""
-                SELECT name, ts, dur
-                FROM slice
-                WHERE name LIKE 'SI$block#%'
-                ORDER BY ts ASC
-            """)
-        except Exception as e:
-            debug_log("perfetto", f"Block events query failed: {e}")
-            return []
-
-        block_slices = []
-        for r in slice_rows:
-            name = r.name
-            # Extract real duration from name suffix (#NNNms)
-            # Name format: SI$block#com.example.Worker$1.run#250ms
-            # May be truncated by atrace (~127 chars): SI$block#com.exampl....#25
-            dur_ms = 0.0
-            if "#" in name:
-                last_hash = name.rfind("#")
-                suffix = name[last_hash + 1:]
-                # Try: "250ms", "250m" (truncated), "250" (very truncated)
-                dur_str = suffix
-                if suffix.endswith("ms"):
-                    dur_str = suffix[:-2]
-                elif suffix.endswith("m"):
-                    dur_str = suffix[:-1]
-                try:
-                    dur_ms = float(dur_str)
-                except ValueError:
-                    pass
-            # Fallback: use Perfetto dur if name parsing failed
-            if dur_ms == 0 and r.dur:
-                dur_ms = round(r.dur / 1e6, 2)
-
-            block_slices.append({
-                "raw_name": name,
-                "ts_ns": r.ts,
-                "dur_ms": dur_ms,
-            })
-
-        if not block_slices:
-            return []
-
-        # 2. Query SIBlock logcat entries for stack traces
-        log_entries: list[dict] = []
-        try:
-            log_rows = tp.query("""
-                SELECT ts, msg
-                FROM android_logs
-                WHERE tag = 'SIBlock'
-                ORDER BY ts ASC
-            """)
-            for r in log_rows:
-                log_entries.append({
-                    "ts_ns": r.ts,
-                    "msg": r.msg or "",
-                })
-        except Exception as e:
-            debug_log("perfetto", f"SIBlock logcat query failed: {e}")
-
-        # 3. Correlate slices with log entries by timestamp (bisect, O(n log n + m log m))
-        MATCH_WINDOW_NS = 500_000_000  # 500ms
-
-        if log_entries:
-            log_ts_list = sorted(
-                [(log["ts_ns"], log) for log in log_entries],
-                key=lambda x: x[0],
-            )
-            log_timestamps = [t for t, _ in log_ts_list]
-
-            for block in block_slices:
-                block_ts = block["ts_ns"]
-                idx = bisect.bisect_left(log_timestamps, block_ts)
-                best_match = None
-                best_dist = MATCH_WINDOW_NS + 1
-
-                # Check idx and idx-1 as candidates
-                for candidate_idx in (idx - 1, idx):
-                    if 0 <= candidate_idx < len(log_ts_list):
-                        dist = abs(log_ts_list[candidate_idx][0] - block_ts)
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_match = log_ts_list[candidate_idx][1]
-
-                if best_match and best_dist <= MATCH_WINDOW_NS:
-                    block["stack_trace"] = _parse_siblock_msg(best_match["msg"])
-                else:
-                    block["stack_trace"] = []
-        else:
-            for block in block_slices:
-                block["stack_trace"] = []
-
-        return block_slices
-
-    def collect_thread_state(self) -> list[dict]:
-        """Analyze per-slice thread state distribution with blocking details.
-
-        For each SI$ slow slice, queries the __intrinsic_thread_state table
-        to determine how much time the thread spent in each state during the
-        slice's execution window, along with blocking context (blocked_function,
-        io_wait, waker_name). Falls back to legacy thread_state table when
-        __intrinsic_thread_state is not available.
-
-        Returns a list of dicts with:
-          - slice_name: the SI$ slice name
-          - dur_ms: total slice duration
-          - state_distribution: {state: percentage} e.g. {"Running": 85.2, "Sleeping": 14.8}
-          - dominant_state: the state with the highest percentage
-          - blocked_function: kernel function where thread was blocked (or None)
-          - io_wait: whether the thread was waiting for IO (bool)
-          - waker_name: name of the thread that woke this one (or None)
-        """
-        tp = self._open()
-
-        # Resolve main thread utid
-        main_utid = self._resolve_main_utid(tp)
-        if main_utid is None:
-            return []
-
-        # Get SI$ slow slices (top 20 by duration)
-        try:
-            slice_rows = tp.query("""
-                SELECT name, ts, dur
-                FROM slice
-                WHERE name LIKE 'SI$%'
-                  AND name NOT LIKE 'SI$net#%'
-                  AND name NOT LIKE 'SI$db#%'
-                  AND name NOT LIKE 'SI$img#%'
-                  AND name NOT LIKE 'SI$touch#%'
-                  AND dur > 1000000
-                ORDER BY dur DESC
-                LIMIT 20
-            """)
-        except Exception as e:
-            debug_log("perfetto", f"thread_state: slice query failed: {e}")
-            return []
-
-        # Check if __intrinsic_thread_state table is available
-        has_intrinsic_ts = self._check_intrinsic_thread_state(tp)
-
-        if not has_intrinsic_ts:
-            debug_log("perfetto", "thread_state: __intrinsic_thread_state not available, using fallback")
-            return self._collect_thread_state_fallback(tp, main_utid, slice_rows)
-
-        # --- Primary path: __intrinsic_thread_state ---
-        results = []
-        for sr in slice_rows:
-            slice_ts = sr.ts
-            slice_end = sr.ts + sr.dur
-            slice_name = sr.name
-            dur_ms = round(sr.dur / 1e6, 2)
-
-            if dur_ms < 1.0:
-                continue
-
-            try:
-                state_rows = tp.query(f"""
-                    SELECT
-                        state,
-                        SUM(dur) AS total_ns,
-                        blocked_function,
-                        io_wait,
-                        waker_utid
-                    FROM __intrinsic_thread_state
-                    WHERE utid = {main_utid}
-                      AND ts < {slice_end}
-                      AND ts + dur > {slice_ts}
-                    GROUP BY state, blocked_function, io_wait, waker_utid
-                    ORDER BY total_ns DESC
-                """)
-            except Exception as e:
-                debug_log("perfetto", f"thread_state: __intrinsic_thread_state query failed for {slice_name}: {e}")
-                # Fall back to single-slice legacy query
-                results.append(self._query_thread_state_legacy(tp, main_utid, slice_name, slice_ts, sr.dur, dur_ms))
-                continue
-
-            # Collect waker names in a separate step (subquery in GROUP BY is unreliable)
-            state_entries = list(state_rows)
-            if not state_entries:
-                # No thread_state coverage — sleeping threads can't produce slices
-                results.append({
-                    "slice_name": slice_name,
-                    "dur_ms": dur_ms,
-                    "state_distribution": {"Running": 100.0},
-                    "dominant_state": "Running",
-                    "blocked_function": None,
-                    "io_wait": False,
-                    "waker_name": None,
-                })
-                continue
-
-            total_ns = sum(r.total_ns for r in state_entries)
-            pct_dist: dict[str, float] = {}
-            blocked_fn = None
-            io_wait = False
-            waker_name = None
-
-            for r in state_entries:
-                state_label = _map_state_label(r.state)
-                pct = round(r.total_ns / total_ns * 100, 1)
-                pct_dist[state_label] = pct_dist.get(state_label, 0) + pct
-
-                # Record blocking details from first non-Running entry
-                if state_label != "Running" and blocked_fn is None:
-                    blocked_fn = r.blocked_function
-                    io_wait = bool(r.io_wait) if r.io_wait is not None else False
-                    # Resolve waker name
-                    if r.waker_utid is not None:
-                        try:
-                            waker_rows = tp.query(f"""
-                                SELECT name FROM thread WHERE utid = {r.waker_utid} LIMIT 1
-                            """)
-                            for wr in waker_rows:
-                                waker_name = wr.name
-                                break
-                        except Exception:
-                            pass
-
-            dominant = max(pct_dist, key=pct_dist.get) if pct_dist else "unknown"
-            results.append({
-                "slice_name": slice_name,
-                "dur_ms": dur_ms,
-                "state_distribution": pct_dist,
-                "dominant_state": dominant,
-                "blocked_function": blocked_fn,
-                "io_wait": io_wait,
-                "waker_name": waker_name,
-            })
-
-        return results
-
-    def _resolve_main_utid(self, tp) -> int | None:
-        """Resolve the main thread's utid from the thread table.
-
-        Tries multiple strategies:
-          1. Thread named 'main'
-          2. Thread named after the target package (common on Android)
-          3. Thread with the lowest tid in the target process (main thread is always tid 1 in-process)
-        """
-        # Strategy 1: name = 'main'
-        try:
-            rows = tp.query("SELECT utid FROM thread WHERE name = 'main' LIMIT 1")
-            for r in rows:
-                return r.utid
-        except Exception as e:
-            debug_log("perfetto", f"thread_state: strategy 1 (name=main) failed: {e}")
-
-        # Strategy 2: thread named after target package
-        if self._target_package:
-            try:
-                rows = tp.query(f"SELECT utid FROM thread WHERE name = '{self._target_package}' LIMIT 1")
-                for r in rows:
-                    return r.utid
-            except Exception:
-                pass
-
-        # Strategy 3: lowest-tid thread in target process
-        proc = self._resolve_target_process()
-        upid = proc.get("upid")
-        if upid is not None:
-            try:
-                rows = tp.query(f"""
-                    SELECT t.utid FROM thread t
-                    JOIN process p ON t.upid = p.upid
-                    WHERE t.upid = {upid}
-                    ORDER BY t.tid ASC
-                    LIMIT 1
-                """)
-                for r in rows:
-                    return r.utid
-            except Exception as e:
-                debug_log("perfetto", f"thread_state: strategy 3 (lowest tid) failed: {e}")
-
-        debug_log("perfetto", "thread_state: could not resolve main thread utid")
-        return None
-
-    def _check_intrinsic_thread_state(self, tp) -> bool:
-        """Check if __intrinsic_thread_state table is available."""
-        try:
-            tp.query("SELECT 1 FROM __intrinsic_thread_state LIMIT 1")
-            return True
-        except Exception:
-            return False
-
-    def _collect_thread_state_fallback(self, tp, main_utid: int, slice_rows) -> list[dict]:
-        """Fallback: use legacy thread_state table (sched-based) when __intrinsic_thread_state is unavailable.
-
-        Preserves the original overlap-based calculation logic.
-        """
-        results = []
-        for sr in slice_rows:
-            slice_ts = sr.ts
-            slice_dur = sr.dur
-            slice_name = sr.name
-            dur_ms = round(slice_dur / 1e6, 2)
-
-            if dur_ms < 1.0:
-                continue
-
-            result = self._query_thread_state_legacy(tp, main_utid, slice_name, slice_ts, slice_dur, dur_ms)
-            results.append(result)
-
-        return results
-
-    def _query_thread_state_legacy(self, tp, main_utid: int, slice_name: str,
-                                    slice_ts: int, slice_dur: int, dur_ms: float) -> dict:
-        """Query single slice using legacy thread_state table."""
-        slice_end = slice_ts + slice_dur
-        try:
-            state_rows = tp.query(f"""
-                SELECT
-                  state,
-                  SUM(
-                    MIN(
-                      CASE WHEN dur < 0 THEN {slice_end} ELSE ts + dur END,
-                      {slice_end}
-                    ) -
-                    MAX(ts, {slice_ts})
-                  ) AS state_dur_ns
-                FROM thread_state
-                WHERE utid = {main_utid}
-                  AND ts < {slice_end}
-                  AND (dur < 0 OR ts + dur > {slice_ts})
-                GROUP BY state
-                ORDER BY state_dur_ns DESC
-            """)
-
-            state_dist = {}
-            total_state_ns = 0
-            for st in state_rows:
-                ns = st.state_dur_ns or 0
-                total_state_ns += ns
-                state_name = _map_state_label(st.state)
-                state_dist[state_name] = state_dist.get(state_name, 0) + ns
-
-            if total_state_ns > 0:
-                pct_dist = {
-                    k: round(v / total_state_ns * 100, 1)
-                    for k, v in state_dist.items()
-                }
-            else:
-                pct_dist = state_dist
-
-            dominant = max(pct_dist, key=pct_dist.get) if pct_dist else "unknown"
-
-            return {
-                "slice_name": slice_name,
-                "dur_ms": dur_ms,
-                "state_distribution": pct_dist,
-                "dominant_state": dominant,
-                "blocked_function": None,
-                "io_wait": False,
-                "waker_name": None,
-            }
-        except Exception as e:
-            debug_log("perfetto", f"thread_state: legacy query failed for {slice_name}: {e}")
-            return {
-                "slice_name": slice_name,
-                "dur_ms": dur_ms,
-                "state_distribution": {},
-                "dominant_state": "unknown",
-                "blocked_function": None,
-                "io_wait": False,
-                "waker_name": None,
-            }
-
-    def _diagnose_tables(self) -> dict:
-        """Check which key tables have data, for diagnosing empty results."""
-        tp = self._open()
-        checks = {
-            "perf_sample": "SELECT COUNT(*) as c FROM perf_sample",
-            "heap_graph_object": "SELECT COUNT(*) as c FROM heap_graph_object",
-            "actual_frame_timeline_slice": "SELECT COUNT(*) as c FROM actual_frame_timeline_slice",
-            "sched": "SELECT COUNT(*) as c FROM sched",
-            "package_list": "SELECT COUNT(*) as c FROM package_list",
-        }
-        result = {}
-        for table, sql in checks.items():
-            try:
-                rows = tp.query(sql)
-                for r in rows:
-                    result[table] = r.c
-                    break
-                else:
-                    result[table] = 0
-            except Exception as e:
-                debug_log("perfetto", f"Table {table} query failed: {e}")
-                result[table] = -1  # table doesn't exist
-        return result
-
-    def collect_compose_slices(self) -> dict:
-        """Collect Jetpack Compose recomposition slices (SI$compose#).
-
-        Tag format from ComposeHook.kt:
-          SI$compose#ComposableName#first     — first composition
-          SI$compose#ComposableName#recompose — recomposition
-
-        Returns aggregated recomposition stats per composable.
-        """
-        tp = self._open()
-        try:
-            rows = tp.query("""
-                SELECT name, ts, dur, depth, track_id
-                FROM slice
-                WHERE name LIKE 'SI$compose#%'
-                ORDER BY ts ASC
-            """)
-        except Exception as e:
-            debug_log("perfetto", f"Compose slices query failed: {e}")
-            return {}
-
-        slices = []
-        # Aggregate per-composable: {name: {first_count, recompose_count, total_ms, max_ms}}
-        composable_stats: dict[str, dict] = {}
-
-        for r in rows:
-            dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
-            name = r.name
-            slices.append({
-                "name": name,
-                "ts_ns": r.ts,
-                "dur_ms": dur_ms,
-                "depth": r.depth,
-            })
-
-            # Parse: SI$compose#ComposableName#first/recompose
-            body = name[len("SI$compose#"):]
-            last_hash = body.rfind("#")
-            if last_hash >= 0:
-                composable_name = body[:last_hash]
-                compose_type = body[last_hash + 1:]  # "first" or "recompose"
-            else:
-                composable_name = body
-                compose_type = "unknown"
-
-            if composable_name not in composable_stats:
-                composable_stats[composable_name] = {
-                    "name": composable_name,
-                    "first_count": 0,
-                    "recompose_count": 0,
-                    "total_ms": 0.0,
-                    "max_ms": 0.0,
-                }
-            stats = composable_stats[composable_name]
-            if compose_type == "first":
-                stats["first_count"] += 1
-            elif compose_type == "recompose":
-                stats["recompose_count"] += 1
-            stats["total_ms"] += dur_ms
-            stats["max_ms"] = max(stats["max_ms"], dur_ms)
-
-        if not slices:
-            return {}
-
-        # Sort composables by total recomposition time (descending)
-        sorted_stats = sorted(
-            composable_stats.values(),
-            key=lambda x: -x["total_ms"],
-        )
-
-        return {
-            "total_count": len(slices),
-            "composables": sorted_stats,
-            "slowest": sorted(slices, key=lambda x: -x["dur_ms"])[:20],
-        }
+        return {}
 
     def summarize(self) -> PerfSummary:
         """Run all analyses and return a unified summary."""
@@ -1605,7 +325,6 @@ class PerfettoCollector:
         try:
             diag = self._diagnose_tables()
             summary.metadata["table_stats"] = diag
-            # Build human-readable notes
             notes = []
             if diag.get("perf_sample", -1) <= 0:
                 notes.append("CPU profiling (linux.perf): no data. Need target_process for callstack sampling.")
@@ -1706,7 +425,6 @@ class PerfettoCollector:
             summary.thread_state = self.collect_thread_state()
             debug_log("perfetto", f"thread_state: collected {len(summary.thread_state)} entries")
             if not summary.thread_state:
-                # Diagnose why thread_state is empty
                 try:
                     tp = self._open()
                     ts_count = 0
@@ -1743,15 +461,12 @@ class PerfettoCollector:
             output_path: Local path to save the trace. Defaults to temp file.
             duration_ms: Trace duration in milliseconds.
             categories: Ftrace/atrace categories to enable.
-            target_process: Target app package name for CPU/memory profiling,
-                            e.g. "com.example.myapp". When set, enables CPU
-                            callstack profiling and Java heap profiling.
+            target_process: Target app package name for CPU/memory profiling.
             buffer_size_kb: Main buffer size in KB.
             cpu_sampling_interval_ms: CPU sampling interval in ms (1-10).
             collect_cpu_callstacks: Enable CPU callstack profiling (requires target_process).
             collect_java_heap: Enable Java heap profiling (requires target_process).
-            on_record_start: Optional callback invoked after Perfetto recording starts
-                             on device (useful for cold start app launch).
+            on_record_start: Optional callback invoked after Perfetto recording starts.
 
         Returns:
             Path to the downloaded trace file.
@@ -1841,7 +556,7 @@ class PerfettoCollector:
 
         # CPU callstack profiling (requires target_process)
         if target_process and collect_cpu_callstacks:
-            cpu_freq = max(1, 1000 // cpu_sampling_interval_ms)  # ms → Hz
+            cpu_freq = max(1, 1000 // cpu_sampling_interval_ms)
             config_lines += [
                 "",
                 "# CPU callstack profiling",
@@ -1882,14 +597,13 @@ class PerfettoCollector:
 
         config_text = "\n".join(config_lines)
 
-        # --- P1-6 + P1-7: Trace collection with SELinux fallback and auto-degradation ---
+        # --- Trace collection with SELinux fallback and auto-degradation ---
         timeout_sec = duration_ms // 1000 + 30
         collection_error = None
 
         # Strategy 1: Config mode via stdin pipe (preferred)
         try:
             if on_record_start:
-                # Use Popen so we can invoke callback while Perfetto is recording
                 import threading
                 import time
 
@@ -1907,10 +621,6 @@ class PerfettoCollector:
                 except (BrokenPipeError, OSError) as e:
                     info_log("perfetto", f"WARNING: Failed to write config to perfetto stdin: {e}")
 
-                # Read stdout/stderr in background threads to avoid pipe
-                # buffer deadlock (communicate() is unsafe here because
-                # stdin was already closed above — it would raise
-                # "ValueError: I/O operation on closed file").
                 stdout_chunks: list[str] = []
                 stderr_chunks: list[str] = []
 
@@ -1929,10 +639,8 @@ class PerfettoCollector:
                 t_out.start()
                 t_err.start()
 
-                # Give Perfetto a moment to start recording, then invoke callback
                 time.sleep(0.5)
 
-                # Run on_record_start in a thread so pipe I/O is not blocked
                 callback_error = None
 
                 def _run_callback():
@@ -1945,12 +653,10 @@ class PerfettoCollector:
 
                 cb_thread = threading.Thread(target=_run_callback, daemon=True)
                 cb_thread.start()
-                # Wait for callback to finish, but cap at a reasonable timeout
                 cb_thread.join(timeout=10.0)
                 if cb_thread.is_alive():
                     info_log("perfetto", "WARNING: on_record_start callback timed out after 10s")
 
-                # Wait for perfetto recording to complete
                 proc.wait(timeout=timeout_sec)
                 t_out.join(timeout=5)
                 t_err.join(timeout=5)
@@ -1980,17 +686,15 @@ class PerfettoCollector:
             debug_log("perfetto", f"config mode (stdin pipe) failed: {err_msg}")
             collection_error = f"stdin-pipe: {err_msg}"
 
-            # Strategy 2: P1-6 SELinux fallback — push config file, use cat pipe
+            # Strategy 2: SELinux fallback — push config file, use cat pipe
             try:
                 config_device_path = "/data/local/tmp/si_perfetto_config.pbtx"
-                # Push config text to device
                 subprocess.run(
                     ["adb", "push", "/dev/stdin", config_device_path],
                     input=config_text,
                     check=True, capture_output=True, text=True,
                     timeout=10,
                 )
-                # Use cat pipe to bypass SELinux restrictions
                 subprocess.run(
                     ["adb", "shell", f"cat {config_device_path} | perfetto -c - --txt -o {device_path}"],
                     check=True, capture_output=True, text=True,
@@ -1998,7 +702,6 @@ class PerfettoCollector:
                 )
                 collection_error = None
                 debug_log("perfetto", "SELinux fallback (cat pipe) succeeded")
-                # Cleanup config file
                 subprocess.run(
                     ["adb", "shell", "rm", config_device_path],
                     capture_output=True, text=True,
@@ -2012,9 +715,7 @@ class PerfettoCollector:
                 debug_log("perfetto", f"SELinux fallback (cat pipe) failed: {err_msg2}")
                 collection_error = f"stdin-pipe + cat-pipe: {err_msg} / {err_msg2}"
 
-                # Strategy 3: P1-7 Auto-degradation — command-line mode
-                # Simpler perfetto invocation without config file,
-                # using inline -t and atrace categories only
+                # Strategy 3: Auto-degradation — command-line mode
                 try:
                     duration_sec = duration_ms // 1000
                     cmdline = (
@@ -2071,16 +772,13 @@ class TraceServer:
         self.process: subprocess.Popen | None = None
 
     def start(self, timeout: float = 10.0) -> bool:
-        """Start trace_processor_shell in HTTP mode.
-
-        Returns True if the server becomes ready within *timeout* seconds.
-        """
+        """Start trace_processor_shell in HTTP mode."""
         import time
         import urllib.request
         import urllib.error
 
         if self.process is not None and self.process.poll() is None:
-            return True  # already running
+            return True
 
         shell = str(SHELL_BIN)
         if not Path(shell).exists():
@@ -2108,10 +806,7 @@ class TraceServer:
         return False
 
     def query(self, sql: str) -> list[dict]:
-        """Execute a SQL query via the Python API connecting to HTTP server.
-
-        Returns list of row dicts.
-        """
+        """Execute a SQL query via the Python API connecting to HTTP server."""
         tp = TraceProcessor(addr=f"127.0.0.1:{self.port}",
                             config=TraceProcessorConfig(bin_path=str(SHELL_BIN)))
         try:
@@ -2160,10 +855,6 @@ def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
     )
     tp = TraceProcessor(trace=trace_path, config=config)
     try:
-        # Slices overlapping the selected time range.
-        # SI$block# slices have dur≈0 (beginSection+endSection are adjacent),
-        # so a single ORDER BY dur DESC would squeeze them out.  Query in two
-        # batches: all SI$ slices first, then top non-SI$ slices by duration.
         si_rows = tp.query(f"""
             SELECT id, name, ts, dur, depth, track_id, cat, parent_id
             FROM slice
@@ -2200,7 +891,6 @@ def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
                 "parent_id": r.parent_id,
             })
 
-        # Frame timeline overlapping the range
         frames = []
         try:
             frame_rows = tp.query(f"""
@@ -2225,7 +915,6 @@ def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
         except Exception:
             pass
 
-        # Build call chains for top slices (parent -> child walk)
         call_chains = []
         seen_ids: set[int] = set()
         for s in slices[:10]:
@@ -2235,8 +924,6 @@ def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
             if chain:
                 call_chains.append(chain)
 
-        # Correlate SI$block# slices with SIBlock logcat entries for stack traces.
-        # This mirrors the bisect-based correlation in collect_block_events().
         _correlate_block_stacks_from_logcat(tp, slices, ts_ns, ts_ns + dur_ns)
 
         return {
@@ -2253,18 +940,11 @@ def query_frame_slices(trace_path: str, ts_ns: int, dur_ns: int,
 
 def _correlate_block_stacks_from_logcat(tp, slices: list[dict],
                                           range_start_ns: int, range_end_ns: int):
-    """Correlate SI$block# slices with SIBlock logcat entries for stack traces.
-
-    Modifies slices in-place, adding 'stack_trace' field to block slices.
-    This mirrors the bisect-based correlation in collect_block_events().
-    """
-    import bisect
-
+    """Correlate SI$block# slices with SIBlock logcat entries for stack traces."""
     block_slices = [s for s in slices if s["name"].startswith("SI$block#")]
     if not block_slices:
         return
 
-    # Query android.log for SIBlock entries within the expanded time range
     try:
         log_rows = tp.query(f"""
             SELECT ts, msg
@@ -2292,7 +972,7 @@ def _correlate_block_stacks_from_logcat(tp, slices: list[dict],
         key=lambda x: x[0],
     )
     log_timestamps = [t for t, _ in log_ts_list]
-    MATCH_WINDOW_NS = 500_000_000  # 500ms
+    MATCH_WINDOW_NS = 500_000_000
 
     for block in block_slices:
         block_ts = block["ts_ns"]
@@ -2317,7 +997,7 @@ def _walk_call_chain(tp, slice_id: int, seen: set[int]) -> dict:
     """Walk from a slice up through parents to build a call chain."""
     chain_items = []
     current_id = slice_id
-    for _ in range(20):  # max depth safety
+    for _ in range(20):
         try:
             rows = list(tp.query(f"""
                 SELECT id, name, ts, dur, depth, parent_id

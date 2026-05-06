@@ -19,8 +19,19 @@ src/smartinspector/          # Main Python package (installed via hatchling)
     device.py                #   /devices, /connect, /status, /disconnect
     session.py               #   /help, /clear, /summary, /tokens
   collector/                 # Perfetto trace collection & SQL analysis
-    perfetto.py              #   PerfettoCollector — 14 collect_*() methods (incl. collect_io_slices)
+    perfetto.py              #   PerfettoCollector — core class with summarize() + pull_trace_from_device()
+    _helpers.py              #   Shared helpers (_parse_siblock_msg, _map_state_label)
+    sched.py                 #   SchedMixin — collect_sched()
+    cpu.py                   #   CpuMixin — collect_cpu_hotspots(), collect_cpu_usage()
+    frame.py                 #   FrameMixin — collect_frame_timeline(), collect_view_slices(), collect_compose_slices()
+    io.py                    #   IoMixin — collect_io_slices(), collect_input_events()
+    block.py                 #   BlockMixin — collect_block_events()
+    thread.py                #   ThreadMixin — collect_thread_state()
+    sys.py                   #   SysMixin — collect_sys_stats(), collect_threads()
+    memory.py                #   Heap graph analysis (used by PerfettoCollector.collect_memory())
     startup.py               #   StartupAnalyzer — cold start phase splitting & bottleneck ID
+  llm/                       # LLM instance management
+    factory.py               #   LLMFactory — centralized creation & caching (replaces per-agent singletons)
   graph/                     # LangGraph orchestration
     nodes/                   #   Graph nodes (orchestrator, collector, attributor, reporter, ...)
       startup.py             #   Cold start analysis node
@@ -30,7 +41,7 @@ src/smartinspector/          # Main Python package (installed via hatchling)
         json_formatter.py    #     JSON structured report (CI/automation)
         generator.py         #     LLM report generation
         persistence.py       #     Markdown report file output
-    state.py                 #   AgentState TypedDict, _pass_through(), node_error_handler()
+    state.py                 #   AgentState TypedDict, _pass_through(), _get_perf_data(), node_error_handler()
   tools/                     # File search tools (glob, grep, read) — used by agents
   ws/                        # WebSocket server for app communication
   headless.py                # Headless/CI non-interactive runner
@@ -161,13 +172,36 @@ Agents are separate from graph nodes. They contain the business logic:
 - `agents/frame_analyzer.py` — Frame-level analysis
 - `agents/perf_analyzer.py` — Performance analysis
 - `agents/explorer.py` — Code exploration
+- `agents/android.py` — Android expert
+
+### LLM Instance Management
+
+All LLM instances are created and cached via `LLMFactory` (`llm/factory.py`):
+
+```python
+from smartinspector.llm.factory import LLMFactory
+
+# Get a cached LLM for a role
+llm = LLMFactory.get("perf_analyzer", temperature=0.1)
+
+# Get an LLM with tools bound
+llm_tools = LLMFactory.get_with_tools("attributor", [grep, glob, read], temperature=0)
+```
+
+Roles: `default`, `attributor`, `router`, `perf_analyzer`, `frame_analyzer`, `metric_qa`, `reporter`, `android_expert`, `explorer`.
+
+**Do NOT** create `ChatOpenAI()` instances directly in agent code. Use `LLMFactory.get()` instead.
+- `agents/frame_analyzer.py` — Frame-level analysis
+- `agents/perf_analyzer.py` — Performance analysis
+- `agents/explorer.py` — Code exploration
 
 ### AgentState Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `messages` | `Annotated[list, operator.add]` | Accumulated conversation messages |
-| `perf_summary` | `str` | JSON from PerfettoCollector (PerfSummary.to_json()) |
+| `perf_summary` | `str` | JSON from PerfettoCollector (PerfSummary.to_json()), backward compat for LLM prompts |
+| `perf_summary_raw` | `dict` | Structured perf data (PerfSummary.__dict__), avoids repeated json.loads() |
 | `perf_analysis` | `str` | Markdown from analysis agent |
 | `attribution_data` | `str` | JSON: list of attributable SI$ slices |
 | `attribution_result` | `str` | JSON: source attribution results with snippets |
@@ -327,7 +361,20 @@ Trace config in `PerfettoCollector.pull_trace_from_device()`:
 
 ### Collector Analysis Methods
 
-Each `collect_*()` method queries Perfetto SQL tables and returns structured data:
+Each `collect_*()` method queries Perfetto SQL tables and returns structured data.
+Methods are organized into domain-specific Mixin classes under `collector/`:
+
+| Mixin | Module | Methods |
+|-------|--------|---------|
+| `SchedMixin` | `collector/sched.py` | `collect_sched()` |
+| `CpuMixin` | `collector/cpu.py` | `collect_cpu_hotspots()`, `collect_cpu_usage()` |
+| `FrameMixin` | `collector/frame.py` | `collect_frame_timeline()`, `collect_view_slices()`, `collect_compose_slices()` |
+| `IoMixin` | `collector/io.py` | `collect_io_slices()`, `collect_input_events()` |
+| `BlockMixin` | `collector/block.py` | `collect_block_events()` |
+| `ThreadMixin` | `collector/thread.py` | `collect_thread_state()` + internal helpers |
+| `SysMixin` | `collector/sys.py` | `collect_sys_stats()`, `collect_threads()` |
+
+Methods remaining in `perfetto.py`: `collect_memory()`, `collect_process_memory()` (use `memory.py` helper).
 
 | Method | Returns | SQL Tables |
 |--------|---------|------------|

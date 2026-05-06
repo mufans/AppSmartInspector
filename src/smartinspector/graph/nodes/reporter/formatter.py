@@ -3,7 +3,7 @@
 import json
 
 
-def format_perf_sections(perf_json: str) -> list[str]:
+def format_perf_sections(perf_json: str | dict) -> list[str]:
     """Build user-facing markdown sections from perf JSON.
 
     Section ordering follows CLAUDE.md priority to survive truncation:
@@ -18,15 +18,20 @@ def format_perf_sections(perf_json: str) -> list[str]:
     if not perf_json:
         return user_parts
 
+    # compute_hints expects JSON string
+    perf_str = perf_json if isinstance(perf_json, str) else json.dumps(perf_json)
     from smartinspector.agents.deterministic import compute_hints
-    hints = compute_hints(perf_json)
+    hints = compute_hints(perf_str)
     if hints:
         user_parts.append(f"## 预计算结论\n{hints}")
 
-    try:
-        perf_data = json.loads(perf_json)
-    except Exception:
-        perf_data = {}
+    if isinstance(perf_json, dict):
+        perf_data = perf_json
+    else:
+        try:
+            perf_data = json.loads(perf_json)
+        except Exception:
+            perf_data = {}
 
     # Thread state analysis — Running vs Sleeping vs DiskSleep with blocking details
     # Priority 2: must appear before frame timeline to survive truncation

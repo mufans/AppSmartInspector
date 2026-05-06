@@ -5,29 +5,17 @@ data, runs source code attribution, and calls LLM for frame-level analysis.
 """
 
 import json
-import threading
 
-from langchain_openai import ChatOpenAI
-
-from smartinspector.config import get_llm_kwargs
 from smartinspector.debug_log import info_log
+from smartinspector.llm.factory import LLMFactory
 from smartinspector.prompts import load_prompt
 from smartinspector.token_tracker import get_tracker
 
 _prompt = load_prompt("frame-analyzer")
-_llm = None
-_llm_lock = threading.Lock()
 
 
 def _get_llm():
-    global _llm
-    if _llm is not None:
-        return _llm
-    with _llm_lock:
-        if _llm is not None:
-            return _llm
-        _llm = ChatOpenAI(**get_llm_kwargs(temperature=0.1))
-    return _llm
+    return LLMFactory.get("frame_analyzer", temperature=0.1)
 
 
 def analyze_frame(trace_path: str, ts_ns: int, dur_ns: int,

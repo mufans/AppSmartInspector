@@ -1,5 +1,6 @@
 """AgentState definition and state helpers."""
 
+import json
 from enum import Enum
 from typing import Annotated, TypedDict
 import functools
@@ -27,7 +28,8 @@ class RouteDecision(str, Enum):
 class AgentState(TypedDict):
     """Shared state flowing through the graph."""
     messages: Annotated[list, operator.add]
-    perf_summary: str            # JSON: PerfettoCollector summary
+    perf_summary: str            # JSON: PerfettoCollector summary (backward compat, LLM prompts)
+    perf_summary_raw: dict       # Dict: structured perf data (avoids repeated json.loads)
     perf_analysis: str           # Markdown: LLM performance analysis
     attribution_data: str        # JSON: list of attributable SI$ slices
     attribution_result: str      # JSON: list of attribution results with source snippets
@@ -40,7 +42,7 @@ class AgentState(TypedDict):
 
 # State keys that every node must pass through unchanged.
 _PASS_THROUGH_KEYS = (
-    "perf_summary", "perf_analysis", "attribution_data", "attribution_result",
+    "perf_summary", "perf_summary_raw", "perf_analysis", "attribution_data", "attribution_result",
 )
 
 
@@ -60,6 +62,30 @@ def _pass_through(state: AgentState, *, extra_keys: tuple = ()) -> dict:
     """
     keys = _PASS_THROUGH_KEYS + extra_keys
     return {k: state.get(k, "") for k in keys}
+
+
+def _get_perf_data(state: AgentState) -> dict:
+    """Extract structured perf data from state, avoiding redundant json.loads().
+
+    Prefers ``perf_summary_raw`` (dict) when available, falling back to
+    parsing ``perf_summary`` (JSON string) for backward compatibility.
+
+    Args:
+        state: Current graph state.
+
+    Returns:
+        Parsed perf data dict, or empty dict if unavailable.
+    """
+    raw = state.get("perf_summary_raw")
+    if raw and isinstance(raw, dict):
+        return raw
+    perf_json = state.get("perf_summary", "")
+    if not perf_json:
+        return {}
+    try:
+        return json.loads(perf_json)
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
 def node_error_handler(node_name: str):
