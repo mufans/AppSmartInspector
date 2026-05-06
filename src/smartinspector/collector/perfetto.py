@@ -11,13 +11,14 @@ from __future__ import annotations
 import bisect
 import json
 import os
+import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
 
+from smartinspector.collector.base import BaseCollector, PerfSummary
 from smartinspector.perfetto_compat import patch
 from smartinspector.debug_log import info_log, debug_log
 from smartinspector.collector._helpers import _parse_siblock_msg, _map_state_label
@@ -43,29 +44,8 @@ SHELL_BIN = _PROJECT_ROOT / "bin" / "trace_processor_shell"
 # (e.g., frame_analyzer.py imports _parse_siblock_msg indirectly via query_frame_slices)
 
 
-@dataclass
-class PerfSummary:
-    """Unified performance summary (~2KB JSON)."""
-    frame_timeline: dict = field(default_factory=dict)
-    cpu_usage: dict = field(default_factory=dict)
-    process_memory: dict = field(default_factory=dict)
-    cpu_hotspots: list[dict] = field(default_factory=list)
-    memory: dict | None = None
-    scheduling: dict | None = None
-    view_slices: dict = field(default_factory=dict)
-    io_slices: dict = field(default_factory=dict)
-    metadata: dict = field(default_factory=dict)
-    block_events: list[dict] = field(default_factory=list)
-    input_events: list[dict] = field(default_factory=list)
-    compose_slices: dict = field(default_factory=dict)
-    sys_stats: dict = field(default_factory=dict)
-    thread_state: list[dict] = field(default_factory=list)
-
-    def to_json(self) -> str:
-        return json.dumps(self.__dict__, indent=2, ensure_ascii=False)
-
-
 class PerfettoCollector(
+    BaseCollector,
     SchedMixin,
     CpuMixin,
     FrameMixin,
@@ -76,7 +56,8 @@ class PerfettoCollector(
 ):
     """Collect and analyze Android Perfetto traces.
 
-    Collect methods are provided by domain-specific mixins:
+    Inherits from BaseCollector (platform-agnostic interface) and
+    domain-specific mixin modules:
       - SchedMixin: collect_sched()
       - CpuMixin: collect_cpu_hotspots(), collect_cpu_usage()
       - FrameMixin: collect_frame_timeline(), collect_view_slices(), collect_compose_slices()
@@ -86,13 +67,14 @@ class PerfettoCollector(
       - SysMixin: collect_sys_stats(), collect_threads()
     """
 
+    _platform: str = "android"
+
     def __init__(self, trace_path: str, shell_path: str | None = None,
                  target_process: str | None = None):
-        self.trace_path = trace_path
+        super().__init__(trace_path=trace_path, target_process=target_process)
         self.shell_path = shell_path or str(SHELL_BIN)
         self._tp: TraceProcessor | None = None
         self._target_process_cache: dict | None = None  # cached resolve result
-        self._target_package: str | None = target_process
 
     def _open(self) -> TraceProcessor:
         if self._tp is not None:
@@ -112,12 +94,12 @@ class PerfettoCollector(
 
         Args:
             package_name: Android package name, e.g. "com.example.app".
-                          Falls back to ``self._target_package`` if not provided.
+                          Falls back to ``self.target_process`` if not provided.
 
         Returns:
             Dict with keys: upid, pid, uid, name, source ("process"|"package_list"|"")
         """
-        package_name = package_name or self._target_package
+        package_name = package_name or self.target_process
         if not package_name:
             return {}
         if self._target_process_cache is not None:
@@ -194,12 +176,26 @@ class PerfettoCollector(
             self._tp.close()
             self._tp = None
 
-    def __enter__(self):
-        return self
+    @classmethod
+    def is_available(cls) -> bool:
+        """Check if adb and trace_processor_shell are available."""
+        return shutil.which("adb") is not None and SHELL_BIN.exists()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-        return False
+    def get_device_info(self):
+        """Return Android device info from metadata."""
+        from smartinspector.collector.base import DeviceInfo
+
+        info = DeviceInfo(platform="android")
+        try:
+            tp = self._open()
+            for r in tp.query("SELECT name, str_value FROM metadata"):
+                if r.name == "device":
+                    info.model = r.str_value or ""
+                elif r.name == "fingerprint":
+                    info.os_version = r.str_value or ""
+        except Exception:
+            pass
+        return info
 
     def _diagnose_tables(self) -> dict:
         """Check which key tables have data, for diagnosing empty results."""
@@ -340,8 +336,8 @@ class PerfettoCollector(
             debug_log("perfetto", f"Table diagnosis failed: {e}")
 
         # P1-5: Resolve target process with package_list fallback for cold-start support
-        if self._target_package:
-            resolved = self._resolve_target_process(self._target_package)
+        if self.target_process:
+            resolved = self._resolve_target_process(self.target_process)
             if resolved.get("source"):
                 summary.metadata["target_process"] = resolved
                 debug_log("perfetto", f"target process resolved via {resolved['source']}: {resolved}")
