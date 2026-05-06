@@ -370,8 +370,8 @@ class TestFastPathContextMethod:
         }]
         assert _can_use_fast_path(group)
 
-    def test_cannot_use_fast_path_with_dollar_in_class(self):
-        """Entries with $ in class_name should NOT be fast-path eligible."""
+    def test_can_use_fast_path_with_dollar_in_class(self):
+        """Entries with $ in class_name ARE fast-path eligible (anonymous inner class support)."""
         from smartinspector.agents.attributor import _can_use_fast_path
         group = [{
             "class_name": "CpuBurnWorker$1",
@@ -380,7 +380,7 @@ class TestFastPathContextMethod:
             "raw_name": "SI$block#worker.CpuBurnWorker$1#125ms",
             "dur_ms": 147,
         }]
-        assert not _can_use_fast_path(group)
+        assert _can_use_fast_path(group)
 
 
 class TestExtractMethodFromAnonymous:
