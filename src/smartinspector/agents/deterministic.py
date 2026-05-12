@@ -840,18 +840,21 @@ def _analyze_lock_contention(data: dict) -> str:
     Reports the most severe lock waits, distinguishing main-thread blockers
     from background contention.
     """
-    lock_events = data.get("lock_contention") or []
-    if not lock_events:
+    lock_data = data.get("lock_contention") or {}
+    if not lock_data:
+        return ""
+    contentions = lock_data.get("top_contentions") or []
+    total_count = lock_data.get("total_count", len(contentions))
+    if not contentions:
         return ""
 
     lines = ["[锁竞争分析]"]
 
     # Sort by duration descending
-    sorted_events = sorted(lock_events, key=lambda x: -_safe_float(x.get("dur_ms")))
-    main_blockers = [e for e in sorted_events if e.get("is_blocked_main")]
-    other_blockers = [e for e in sorted_events if not e.get("is_blocked_main")]
+    sorted_events = sorted(contentions, key=lambda x: -_safe_float(x.get("dur_ms")))
+    main_blockers = [e for e in sorted_events if e.get("is_main_thread_blocked")]
+    other_blockers = [e for e in sorted_events if not e.get("is_main_thread_blocked")]
 
-    total_count = len(sorted_events)
     total_dur = sum(_safe_float(e.get("dur_ms")) for e in sorted_events)
     lines.append(f"  共{total_count}次锁等待, 总耗时{total_dur:.1f}ms")
 
@@ -884,15 +887,18 @@ def _analyze_lock_contention(data: dict) -> str:
 
 def _analyze_binder_txns(data: dict) -> str:
     """Analyze Binder transactions, ranking by client/server latency."""
-    txns = data.get("binder_txns") or []
+    binder_data = data.get("binder_txns") or {}
+    if not binder_data:
+        return ""
+    txns = binder_data.get("top_by_duration") or []
     if not txns:
         return ""
 
     lines = ["[Binder调用分析]"]
 
-    total = len(txns)
-    main_txns = [t for t in txns if t.get("is_main_thread")]
-    lines.append(f"  共{total}次Binder调用, 其中{len(main_txns)}次在主线程")
+    total = binder_data.get("total_count", len(txns))
+    main_count = binder_data.get("main_thread_count", 0)
+    lines.append(f"  共{total}次Binder调用, 其中{main_count}次在主线程")
 
     # Sort by client duration descending
     sorted_txns = sorted(txns, key=lambda x: -_safe_float(x.get("client_dur_ms")))
@@ -923,7 +929,7 @@ def _analyze_startup_metrics(data: dict) -> str:
         return ""
 
     startups = startup.get("startups") or []
-    breakdown = startup.get("breakdown") or []
+    breakdown = startup.get("breakdowns") or []
     if not startups and not breakdown:
         return ""
 
@@ -957,16 +963,19 @@ def _analyze_startup_metrics(data: dict) -> str:
 
 def _analyze_gc_events(data: dict) -> str:
     """Analyze GC events: type, duration, impact on performance."""
-    gc_events = data.get("gc_events") or []
-    if not gc_events:
+    gc_data = data.get("gc_events") or {}
+    if not gc_data:
+        return ""
+    gc_list = gc_data.get("events") or []
+    if not gc_list:
         return ""
 
     lines = ["[GC分析]"]
 
-    total_count = len(gc_events)
-    total_dur = sum(_safe_float(e.get("gc_dur_ms")) for e in gc_events)
-    total_reclaimed = sum(_safe_float(e.get("reclaimed_mb")) for e in gc_events)
-    mark_compact_count = sum(1 for e in gc_events if e.get("is_mark_compact"))
+    total_count = gc_data.get("total_count", len(gc_list))
+    total_dur = sum(_safe_float(e.get("gc_dur_ms")) for e in gc_list)
+    total_reclaimed = gc_data.get("total_reclaimed_mb", sum(_safe_float(e.get("reclaimed_mb")) for e in gc_list))
+    mark_compact_count = sum(1 for e in gc_list if e.get("is_mark_compact"))
 
     lines.append(
         f"  共{total_count}次GC, 总耗时{total_dur:.1f}ms, "
@@ -975,7 +984,7 @@ def _analyze_gc_events(data: dict) -> str:
     if mark_compact_count > 0:
         lines.append(f"  其中{mark_compact_count}次Mark-Compact (全堆GC, 耗时较长)")
 
-    for e in sorted(gc_events, key=lambda x: -_safe_float(x.get("gc_dur_ms")))[:3]:
+    for e in sorted(gc_list, key=lambda x: -_safe_float(x.get("gc_dur_ms")))[:3]:
         dur = _safe_float(e.get("gc_dur_ms"))
         gc_type = e.get("gc_type", "?")
         reclaimed = _safe_float(e.get("reclaimed_mb"))
@@ -996,7 +1005,12 @@ def _analyze_gc_events(data: dict) -> str:
 
 def _analyze_anrs(data: dict) -> str:
     """Analyze ANR events with main-thread operation details."""
-    anrs = data.get("anrs") or []
+    anr_data = data.get("anrs") or {}
+    if not anr_data:
+        return ""
+    anrs = anr_data.get("anr_events") if isinstance(anr_data, dict) else []
+    if isinstance(anr_data, list):
+        anrs = anr_data
     if not anrs:
         return ""
 
@@ -1027,7 +1041,12 @@ def _analyze_anrs(data: dict) -> str:
 
 def _analyze_input_latency(data: dict) -> str:
     """Analyze input latency breakdown: dispatch/handling/ack phases."""
-    events = data.get("input_latency") or []
+    input_data = data.get("input_latency") or {}
+    if not input_data:
+        return ""
+    events = input_data.get("top_events") if isinstance(input_data, dict) else []
+    if isinstance(input_data, list):
+        events = input_data
     if not events:
         return ""
 
@@ -1062,7 +1081,12 @@ def _analyze_input_latency(data: dict) -> str:
 
 def _analyze_sched_latency(data: dict) -> str:
     """Analyze scheduling latency: threads waiting longest for CPU."""
-    events = data.get("sched_latency") or []
+    sched_data = data.get("sched_latency") or {}
+    if not sched_data:
+        return ""
+    events = sched_data.get("top_threads") if isinstance(sched_data, dict) else []
+    if isinstance(sched_data, list):
+        events = sched_data
     if not events:
         return ""
 
