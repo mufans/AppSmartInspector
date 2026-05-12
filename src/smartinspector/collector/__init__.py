@@ -7,5 +7,6 @@ from smartinspector.collector.startup import StartupMixin
 from smartinspector.collector.gc import GcMixin
 from smartinspector.collector.anr import AnrMixin
 from smartinspector.collector.slice_enhanced import SliceEnhancedMixin
+from smartinspector.collector.input import InputMixin
 
-__all__ = ["PerfettoCollector", "PerfSummary", "LockMixin", "BinderMixin", "StartupMixin", "GcMixin", "AnrMixin", "SliceEnhancedMixin"]
+__all__ = ["PerfettoCollector", "PerfSummary", "LockMixin", "BinderMixin", "StartupMixin", "GcMixin", "AnrMixin", "SliceEnhancedMixin", "InputMixin"]
