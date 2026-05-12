@@ -468,3 +468,360 @@ class TestCollectANRs:
 
         sql = mock_tp.query.call_args_list[0][0][0]
         assert "upid = 42" in sql
+
+
+# -----------------------------------------------------------------------
+# P1-6: collect_slice_cpu_time (slices.cpu_time)
+# -----------------------------------------------------------------------
+
+class TestCollectSliceCpuTime:
+
+    def test_returns_empty_when_no_data(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={"upid": 1}):
+            result = collector.collect_slice_cpu_time()
+
+        assert result == {}
+
+    def test_parses_slice_cpu_time(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+
+        rows = [
+            _row(id=1, name="Choreographer#doFrame", utid=1,
+                 thread_name="main", upid=10, process_name="com.example.app",
+                 cpu_time=8_000_000),
+            _row(id=2, name="measure", utid=1,
+                 thread_name="main", upid=10, process_name="com.example.app",
+                 cpu_time=3_000_000),
+        ]
+        mock_tp.query.return_value = iter(rows)
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={"upid": 10}):
+            result = collector.collect_slice_cpu_time()
+
+        assert result["total_cpu_time_ms"] == 11.0
+        assert len(result["slices"]) == 2
+        assert result["slices"][0]["cpu_time_ms"] == 8.0
+        assert result["slices"][0]["name"] == "Choreographer#doFrame"
+
+    def test_includes_module(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            collector.collect_slice_cpu_time()
+
+        sql = mock_tp.query.call_args_list[0][0][0]
+        assert "INCLUDE PERFETTO MODULE slices.cpu_time" in sql
+
+
+# -----------------------------------------------------------------------
+# P1-7: collect_input_latency (android.input)
+# -----------------------------------------------------------------------
+
+class TestCollectInputLatency:
+
+    def test_returns_empty_when_no_data(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={"pid": 1001}):
+            result = collector.collect_input_latency()
+
+        assert result == {}
+
+    def test_parses_input_events(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+
+        rows = [
+            _row(
+                dispatch_latency_dur=2_000_000,
+                handling_latency_dur=8_000_000,
+                ack_latency_dur=1_000_000,
+                total_latency_dur=11_000_000,
+                end_to_end_latency_dur=32_000_000,
+                tid=1001, thread_name="main", pid=1001,
+                process_name="com.example.app",
+                event_type="MOTION_EVENT",
+                event_action="ACTION_MOVE",
+                event_seq="42",
+                event_channel="com.example.app (server)",
+                input_event_id="evt-123",
+                read_time=1000,
+                dispatch_ts=2000, dispatch_dur=2_000_000,
+                receive_ts=3000, receive_dur=8_000_000,
+                frame_id=100,
+            ),
+        ]
+        mock_tp.query.return_value = iter(rows)
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={"pid": 1001}):
+            result = collector.collect_input_latency()
+
+        assert result["total_count"] == 1
+        evt = result["events"][0]
+        assert evt["dispatch_latency_ms"] == 2.0
+        assert evt["handling_latency_ms"] == 8.0
+        assert evt["total_latency_ms"] == 11.0
+        assert evt["end_to_end_latency_ms"] == 32.0
+        assert evt["event_type"] == "MOTION_EVENT"
+        assert evt["frame_id"] == 100
+
+    def test_includes_module(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            collector.collect_input_latency()
+
+        sql = mock_tp.query.call_args_list[0][0][0]
+        assert "INCLUDE PERFETTO MODULE android.input" in sql
+
+
+# -----------------------------------------------------------------------
+# P1-8: collect_sched_latency (sched.latency)
+# -----------------------------------------------------------------------
+
+class TestCollectSchedLatency:
+
+    def test_returns_empty_when_no_data(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            result = collector.collect_sched_latency()
+
+        assert result == {}
+
+    def test_parses_latency_entries(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+
+        rows = [
+            _row(thread_state_id=10, sched_id=20, utid=5,
+                 runnable_latency_id=9, latency_dur=15_000_000),
+            _row(thread_state_id=11, sched_id=21, utid=5,
+                 runnable_latency_id=8, latency_dur=3_000_000),
+        ]
+        mock_tp.query.return_value = iter(rows)
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            result = collector.collect_sched_latency()
+
+        assert result["total_count"] == 2
+        assert result["top_latency"][0]["latency_ms"] == 15.0
+        assert result["top_latency"][1]["latency_ms"] == 3.0
+
+    def test_includes_module(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            collector.collect_sched_latency()
+
+        sql = mock_tp.query.call_args_list[0][0][0]
+        assert "INCLUDE PERFETTO MODULE sched.latency" in sql
+
+
+# -----------------------------------------------------------------------
+# P1-9: collect_oom_rss_swap (android.memory.process + android.memory.lmk)
+# -----------------------------------------------------------------------
+
+class TestCollectOomRssSwap:
+
+    def test_returns_empty_when_no_data(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            result = collector.collect_oom_rss_swap()
+
+        assert result == {}
+
+    def test_parses_memory_transitions(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+
+        mem_rows = [
+            _row(ts=1000, dur=5_000_000, score=100, bucket="visible",
+                 upid=10, process_name="com.example.app", pid=1001,
+                 anon_rss=50000, file_rss=30000, shmem_rss=5000,
+                 rss=85000, swap=2000, anon_rss_and_swap=52000,
+                 rss_and_swap=87000, oom_adj_reason="became visible"),
+        ]
+        lmk_rows = [
+            _row(ts=3000, upid=20, pid=2000, process_name="com.example.bg",
+                 oom_score_adj=900, kill_reason="lowmem"),
+        ]
+
+        def query_side_effect(sql):
+            if "android.memory.lmk" in sql:
+                return iter(lmk_rows)
+            return iter(mem_rows)
+
+        mock_tp.query.side_effect = query_side_effect
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={"upid": 10}):
+            result = collector.collect_oom_rss_swap()
+
+        assert "memory_transitions" in result
+        assert "lmk_events" in result
+        assert result["memory_transitions"][0]["oom_score"] == 100
+        assert result["memory_transitions"][0]["rss_kb"] == 85000
+        assert result["lmk_events"][0]["kill_reason"] == "lowmem"
+
+    def test_includes_modules(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            collector.collect_oom_rss_swap()
+
+        first_sql = mock_tp.query.call_args_list[0][0][0]
+        assert "INCLUDE PERFETTO MODULE android.memory.process" in first_sql
+
+
+# -----------------------------------------------------------------------
+# P1-10: collect_cpu_utilization (linux.cpu.utilization)
+# -----------------------------------------------------------------------
+
+class TestCollectCpuUtilization:
+
+    def test_returns_empty_when_no_data(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            result = collector.collect_cpu_utilization()
+
+        assert result == {}
+
+    def test_parses_cpu_utilization(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+
+        rows = [
+            _row(upid=10, millicycles=500000, megacycles=500,
+                 runtime=10_000_000_000, min_freq=300000,
+                 max_freq=2841600, avg_freq=1800000),
+            _row(upid=5, millicycles=200000, megacycles=200,
+                 runtime=5_000_000_000, min_freq=300000,
+                 max_freq=2841600, avg_freq=1500000),
+        ]
+        mock_tp.query.return_value = iter(rows)
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            result = collector.collect_cpu_utilization()
+
+        assert len(result["processes"]) == 2
+        assert result["processes"][0]["megacycles"] == 500
+        assert result["processes"][0]["runtime_ms"] == 10000.0
+        assert result["processes"][0]["avg_freq_khz"] == 1800000
+
+    def test_filters_by_target_process(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+
+        rows = [
+            _row(upid=10, millicycles=500000, megacycles=500,
+                 runtime=10_000_000_000, min_freq=300000,
+                 max_freq=2841600, avg_freq=1800000),
+            _row(upid=5, millicycles=200000, megacycles=200,
+                 runtime=5_000_000_000, min_freq=300000,
+                 max_freq=2841600, avg_freq=1500000),
+        ]
+        mock_tp.query.return_value = iter(rows)
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={"upid": 5}):
+            result = collector.collect_cpu_utilization()
+
+        assert len(result["processes"]) == 1
+        assert result["processes"][0]["upid"] == 5
+
+    def test_includes_module(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            collector.collect_cpu_utilization()
+
+        sql = mock_tp.query.call_args_list[0][0][0]
+        assert "INCLUDE PERFETTO MODULE linux.cpu.utilization.process" in sql
+
+
+# -----------------------------------------------------------------------
+# P1-11: collect_surfaceflinger_timeline (android.surfaceflinger)
+# -----------------------------------------------------------------------
+
+class TestCollectSurfaceflingerTimeline:
+
+    def test_returns_empty_when_no_data(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            result = collector.collect_surfaceflinger_timeline()
+
+        assert result == {}
+
+    def test_parses_frame_matches(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+
+        rows = [
+            _row(app_upid=10, app_vsync=1001, sf_upid=5, sf_vsync=2001),
+            _row(app_upid=10, app_vsync=1002, sf_upid=5, sf_vsync=2002),
+        ]
+        mock_tp.query.return_value = iter(rows)
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={"upid": 10}):
+            result = collector.collect_surfaceflinger_timeline()
+
+        assert len(result["frame_matches"]) == 2
+        assert result["frame_matches"][0]["app_vsync"] == 1001
+        assert result["frame_matches"][0]["sf_vsync"] == 2001
+
+    def test_includes_module(self):
+        collector = _make_collector()
+        mock_tp = MagicMock()
+        mock_tp.query.return_value = iter([])
+
+        with patch.object(collector, '_open', return_value=mock_tp), \
+             patch.object(collector, '_resolve_target_process', return_value={}):
+            collector.collect_surfaceflinger_timeline()
+
+        sql = mock_tp.query.call_args_list[0][0][0]
+        assert "INCLUDE PERFETTO MODULE android.surfaceflinger" in sql
