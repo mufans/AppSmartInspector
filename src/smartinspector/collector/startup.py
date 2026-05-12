@@ -477,3 +477,144 @@ class StartupAnalyzer:
         if "init" in name or "initialize" in name or "setup" in name:
             return "延迟初始化: 考虑将非关键组件移至后台线程初始化"
         return "检查是否可异步化或延迟执行"
+
+
+class StartupMixin:
+    """Mixin providing startup analysis using Perfetto stdlib.
+
+    Expects the host class to provide:
+      - ``self._open()`` -> TraceProcessor
+      - ``self._target_package`` (str | None) — target app package name
+    """
+
+    def collect_startup_metrics(self) -> list[dict]:
+        """Collect startup metrics (TTID/TTFD) for the target process.
+
+        Uses android.startup.startups and android.startup.time_to_display
+        stdlib modules to detect app startups and report Time To Initial
+        Display (TTID) and Time To Full Display (TTFD) metrics.
+
+        Returns a list of startup events sorted by timestamp, or an empty
+        list if no startup events are found in the trace.
+        """
+        tp = self._open()
+        target_pkg = getattr(self, "_target_package", None)
+
+        debug_log("startup", f"collect_startup_metrics: target_package={target_pkg}")
+        logger.info("Collecting startup metrics for %s", target_pkg or "all processes")
+
+        # --- Build WHERE clause for target process ---
+        where_package = ""
+        if target_pkg:
+            where_package = f"AND s.package GLOB '{target_pkg}'"
+
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.startup.startups;
+                INCLUDE PERFETTO MODULE android.startup.time_to_display;
+
+                SELECT
+                  s.startup_id,
+                  s.ts,
+                  s.dur / 1000000.0 AS startup_dur_ms,
+                  s.package,
+                  s.startup_type,
+                  ttd.time_to_initial_display / 1000000.0 AS ttid_ms,
+                  ttd.time_to_full_display / 1000000.0 AS ttfd_ms,
+                  ttd.upid
+                FROM android_startups s
+                LEFT JOIN android_startup_time_to_display ttd
+                  ON ttd.startup_id = s.startup_id
+                WHERE 1=1
+                  {where_package}
+                ORDER BY s.ts
+            """)
+        except Exception as e:
+            debug_log("startup", f"startup metrics query failed: {e}")
+            logger.debug("Startup metrics query failed: %s", e)
+            return []
+
+        startups: list[dict] = []
+        for r in rows:
+            entry = {
+                "startup_id": r.startup_id,
+                "ts_ns": r.ts,
+                "startup_dur_ms": round(r.startup_dur_ms, 3),
+                "package": r.package,
+                "startup_type": r.startup_type,
+                "ttid_ms": round(r.ttid_ms, 3) if r.ttid_ms is not None else None,
+                "ttfd_ms": round(r.ttfd_ms, 3) if r.ttfd_ms is not None else None,
+                "upid": r.upid,
+            }
+            startups.append(entry)
+
+        debug_log("startup", f"found {len(startups)} startup events")
+        logger.info("Startup metrics complete: %d startups", len(startups))
+        return startups
+
+    def collect_startup_breakdown(self) -> list[dict]:
+        """Collect startup bottleneck breakdown for the target process.
+
+        Uses android.startup.startup_breakdowns stdlib module to get
+        an opinionated breakdown of startup bottlenecks (binder, io, cpu,
+        lock, etc.) for each detected startup.
+
+        Returns a list of breakdown segments sorted by duration (descending),
+        limited to the top 50 segments. Returns an empty list if no startup
+        breakdown data is available in the trace.
+        """
+        tp = self._open()
+        target_pkg = getattr(self, "_target_package", None)
+
+        debug_log("startup", f"collect_startup_breakdown: target_package={target_pkg}")
+        logger.info("Collecting startup breakdown for %s", target_pkg or "all processes")
+
+        # --- Build WHERE clause for target process ---
+        where_package = ""
+        if target_pkg:
+            where_package = (
+                f"AND sb.startup_id IN ("
+                f"  SELECT startup_id FROM android_startups"
+                f"  WHERE package GLOB '{target_pkg}'"
+                f")"
+            )
+
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.startup.startups;
+                INCLUDE PERFETTO MODULE android.startup.startup_breakdowns;
+
+                SELECT
+                  sb.startup_id,
+                  sb.slice_id,
+                  sb.thread_state_id,
+                  sb.ts,
+                  sb.dur / 1000000.0 AS segment_dur_ms,
+                  sb.reason
+                FROM android_startup_opinionated_breakdown sb
+                WHERE sb.dur > 0
+                  AND sb.dur != -1
+                  {where_package}
+                ORDER BY sb.dur DESC
+                LIMIT 50
+            """)
+        except Exception as e:
+            debug_log("startup", f"startup breakdown query failed: {e}")
+            logger.debug("Startup breakdown query failed: %s", e)
+            return []
+
+        breakdown: list[dict] = []
+        for r in rows:
+            entry = {
+                "startup_id": r.startup_id,
+                "slice_id": r.slice_id,
+                "thread_state_id": r.thread_state_id,
+                "ts_ns": r.ts,
+                "segment_dur_ms": round(r.segment_dur_ms, 3),
+                "reason": r.reason,
+            }
+            breakdown.append(entry)
+
+        debug_log("startup", f"found {len(breakdown)} breakdown segments")
+        logger.info("Startup breakdown complete: %d segments", len(breakdown))
+        return breakdown
