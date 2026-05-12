@@ -63,6 +63,8 @@ def get_llm_kwargs(**overrides) -> dict:
     Returns a dict suitable for ChatOpenAI(**kwargs).
     Caller can add temperature, streaming, etc. via overrides.
     """
+    from smartinspector.debug_log import debug_log
+
     kwargs = {
         "model": get_model(overrides.pop("role", "default")),
         "base_url": get_base_url(),
@@ -71,7 +73,40 @@ def get_llm_kwargs(**overrides) -> dict:
     if api_key:
         kwargs["api_key"] = api_key
     kwargs.update(overrides)
+    # Inject LLM logging callbacks in debug mode
+    callbacks = get_llm_log_callbacks()
+    if callbacks and "callbacks" not in kwargs:
+        kwargs["callbacks"] = callbacks
     return kwargs
+
+
+class _LLMLogCallback(__import__("langchain_core.callbacks").callbacks.BaseCallbackHandler):
+    """LangChain callback handler that logs all LLM requests/responses to debug_log."""
+
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        from smartinspector.debug_log import debug_log
+        model = kwargs.get("invocation_params", {}).get("model_name", "unknown")
+        for i, p in enumerate(prompts or []):
+            debug_log("llm", f"[REQUEST] model={model} prompt#{i}:\n{p}")
+
+    def on_llm_end(self, response, **kwargs):
+        from smartinspector.debug_log import debug_log
+        generations = response.generations
+        for gen_list in generations:
+            for gen in gen_list:
+                text = getattr(gen, "text", "") or str(getattr(gen, "message", ""))
+                debug_log("llm", f"[RESPONSE] {text[:3000]}")
+
+    def on_llm_error(self, error, **kwargs):
+        from smartinspector.debug_log import info_log
+        info_log("llm", f"[ERROR] {error}")
+
+
+def get_llm_log_callbacks() -> list:
+    """Return LLM logging callbacks. Used by get_llm_kwargs when SI_DEBUG=1."""
+    if os.environ.get("SI_DEBUG"):
+        return [_LLMLogCallback()]
+    return []
 
 
 def model_info() -> str:

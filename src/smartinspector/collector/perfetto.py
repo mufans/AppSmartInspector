@@ -77,6 +77,19 @@ class PerfSummary:
     compose_slices: dict = field(default_factory=dict)
     sys_stats: dict = field(default_factory=dict)
     thread_state: list[dict] = field(default_factory=list)
+    # Stdlib modules (P0)
+    lock_contention: list[dict] = field(default_factory=list)
+    binder_txns: list[dict] = field(default_factory=list)
+    startup_metrics: dict = field(default_factory=dict)
+    gc_events: list[dict] = field(default_factory=list)
+    anrs: list[dict] = field(default_factory=list)
+    # Stdlib modules (P1)
+    slice_cpu_time: list[dict] = field(default_factory=list)
+    input_latency: list[dict] = field(default_factory=list)
+    sched_latency: list[dict] = field(default_factory=list)
+    oom_rss_swap: dict = field(default_factory=dict)
+    cpu_utilization: dict = field(default_factory=dict)
+    surfaceflinger_timeline: list[dict] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, ensure_ascii=False)
@@ -1587,6 +1600,904 @@ class PerfettoCollector:
             "slowest": sorted(slices, key=lambda x: -x["dur_ms"])[:20],
         }
 
+    # ------------------------------------------------------------------
+    # Stdlib module collection methods
+    # ------------------------------------------------------------------
+
+    def collect_lock_contention(self) -> dict:
+        """Collect monitor lock contention events using android.monitor_contention.
+
+        Uses the Perfetto stdlib android.monitor_contention module to extract
+        parsed lock contention slices with blocking/blocked method info.
+
+        Returns:
+            Dict with keys: total_count, main_thread_blocks, top_contentions,
+                            thread_state_breakdown (optional).
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_lock_contention: querying android_monitor_contention")
+
+        target = self._resolve_target_process()
+        upid_filter = ""
+        if target.get("upid") is not None:
+            upid_filter = f"WHERE upid = {target['upid']}"
+
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.monitor_contention;
+
+                SELECT
+                  id, ts, dur,
+                  blocked_method,
+                  blocking_method,
+                  short_blocked_method,
+                  short_blocking_method,
+                  blocked_src,
+                  blocking_src,
+                  waiter_count,
+                  blocked_thread_name,
+                  blocking_thread_name,
+                  blocked_utid,
+                  blocking_utid,
+                  is_blocked_thread_main,
+                  is_blocking_thread_main,
+                  upid,
+                  process_name
+                FROM android_monitor_contention
+                {upid_filter}
+                ORDER BY dur DESC
+                LIMIT 50
+            """)
+        except Exception as e:
+            debug_log("perfetto", f"lock_contention query failed: {e}")
+            return {}
+
+        contentions = []
+        main_thread_count = 0
+        for r in rows:
+            dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
+            entry = {
+                "blocked_method": r.blocked_method,
+                "blocking_method": r.blocking_method,
+                "short_blocked_method": r.short_blocked_method,
+                "short_blocking_method": r.short_blocking_method,
+                "blocked_src": r.blocked_src,
+                "blocking_src": r.blocking_src,
+                "waiter_count": r.waiter_count,
+                "blocked_thread": r.blocked_thread_name,
+                "blocking_thread": r.blocking_thread_name,
+                "dur_ms": dur_ms,
+                "ts_ns": r.ts,
+                "is_main_thread_blocked": bool(r.is_blocked_thread_main),
+            }
+            contentions.append(entry)
+            if r.is_blocked_thread_main:
+                main_thread_count += 1
+
+        if not contentions:
+            debug_log("perfetto", "lock_contention: no contention events found")
+            return {}
+
+        # Query thread state breakdown for top contentions
+        thread_state_breakdown: list[dict] = []
+        try:
+            ts_rows = tp.query("""
+                INCLUDE PERFETTO MODULE android.monitor_contention;
+
+                SELECT
+                  id,
+                  thread_state,
+                  thread_state_dur,
+                  thread_state_count
+                FROM android_monitor_contention_chain_thread_state_by_txn
+                LIMIT 100
+            """)
+            for r in ts_rows:
+                thread_state_breakdown.append({
+                    "contention_id": r.id,
+                    "thread_state": r.thread_state,
+                    "dur_ns": r.thread_state_dur,
+                    "count": r.thread_state_count,
+                })
+        except Exception as e:
+            debug_log("perfetto", f"lock_contention thread_state breakdown failed: {e}")
+
+        debug_log("perfetto", f"lock_contention: found {len(contentions)} events, {main_thread_count} main-thread blocks")
+
+        return {
+            "total_count": len(contentions),
+            "main_thread_blocks": main_thread_count,
+            "top_contentions": contentions[:20],
+            **({"thread_state_breakdown": thread_state_breakdown} if thread_state_breakdown else {}),
+        }
+
+    def collect_binder_txns(self) -> dict:
+        """Collect binder transaction data using android.binder module.
+
+        Returns:
+            Dict with keys: total_count, sync_count, main_thread_count,
+                            top_by_duration, metrics_by_process.
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_binder_txns: querying android_binder_txns")
+
+        target = self._resolve_target_process()
+        upid_filter_client = ""
+        upid_filter_server = ""
+        if target.get("upid") is not None:
+            upid = target["upid"]
+            upid_filter_client = f"WHERE client_upid = {upid}"
+            upid_filter_server = f"WHERE server_upid = {upid}"
+
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.binder;
+
+                SELECT
+                  binder_txn_id, binder_reply_id,
+                  aidl_name, interface, method_name,
+                  client_process, client_thread, client_upid, client_tid, client_pid,
+                  is_main_thread,
+                  client_ts, client_dur,
+                  server_process, server_thread, server_upid, server_tid, server_pid,
+                  server_ts, server_dur,
+                  is_sync,
+                  client_oom_score, server_oom_score
+                FROM android_binder_txns
+                {upid_filter_client or upid_filter_server}
+                ORDER BY client_dur DESC
+                LIMIT 50
+            """)
+        except Exception as e:
+            debug_log("perfetto", f"binder_txns query failed: {e}")
+            return {}
+
+        txns = []
+        sync_count = 0
+        main_thread_count = 0
+        for r in rows:
+            client_dur_ms = round(r.client_dur / 1e6, 2) if r.client_dur else 0
+            server_dur_ms = round(r.server_dur / 1e6, 2) if r.server_dur else 0
+            entry = {
+                "aidl_name": r.aidl_name,
+                "interface": r.interface,
+                "method_name": r.method_name,
+                "client_process": r.client_process,
+                "client_thread": r.client_thread,
+                "client_tid": r.client_tid,
+                "server_process": r.server_process,
+                "server_thread": r.server_thread,
+                "server_tid": r.server_tid,
+                "client_dur_ms": client_dur_ms,
+                "server_dur_ms": server_dur_ms,
+                "is_sync": bool(r.is_sync),
+                "is_main_thread": bool(r.is_main_thread),
+                "client_oom_score": r.client_oom_score,
+                "server_oom_score": r.server_oom_score,
+            }
+            txns.append(entry)
+            if r.is_sync:
+                sync_count += 1
+            if r.is_main_thread:
+                main_thread_count += 1
+
+        if not txns:
+            debug_log("perfetto", "binder_txns: no binder transactions found")
+            return {}
+
+        # Metrics by process
+        metrics_by_process: list[dict] = []
+        try:
+            mp_rows = tp.query("""
+                INCLUDE PERFETTO MODULE android.binder;
+
+                SELECT process_name, pid, slice_name, event_count
+                FROM android_binder_metrics_by_process
+                ORDER BY event_count DESC
+                LIMIT 20
+            """)
+            for r in mp_rows:
+                metrics_by_process.append({
+                    "process_name": r.process_name,
+                    "pid": r.pid,
+                    "slice_name": r.slice_name,
+                    "event_count": r.event_count,
+                })
+        except Exception as e:
+            debug_log("perfetto", f"binder metrics_by_process failed: {e}")
+
+        debug_log("perfetto", f"binder_txns: found {len(txns)} txns ({sync_count} sync, {main_thread_count} main-thread)")
+
+        return {
+            "total_count": len(txns),
+            "sync_count": sync_count,
+            "main_thread_count": main_thread_count,
+            "top_by_duration": txns[:20],
+            **({"metrics_by_process": metrics_by_process} if metrics_by_process else {}),
+        }
+
+    def collect_binder_breakdown(self) -> dict:
+        """Collect binder client/server breakdown using android.binder_breakdown.
+
+        Returns:
+            Dict with keys: server_breakdown, client_breakdown.
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_binder_breakdown: querying breakdown tables")
+
+        target = self._resolve_target_process()
+
+        server_breakdown: list[dict] = []
+        try:
+            sb_rows = tp.query("""
+                INCLUDE PERFETTO MODULE android.binder_breakdown;
+
+                SELECT binder_txn_id, binder_reply_id, ts, dur, reason
+                FROM android_binder_server_breakdown
+                ORDER BY dur DESC
+                LIMIT 50
+            """)
+            for r in sb_rows:
+                dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
+                server_breakdown.append({
+                    "binder_txn_id": r.binder_txn_id,
+                    "binder_reply_id": r.binder_reply_id,
+                    "ts_ns": r.ts,
+                    "dur_ms": dur_ms,
+                    "reason": r.reason,
+                })
+        except Exception as e:
+            debug_log("perfetto", f"binder_server_breakdown failed: {e}")
+
+        client_breakdown: list[dict] = []
+        try:
+            cb_rows = tp.query("""
+                INCLUDE PERFETTO MODULE android.binder_breakdown;
+
+                SELECT binder_txn_id, binder_reply_id, ts, dur, reason
+                FROM android_binder_client_breakdown
+                ORDER BY dur DESC
+                LIMIT 50
+            """)
+            for r in cb_rows:
+                dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
+                client_breakdown.append({
+                    "binder_txn_id": r.binder_txn_id,
+                    "binder_reply_id": r.binder_reply_id,
+                    "ts_ns": r.ts,
+                    "dur_ms": dur_ms,
+                    "reason": r.reason,
+                })
+        except Exception as e:
+            debug_log("perfetto", f"binder_client_breakdown failed: {e}")
+
+        if not server_breakdown and not client_breakdown:
+            debug_log("perfetto", "binder_breakdown: no breakdown data found")
+            return {}
+
+        return {
+            "server_breakdown": server_breakdown,
+            "client_breakdown": client_breakdown,
+        }
+
+    def collect_startup_metrics(self) -> dict:
+        """Collect app startup metrics using android.startup modules.
+
+        Uses android.startup.startups, startup_breakdowns, and time_to_display
+        to provide TTID, TTFD, and startup breakdown data.
+
+        Returns:
+            Dict with keys: startups, breakdowns, time_to_display.
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_startup_metrics: querying android.startup modules")
+
+        target = self._resolve_target_process()
+        package_filter = ""
+        if target.get("name"):
+            package_filter = f"WHERE package = '{target['name']}'"
+
+        # 1. Startup list
+        startups: list[dict] = []
+        try:
+            s_rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.startup.startups;
+
+                SELECT startup_id, ts, ts_end, dur, package, startup_type
+                FROM android_startups
+                {package_filter}
+                ORDER BY ts DESC
+                LIMIT 10
+            """)
+            for r in s_rows:
+                dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
+                startups.append({
+                    "startup_id": r.startup_id,
+                    "ts_ns": r.ts,
+                    "ts_end_ns": r.ts_end,
+                    "dur_ms": dur_ms,
+                    "package": r.package,
+                    "startup_type": r.startup_type,
+                })
+        except Exception as e:
+            debug_log("perfetto", f"startup startups query failed: {e}")
+
+        if not startups:
+            debug_log("perfetto", "startup_metrics: no startups found")
+            return {}
+
+        # 2. Time to display
+        time_to_display: list[dict] = []
+        try:
+            ttd_rows = tp.query("""
+                INCLUDE PERFETTO MODULE android.startup.time_to_display;
+
+                SELECT
+                  startup_id, time_to_initial_display, time_to_full_display,
+                  ttid_frame_id, ttfd_frame_id, upid
+                FROM android_startup_time_to_display
+            """)
+            for r in ttd_rows:
+                entry = {
+                    "startup_id": r.startup_id,
+                    "upid": r.upid,
+                }
+                if r.time_to_initial_display is not None:
+                    entry["ttid_ms"] = round(r.time_to_initial_display / 1e6, 2)
+                if r.time_to_full_display is not None:
+                    entry["ttfd_ms"] = round(r.time_to_full_display / 1e6, 2)
+                if r.ttid_frame_id is not None:
+                    entry["ttid_frame_id"] = r.ttid_frame_id
+                if r.ttfd_frame_id is not None:
+                    entry["ttfd_frame_id"] = r.ttfd_frame_id
+                time_to_display.append(entry)
+        except Exception as e:
+            debug_log("perfetto", f"startup time_to_display failed: {e}")
+
+        # 3. Startup breakdowns
+        breakdowns: list[dict] = []
+        try:
+            bd_rows = tp.query("""
+                INCLUDE PERFETTO MODULE android.startup.startup_breakdowns;
+
+                SELECT startup_id, slice_id, ts, dur, reason
+                FROM android_startup_opinionated_breakdown
+                ORDER BY dur DESC
+                LIMIT 50
+            """)
+            for r in bd_rows:
+                dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
+                breakdowns.append({
+                    "startup_id": r.startup_id,
+                    "slice_id": r.slice_id,
+                    "ts_ns": r.ts,
+                    "dur_ms": dur_ms,
+                    "reason": r.reason,
+                })
+        except Exception as e:
+            debug_log("perfetto", f"startup breakdowns failed: {e}")
+
+        debug_log("perfetto", f"startup_metrics: {len(startups)} startups, {len(time_to_display)} ttd, {len(breakdowns)} breakdowns")
+
+        return {
+            "startups": startups,
+            **({"time_to_display": time_to_display} if time_to_display else {}),
+            **({"breakdowns": breakdowns} if breakdowns else {}),
+        }
+
+    def collect_gc_events(self) -> dict:
+        """Collect garbage collection events using android.garbage_collection.
+
+        Returns:
+            Dict with keys: total_count, total_reclaimed_mb, events.
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_gc_events: querying android_garbage_collection_events")
+
+        target = self._resolve_target_process()
+        upid_filter = ""
+        if target.get("upid") is not None:
+            upid_filter = f"WHERE upid = {target['upid']}"
+
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.garbage_collection;
+
+                SELECT
+                  gc_id, gc_ts, gc_dur,
+                  gc_running_dur, gc_runnable_dur, gc_unint_io_dur, gc_unint_non_io_dur,
+                  gc_type, is_mark_compact,
+                  reclaimed_mb, min_heap_mb, max_heap_mb,
+                  tid, thread_name, process_name, upid
+                FROM android_garbage_collection_events
+                {upid_filter}
+                ORDER BY gc_dur DESC
+                LIMIT 50
+            """)
+        except Exception as e:
+            debug_log("perfetto", f"gc_events query failed: {e}")
+            return {}
+
+        events = []
+        total_reclaimed = 0.0
+        for r in rows:
+            dur_ms = round(r.gc_dur / 1e6, 2) if r.gc_dur else 0
+            running_ms = round(r.gc_running_dur / 1e6, 2) if r.gc_running_dur else 0
+            runnable_ms = round(r.gc_runnable_dur / 1e6, 2) if r.gc_runnable_dur else 0
+            unint_io_ms = round(r.gc_unint_io_dur / 1e6, 2) if r.gc_unint_io_dur else 0
+            unint_non_io_ms = round(r.gc_unint_non_io_dur / 1e6, 2) if r.gc_unint_non_io_dur else 0
+
+            reclaimed = r.reclaimed_mb or 0
+            total_reclaimed += reclaimed
+
+            events.append({
+                "gc_id": r.gc_id,
+                "gc_type": r.gc_type,
+                "is_mark_compact": bool(r.is_mark_compact),
+                "dur_ms": dur_ms,
+                "running_ms": running_ms,
+                "runnable_ms": runnable_ms,
+                "unint_io_ms": unint_io_ms,
+                "unint_non_io_ms": unint_non_io_ms,
+                "reclaimed_mb": round(reclaimed, 2),
+                "min_heap_mb": round(r.min_heap_mb, 2) if r.min_heap_mb else None,
+                "max_heap_mb": round(r.max_heap_mb, 2) if r.max_heap_mb else None,
+                "thread_name": r.thread_name,
+                "process_name": r.process_name,
+                "ts_ns": r.gc_ts,
+            })
+
+        if not events:
+            debug_log("perfetto", "gc_events: no GC events found")
+            return {}
+
+        debug_log("perfetto", f"gc_events: {len(events)} events, {total_reclaimed:.2f} MB reclaimed")
+
+        return {
+            "total_count": len(events),
+            "total_reclaimed_mb": round(total_reclaimed, 2),
+            "events": events,
+        }
+
+    def collect_anrs(self) -> dict:
+        """Collect ANR (Application Not Responding) events using android.anrs.
+
+        Returns:
+            Dict with keys: total_count, anrs.
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_anrs: querying android_anrs")
+
+        target = self._resolve_target_process()
+        upid_filter = ""
+        if target.get("upid") is not None:
+            upid_filter = f"WHERE upid = {target['upid']}"
+
+        try:
+            rows = tp.query(f"""
+                SELECT
+                  process_name, pid, upid,
+                  error_id, ts, subject,
+                  intent, component,
+                  timer_delay, anr_type,
+                  anr_dur_ms, default_anr_dur_ms
+                FROM android_anrs
+                {upid_filter}
+                ORDER BY ts DESC
+            """)
+        except Exception as e:
+            debug_log("perfetto", f"anrs query failed: {e}")
+            return {}
+
+        anrs = []
+        for r in rows:
+            entry = {
+                "process_name": r.process_name,
+                "pid": r.pid,
+                "error_id": r.error_id,
+                "ts_ns": r.ts,
+                "subject": r.subject,
+                "anr_type": r.anr_type,
+                **({"intent": r.intent} if r.intent else {}),
+                **({"component": r.component} if r.component else {}),
+            }
+            if r.anr_dur_ms is not None:
+                entry["anr_dur_ms"] = r.anr_dur_ms
+            if r.default_anr_dur_ms is not None:
+                entry["default_anr_dur_ms"] = r.default_anr_dur_ms
+            if r.timer_delay is not None:
+                entry["timer_delay"] = r.timer_delay
+            anrs.append(entry)
+
+        if not anrs:
+            debug_log("perfetto", "anrs: no ANR events found")
+            return {}
+
+        debug_log("perfetto", f"anrs: found {len(anrs)} ANR events")
+
+        return {
+            "total_count": len(anrs),
+            "anrs": anrs,
+        }
+
+    def collect_slice_cpu_time(self) -> dict:
+        """Collect per-slice CPU time using slices.cpu_time module.
+
+        Returns:
+            Dict with keys: slices (top by cpu_time), total_cpu_time_ms.
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_slice_cpu_time: querying thread_slice_cpu_time")
+
+        target = self._resolve_target_process()
+        upid_filter = ""
+        if target.get("upid") is not None:
+            upid_filter = f"WHERE upid = {target['upid']}"
+
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE slices.cpu_time;
+
+                SELECT
+                  id, name, utid, thread_name, upid, process_name, cpu_time
+                FROM thread_slice_cpu_time
+                {upid_filter}
+                ORDER BY cpu_time DESC
+                LIMIT 50
+            """)
+        except Exception as e:
+            debug_log("perfetto", f"slice_cpu_time query failed: {e}")
+            return {}
+
+        slices = []
+        total_cpu_ns = 0
+        for r in rows:
+            cpu_ms = round(r.cpu_time / 1e6, 2) if r.cpu_time else 0
+            total_cpu_ns += (r.cpu_time or 0)
+            slices.append({
+                "slice_id": r.id,
+                "name": r.name,
+                "thread_name": r.thread_name,
+                "process_name": r.process_name,
+                "cpu_time_ms": cpu_ms,
+            })
+
+        if not slices:
+            debug_log("perfetto", "slice_cpu_time: no data found")
+            return {}
+
+        debug_log("perfetto", f"slice_cpu_time: {len(slices)} slices, total {round(total_cpu_ns / 1e6, 2)} ms")
+
+        return {
+            "total_cpu_time_ms": round(total_cpu_ns / 1e6, 2),
+            "slices": slices,
+        }
+
+    def collect_input_latency(self) -> dict:
+        """Collect input event latency using android.input module.
+
+        Returns:
+            Dict with keys: total_count, events (with dispatch/handling/ack latency).
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_input_latency: querying android_input_events")
+
+        target = self._resolve_target_process()
+        pid_filter = ""
+        if target.get("pid") is not None:
+            pid_filter = f"WHERE pid = {target['pid']}"
+
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.input;
+
+                SELECT
+                  dispatch_latency_dur,
+                  handling_latency_dur,
+                  ack_latency_dur,
+                  total_latency_dur,
+                  end_to_end_latency_dur,
+                  tid, thread_name, pid, process_name,
+                  event_type, event_action, event_seq,
+                  event_channel, input_event_id,
+                  read_time, dispatch_ts, dispatch_dur,
+                  receive_ts, receive_dur,
+                  frame_id
+                FROM android_input_events
+                {pid_filter}
+                ORDER BY total_latency_dur DESC
+                LIMIT 50
+            """)
+        except Exception as e:
+            debug_log("perfetto", f"input_latency query failed: {e}")
+            return {}
+
+        events = []
+        for r in rows:
+            entry = {
+                "event_type": r.event_type,
+                "event_action": r.event_action,
+                "event_seq": r.event_seq,
+                "event_channel": r.event_channel,
+                "input_event_id": r.input_event_id,
+                "thread_name": r.thread_name,
+                "process_name": r.process_name,
+                "tid": r.tid,
+                "pid": r.pid,
+            }
+            if r.dispatch_latency_dur is not None:
+                entry["dispatch_latency_ms"] = round(r.dispatch_latency_dur / 1e6, 2)
+            if r.handling_latency_dur is not None:
+                entry["handling_latency_ms"] = round(r.handling_latency_dur / 1e6, 2)
+            if r.ack_latency_dur is not None:
+                entry["ack_latency_ms"] = round(r.ack_latency_dur / 1e6, 2)
+            if r.total_latency_dur is not None:
+                entry["total_latency_ms"] = round(r.total_latency_dur / 1e6, 2)
+            if r.end_to_end_latency_dur is not None:
+                entry["end_to_end_latency_ms"] = round(r.end_to_end_latency_dur / 1e6, 2)
+            if r.frame_id is not None:
+                entry["frame_id"] = r.frame_id
+            events.append(entry)
+
+        if not events:
+            debug_log("perfetto", "input_latency: no input events found")
+            return {}
+
+        debug_log("perfetto", f"input_latency: {len(events)} events found")
+
+        return {
+            "total_count": len(events),
+            "events": events,
+        }
+
+    def collect_sched_latency(self) -> dict:
+        """Collect scheduling latency data using sched.latency module.
+
+        Returns:
+            Dict with keys: total_count, top_latency (longest runnable-to-running delays).
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_sched_latency: querying sched_latency_for_running_interval")
+
+        target = self._resolve_target_process()
+
+        try:
+            rows = tp.query("""
+                INCLUDE PERFETTO MODULE sched.latency;
+
+                SELECT
+                  thread_state_id, sched_id, utid,
+                  runnable_latency_id, latency_dur
+                FROM sched_latency_for_running_interval
+                ORDER BY latency_dur DESC
+                LIMIT 50
+            """)
+        except Exception as e:
+            debug_log("perfetto", f"sched_latency query failed: {e}")
+            return {}
+
+        entries = []
+        for r in rows:
+            latency_ms = round(r.latency_dur / 1e6, 2) if r.latency_dur else 0
+            entries.append({
+                "thread_state_id": r.thread_state_id,
+                "sched_id": r.sched_id,
+                "utid": r.utid,
+                "runnable_latency_id": r.runnable_latency_id,
+                "latency_ms": latency_ms,
+            })
+
+        if not entries:
+            debug_log("perfetto", "sched_latency: no latency data found")
+            return {}
+
+        # Filter by target process if available
+        if target.get("upid") is not None:
+            try:
+                utid_rows = tp.query(f"""
+                    SELECT utid FROM thread WHERE utid IN (
+                        SELECT utid FROM {",".join(str(e["utid"]) for e in entries[:50])}
+                    )
+                    """)
+            except Exception:
+                pass
+
+        debug_log("perfetto", f"sched_latency: {len(entries)} entries, top latency {entries[0]['latency_ms'] if entries else 0} ms")
+
+        return {
+            "total_count": len(entries),
+            "top_latency": entries,
+        }
+
+    def collect_oom_rss_swap(self) -> dict:
+        """Collect OOM score, RSS, and swap per process using android.memory.process.
+
+        Also collects LMK events from android.memory.lmk.
+
+        Returns:
+            Dict with keys: memory_transitions (per-process OOM + RSS + swap),
+                            lmk_events (low-memory kills).
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_oom_rss_swap: querying memory_oom_score_with_rss_and_swap_per_process")
+
+        target = self._resolve_target_process()
+        upid_filter = ""
+        if target.get("upid") is not None:
+            upid_filter = f"WHERE upid = {target['upid']}"
+
+        # 1. Memory + OOM transitions
+        transitions: list[dict] = []
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.memory.process;
+
+                SELECT
+                  ts, dur, score, bucket,
+                  upid, process_name, pid,
+                  anon_rss, file_rss, shmem_rss, rss,
+                  swap, anon_rss_and_swap, rss_and_swap,
+                  oom_adj_reason
+                FROM memory_oom_score_with_rss_and_swap_per_process
+                {upid_filter}
+                ORDER BY ts ASC
+                LIMIT 100
+            """)
+            for r in rows:
+                dur_ms = round(r.dur / 1e6, 2) if r.dur else 0
+                transitions.append({
+                    "ts_ns": r.ts,
+                    "dur_ms": dur_ms,
+                    "oom_score": r.score,
+                    "oom_bucket": r.bucket,
+                    "process_name": r.process_name,
+                    "pid": r.pid,
+                    "anon_rss_kb": r.anon_rss,
+                    "file_rss_kb": r.file_rss,
+                    "shmem_rss_kb": r.shmem_rss,
+                    "rss_kb": r.rss,
+                    "swap_kb": r.swap,
+                    "anon_rss_and_swap_kb": r.anon_rss_and_swap,
+                    "rss_and_swap_kb": r.rss_and_swap,
+                    **({"oom_adj_reason": r.oom_adj_reason} if r.oom_adj_reason else {}),
+                })
+        except Exception as e:
+            debug_log("perfetto", f"oom_rss_swap query failed: {e}")
+
+        # 2. LMK events
+        lmk_events: list[dict] = []
+        try:
+            lmk_rows = tp.query("""
+                INCLUDE PERFETTO MODULE android.memory.lmk;
+
+                SELECT ts, upid, pid, process_name, oom_score_adj, kill_reason
+                FROM android_lmk_events
+                ORDER BY ts DESC
+                LIMIT 20
+            """)
+            for r in lmk_rows:
+                lmk_events.append({
+                    "ts_ns": r.ts,
+                    "upid": r.upid,
+                    "pid": r.pid,
+                    "process_name": r.process_name,
+                    "oom_score_adj": r.oom_score_adj,
+                    "kill_reason": r.kill_reason,
+                })
+        except Exception as e:
+            debug_log("perfetto", f"lmk_events query failed: {e}")
+
+        if not transitions and not lmk_events:
+            debug_log("perfetto", "oom_rss_swap: no data found")
+            return {}
+
+        debug_log("perfetto", f"oom_rss_swap: {len(transitions)} transitions, {len(lmk_events)} LMK events")
+
+        return {
+            **({"memory_transitions": transitions} if transitions else {}),
+            **({"lmk_events": lmk_events} if lmk_events else {}),
+        }
+
+    def collect_cpu_utilization(self) -> dict:
+        """Collect CPU utilization per process using linux.cpu.utilization.
+
+        Returns:
+            Dict with keys: processes (cpu cycles, runtime, freq stats).
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_cpu_utilization: querying cpu_cycles_per_process")
+
+        target = self._resolve_target_process()
+
+        try:
+            rows = tp.query("""
+                INCLUDE PERFETTO MODULE linux.cpu.utilization.process;
+
+                SELECT upid, millicycles, megacycles, runtime, min_freq, max_freq, avg_freq
+                FROM cpu_cycles_per_process
+                ORDER BY megacycles DESC
+                LIMIT 20
+            """)
+        except Exception as e:
+            debug_log("perfetto", f"cpu_utilization query failed: {e}")
+            return {}
+
+        processes = []
+        for r in rows:
+            runtime_ms = round(r.runtime / 1e6, 2) if r.runtime else 0
+            entry = {
+                "upid": r.upid,
+                "millicycles": r.millicycles,
+                "megacycles": r.megacycles,
+                "runtime_ms": runtime_ms,
+                "min_freq_khz": r.min_freq,
+                "max_freq_khz": r.max_freq,
+                "avg_freq_khz": r.avg_freq,
+            }
+            # Filter to target process if set
+            if target.get("upid") is not None and r.upid != target["upid"]:
+                continue
+            processes.append(entry)
+
+        if not processes:
+            debug_log("perfetto", "cpu_utilization: no data found")
+            return {}
+
+        debug_log("perfetto", f"cpu_utilization: {len(processes)} processes")
+
+        return {
+            "processes": processes,
+        }
+
+    def collect_surfaceflinger_timeline(self) -> dict:
+        """Collect SurfaceFlinger frame timeline using android.surfaceflinger.
+
+        Matches app-side frame timeline with SurfaceFlinger-side vsync data.
+
+        Returns:
+            Dict with keys: frame_matches (app_vsync -> sf_vsync mapping).
+        """
+        tp = self._open()
+        info_log("perfetto", "collect_surfaceflinger_timeline: querying android_app_to_sf_frame_timeline_match")
+
+        target = self._resolve_target_process()
+        upid_filter = ""
+        if target.get("upid") is not None:
+            upid_filter = f"WHERE app_upid = {target['upid']}"
+
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.surfaceflinger;
+
+                SELECT app_upid, app_vsync, sf_upid, sf_vsync
+                FROM android_app_to_sf_frame_timeline_match
+                {upid_filter}
+                ORDER BY app_vsync DESC
+                LIMIT 100
+            """)
+        except Exception as e:
+            debug_log("perfetto", f"surfaceflinger_timeline query failed: {e}")
+            return {}
+
+        matches = []
+        for r in rows:
+            matches.append({
+                "app_upid": r.app_upid,
+                "app_vsync": r.app_vsync,
+                "sf_upid": r.sf_upid,
+                "sf_vsync": r.sf_vsync,
+            })
+
+        if not matches:
+            debug_log("perfetto", "surfaceflinger_timeline: no frame matches found")
+            return {}
+
+        debug_log("perfetto", f"surfaceflinger_timeline: {len(matches)} frame matches")
+
+        return {
+            "frame_matches": matches,
+        }
+
     def summarize(self) -> PerfSummary:
         """Run all analyses and return a unified summary."""
         summary = PerfSummary()
@@ -1723,6 +2634,76 @@ class PerfettoCollector:
         except Exception as e:
             debug_log("perfetto", f"thread_state collection failed: {e}")
 
+        # --- Stdlib modules (P0) ---
+
+        # Lock contention (android.monitor_contention)
+        try:
+            summary.lock_contention = self.collect_lock_contention()
+        except Exception as e:
+            debug_log("perfetto", f"lock_contention failed: {e}")
+
+        # Binder transactions (android.binder)
+        try:
+            summary.binder_txns = self.collect_binder_txns()
+        except Exception as e:
+            debug_log("perfetto", f"binder_txns failed: {e}")
+
+        # Startup metrics TTID/TTFD (android.startup.*)
+        try:
+            summary.startup_metrics = self.collect_startup_metrics()
+        except Exception as e:
+            debug_log("perfetto", f"startup_metrics failed: {e}")
+
+        # GC events (android.garbage_collection)
+        try:
+            summary.gc_events = self.collect_gc_events()
+        except Exception as e:
+            debug_log("perfetto", f"gc_events failed: {e}")
+
+        # ANR detection (android.anrs)
+        try:
+            summary.anrs = self.collect_anrs()
+        except Exception as e:
+            debug_log("perfetto", f"anrs failed: {e}")
+
+        # --- Stdlib modules (P1) ---
+
+        # Slice CPU time (slices.cpu_time)
+        try:
+            summary.slice_cpu_time = self.collect_slice_cpu_time()
+        except Exception as e:
+            debug_log("perfetto", f"slice_cpu_time failed: {e}")
+
+        # Input latency breakdown (android.input)
+        try:
+            summary.input_latency = self.collect_input_latency()
+        except Exception as e:
+            debug_log("perfetto", f"input_latency failed: {e}")
+
+        # Scheduling latency (sched.latency)
+        try:
+            summary.sched_latency = self.collect_sched_latency()
+        except Exception as e:
+            debug_log("perfetto", f"sched_latency failed: {e}")
+
+        # OOM + RSS/Swap (android.memory.process + android.memory.lmk)
+        try:
+            summary.oom_rss_swap = self.collect_oom_rss_swap()
+        except Exception as e:
+            debug_log("perfetto", f"oom_rss_swap failed: {e}")
+
+        # CPU utilization (linux.cpu.utilization)
+        try:
+            summary.cpu_utilization = self.collect_cpu_utilization()
+        except Exception as e:
+            debug_log("perfetto", f"cpu_utilization failed: {e}")
+
+        # SurfaceFlinger frame timeline (android.surfaceflinger)
+        try:
+            summary.surfaceflinger_timeline = self.collect_surfaceflinger_timeline()
+        except Exception as e:
+            debug_log("perfetto", f"surfaceflinger_timeline failed: {e}")
+
         return summary
 
     @staticmethod
@@ -1731,7 +2712,7 @@ class PerfettoCollector:
         duration_ms: int = 10000,
         categories: list[str] | None = None,
         target_process: str | None = None,
-        buffer_size_kb: int = 65536,
+        buffer_size_kb: int = 131072,
         cpu_sampling_interval_ms: int = 1,
         collect_cpu_callstacks: bool = True,
         collect_java_heap: bool = True,
@@ -1762,37 +2743,86 @@ class PerfettoCollector:
 
         device_path = "/data/misc/perfetto-traces/smartinspector_trace.pb"
 
+        # Atrace categories covering P0/P1 stdlib modules:
+        #   sched/freq/idle/power/memreclaim — CPU scheduling, freq, memory reclaim
+        #   gfx/view/input — UI rendering, view system, input events
+        #   dalvik — GC events, monitor contention lock stacks
+        #   am/wm — Activity/Window Manager (startup, ANR)
+        #   adb — ADB command traces
+        #   binder_driver — binder transaction details (P0: binder analysis)
+        #   lock_dep — lock dependency traces (P0: lock contention)
         default_categories = [
             "sched", "freq", "idle", "power", "memreclaim",
             "gfx", "view", "input", "dalvik", "am", "wm",
+            "adb", "binder_driver", "lock_dep",
         ]
-        cats = ",".join(categories or default_categories)
+        cat_list = categories or default_categories
+        # Build separate atrace_categories lines (protobuf repeated string
+        # requires one entry per line, not comma-separated).
+        atrace_cat_lines = "\n".join(
+            '      atrace_categories: "' + c + '"' for c in cat_list
+        )
+        cats = ",".join(cat_list)  # still used by Strategy 3 CLI fallback
 
         # Build Perfetto textproto config
+        # Data source → analysis module mapping:
+        #   linux.ftrace (sched_switch, sched_wakeup, sched_blocked_reason)
+        #     → sched, thread_state, sched.latency (P1), slices.cpu_time (P1)
+        #   linux.ftrace (cpu_frequency, cpu_idle)
+        #     → cpu_hotspots, linux.cpu.utilization.process (P1)
+        #   linux.ftrace (binder/binder_transaction, binder/binder_transaction_received,
+        #                 binder/binder_lock, binder/binder_unlock)
+        #     → android.binder (P0), android.binder_breakdown (P0)
+        #   linux.ftrace (kmem/mm_vmscan_direct_reclaim_end)
+        #     → android.memory.lmk (P1: LMK context)
+        #   linux.ftrace (atrace: binder_driver, lock_dep, dalvik)
+        #     → android.monitor_contention (P0), android.garbage_collection (P0)
+        #   linux.process_stats (proc_stats_poll_ms: 1000)
+        #     → android.memory.process (P1: OOM+RSS)
+        #   linux.sys_stats
+        #     → cpu_usage, sys_stats
+        #   android.log
+        #     → block_events (SIBlock logcat), general diagnostics
+        #   android.surfaceflinger.frametimeline
+        #     → frame_timeline, android.surfaceflinger (P1: SF timeline)
+        #   android.input.inputevent
+        #     → android.input (P1: input latency)
         config_lines = [
             f"duration_ms: {duration_ms}",
             f"buffers: {{ size_kb: {buffer_size_kb} fill_policy: DISCARD }}",
             "buffers: { size_kb: 4096 fill_policy: DISCARD }",
             "",
-            "# Ftrace: scheduling + power + atrace",
+            "# Ftrace: scheduling + power + binder + atrace",
             "data_sources: {",
             "  config {",
             '    name: "linux.ftrace"',
             "    ftrace_config {",
+            "# Task lifecycle events",
             '      ftrace_events: "sched/sched_process_exit"',
             '      ftrace_events: "sched/sched_process_free"',
             '      ftrace_events: "task/task_newtask"',
             '      ftrace_events: "task/task_rename"',
+            '      ftrace_events: "sched/sched_process_exec"',
+            "# Scheduling events — required for sched, thread_state, sched.latency (P1)",
             '      ftrace_events: "sched/sched_switch"',
-            '      ftrace_events: "power/suspend_resume"',
             '      ftrace_events: "sched/sched_blocked_reason"',
             '      ftrace_events: "sched/sched_wakeup"',
             '      ftrace_events: "sched/sched_wakeup_new"',
             '      ftrace_events: "sched/sched_waking"',
+            "# Power events — required for cpu frequency, linux.cpu.utilization (P1)",
+            '      ftrace_events: "power/suspend_resume"',
             '      ftrace_events: "power/cpu_frequency"',
             '      ftrace_events: "power/cpu_idle"',
+            "# Binder ftrace — required for android.binder (P0), binder_breakdown (P0)",
+            '      ftrace_events: "binder/binder_transaction"',
+            '      ftrace_events: "binder/binder_transaction_received"',
+            '      ftrace_events: "binder/binder_lock"',
+            '      ftrace_events: "binder/binder_unlock"',
+            "# Memory reclaim — provides context for android.memory.lmk (P1)",
+            '      ftrace_events: "kmem/mm_vmscan_direct_reclaim_end"',
+            "# Generic print + atrace",
             '      ftrace_events: "ftrace/print"',
-            f'      atrace_categories: "{cats}"',
+            atrace_cat_lines,
             '      atrace_apps: "*"',
             "      symbolize_ksyms: true",
             "      disable_generic_events: true",
@@ -1800,13 +2830,13 @@ class PerfettoCollector:
             "  }",
             "}",
             "",
-            "# Process stats for names, grouping, and memory (RSS/PSS)",
+            "# Process stats — proc_stats_poll_ms: 1000 for finer memory granularity (P1: OOM+RSS)",
             "data_sources: {",
             "  config {",
             '    name: "linux.process_stats"',
             "    process_stats_config {",
             "      scan_all_processes_on_start: true",
-            "      proc_stats_poll_ms: 2000",
+            "      proc_stats_poll_ms: 1000",
             "    }",
             "  }",
             "}",
@@ -1831,10 +2861,17 @@ class PerfettoCollector:
             "  }",
             "}",
             "",
-            "# Frame timeline from SurfaceFlinger",
+            "# Frame timeline from SurfaceFlinger (frame_timeline, P1: SF timeline)",
             "data_sources: {",
             "  config {",
             '    name: "android.surfaceflinger.frametimeline"',
+            "  }",
+            "}",
+            "",
+            "# Input event latency — required for android.input (P1: input latency)",
+            "data_sources: {",
+            "  config {",
+            '    name: "android.input.inputevent"',
             "  }",
             "}",
         ]
@@ -1881,6 +2918,7 @@ class PerfettoCollector:
             ]
 
         config_text = "\n".join(config_lines)
+        debug_log("collector", f"Perfetto textproto config:\n{config_text}")
 
         # --- P1-6 + P1-7: Trace collection with SELinux fallback and auto-degradation ---
         timeout_sec = duration_ms // 1000 + 30
@@ -1893,8 +2931,10 @@ class PerfettoCollector:
                 import threading
                 import time
 
+                adb_cmd = ["adb", "shell", f"perfetto -c - --txt -o {device_path}"]
+                debug_log("collector", f"Perfetto adb command: {' '.join(adb_cmd)}")
                 proc = subprocess.Popen(
-                    ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
+                    adb_cmd,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -1964,8 +3004,10 @@ class PerfettoCollector:
                 if callback_error:
                     info_log("perfetto", f"WARNING: Trace collected but on_record_start had errors: {callback_error}")
             else:
+                adb_cmd = ["adb", "shell", f"perfetto -c - --txt -o {device_path}"]
+                debug_log("collector", f"Perfetto adb command: {' '.join(adb_cmd)}")
                 subprocess.run(
-                    ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
+                    adb_cmd,
                     input=config_text,
                     check=True, capture_output=True, text=True,
                     timeout=timeout_sec,
@@ -1983,6 +3025,7 @@ class PerfettoCollector:
             # Strategy 2: P1-6 SELinux fallback — push config file, use cat pipe
             try:
                 config_device_path = "/data/local/tmp/si_perfetto_config.pbtx"
+                debug_log("collector", f"Perfetto Strategy 2: adb push config -> cat pipe")
                 # Push config text to device
                 subprocess.run(
                     ["adb", "push", "/dev/stdin", config_device_path],
@@ -1991,8 +3034,10 @@ class PerfettoCollector:
                     timeout=10,
                 )
                 # Use cat pipe to bypass SELinux restrictions
+                adb_cmd_s2 = f"cat {config_device_path} | perfetto -c - --txt -o {device_path}"
+                debug_log("collector", f"Perfetto adb command: adb shell {adb_cmd_s2}")
                 subprocess.run(
-                    ["adb", "shell", f"cat {config_device_path} | perfetto -c - --txt -o {device_path}"],
+                    ["adb", "shell", adb_cmd_s2],
                     check=True, capture_output=True, text=True,
                     timeout=timeout_sec,
                 )
@@ -2023,6 +3068,7 @@ class PerfettoCollector:
                     )
                     if target_process:
                         cmdline += f" --target-cmdline={target_process}"
+                    debug_log("collector", f"Perfetto Strategy 3 adb command: adb shell {cmdline}")
                     subprocess.run(
                         ["adb", "shell", cmdline],
                         check=True, capture_output=True, text=True,

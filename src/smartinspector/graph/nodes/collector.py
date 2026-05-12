@@ -4,6 +4,12 @@ import json
 import os
 import subprocess
 
+# Module-level trace path for headless/CI mode.
+# LangGraph's state merge may lose _trace_path between orchestrator → collector
+# when using MemorySaver checkpoint (observed with LangGraph 1.1.3).
+# The headless runner sets this before invoking the graph.
+_headless_trace_path: str = ""
+
 from langchain_core.messages import AIMessage
 
 from smartinspector.debug_log import debug_log, info_log
@@ -238,62 +244,65 @@ def collector_node(state: AgentState) -> dict:
     skip_wait = state.get("skip_wait", False)
     info_log("collector", f"Starting trace collection (route={route})...")
 
-    # Cold start auto ADB launch: force-stop before trace, launch after
-    cold_start_target = None
-    if is_startup:
-        pc_pre = _read_perfetto_config()
-        cold_start_target = (
-            state.get("trace_target_process")
-            or pc_pre.get("target_process", "")
-            or None
-        )
-        if cold_start_target:
-            if _check_adb_available():
-                info_log("collector", f"Cold start mode: force-stopping {cold_start_target}")
-                _adb_force_stop(cold_start_target)
-            else:
-                info_log("collector",
-                    "WARNING: adb not found in PATH, skipping cold start auto-launch. "
-                    "Manually stop the app before tracing for best results."
-                )
-                cold_start_target = None  # Disable auto-launch
-        else:
-            info_log("collector", "WARNING: Cold start mode but no --target specified, skipping auto ADB launch")
+    # Check for pre-existing trace file early (skip WS wait + device collection)
+    # Fallback to module-level var for headless mode (LangGraph state merge issue)
+    preloaded_trace = state.get("_trace_path", "") or _headless_trace_path
 
-    # Notify app to ensure hooks are ready before collecting
-    if skip_wait:
-        info_log("collector", "--no-wait: skipping app connection wait, starting trace immediately")
-    else:
-        try:
-            from smartinspector.ws.server import SIServer
-            server = SIServer.get()
-            if server.has_connections():
-                info_log("collector", "Sending start_trace, waiting for hook ACK...")
-                ack_ok = server.send_start_trace(timeout=5.0)
-                if ack_ok:
-                    info_log("collector", "Hook ACK received, hooks ready")
+    if not (preloaded_trace and os.path.isfile(preloaded_trace)):
+        # Cold start auto ADB launch: force-stop before trace, launch after
+        cold_start_target = None
+        if is_startup:
+            pc_pre = _read_perfetto_config()
+            cold_start_target = (
+                state.get("trace_target_process")
+                or pc_pre.get("target_process", "")
+                or None
+            )
+            if cold_start_target:
+                if _check_adb_available():
+                    info_log("collector", f"Cold start mode: force-stopping {cold_start_target}")
+                    _adb_force_stop(cold_start_target)
                 else:
-                    info_log("collector", "WARNING: Hook ACK timeout, proceeding anyway")
-            elif server.is_running():
-                info_log("collector", "No app connected, waiting for app to connect...")
-                connected = server.wait_for_connection(timeout=30.0)
-                if connected:
-                    info_log("collector", "App connected, sending start_trace...")
+                    info_log("collector",
+                        "WARNING: adb not found in PATH, skipping cold start auto-launch. "
+                        "Manually stop the app before tracing for best results."
+                    )
+                    cold_start_target = None  # Disable auto-launch
+            else:
+                info_log("collector", "WARNING: Cold start mode but no --target specified, skipping auto ADB launch")
+
+        # Notify app to ensure hooks are ready before collecting
+        if skip_wait:
+            info_log("collector", "--no-wait: skipping app connection wait, starting trace immediately")
+        else:
+            try:
+                from smartinspector.ws.server import SIServer
+                server = SIServer.get()
+                if server.has_connections():
+                    info_log("collector", "Sending start_trace, waiting for hook ACK...")
                     ack_ok = server.send_start_trace(timeout=5.0)
                     if ack_ok:
                         info_log("collector", "Hook ACK received, hooks ready")
                     else:
                         info_log("collector", "WARNING: Hook ACK timeout, proceeding anyway")
+                elif server.is_running():
+                    info_log("collector", "No app connected, waiting for app to connect...")
+                    connected = server.wait_for_connection(timeout=30.0)
+                    if connected:
+                        info_log("collector", "App connected, sending start_trace...")
+                        ack_ok = server.send_start_trace(timeout=5.0)
+                        if ack_ok:
+                            info_log("collector", "Hook ACK received, hooks ready")
+                        else:
+                            info_log("collector", "WARNING: Hook ACK timeout, proceeding anyway")
+                    else:
+                        info_log("collector", "WARNING: App connection timeout, proceeding without hook readiness check")
                 else:
-                    info_log("collector", "WARNING: App connection timeout, proceeding without hook readiness check")
-            else:
-                info_log("collector", "WS server not running, proceeding without hook readiness check")
-        except Exception as e:
-            info_log("collector", f"WARNING: start_trace ACK failed: {e}")
+                    info_log("collector", "WS server not running, proceeding without hook readiness check")
+            except Exception as e:
+                info_log("collector", f"WARNING: start_trace ACK failed: {e}")
 
     try:
-        # Check for pre-existing trace file (skip device collection)
-        preloaded_trace = state.get("_trace_path", "")
         if preloaded_trace and os.path.isfile(preloaded_trace):
             info_log("collector", f"Pre-loaded trace file: {preloaded_trace} (skipping device collection)")
             trace_path = preloaded_trace
