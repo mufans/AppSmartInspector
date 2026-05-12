@@ -5,5 +5,6 @@ from smartinspector.collector.lock import LockMixin
 from smartinspector.collector.binder import BinderMixin
 from smartinspector.collector.startup import StartupMixin
 from smartinspector.collector.gc import GcMixin
+from smartinspector.collector.anr import AnrMixin
 
-__all__ = ["PerfettoCollector", "PerfSummary", "LockMixin", "BinderMixin", "StartupMixin", "GcMixin"]
+__all__ = ["PerfettoCollector", "PerfSummary", "LockMixin", "BinderMixin", "StartupMixin", "GcMixin", "AnrMixin"]
