@@ -19,7 +19,7 @@ src/smartinspector/          # Main Python package (installed via hatchling)
     device.py                #   /devices, /connect, /status, /disconnect
     session.py               #   /help, /clear, /summary, /tokens
   collector/                 # Perfetto trace collection & SQL analysis
-    perfetto.py              #   PerfettoCollector — 14 collect_*() methods (incl. collect_io_slices)
+    perfetto.py              #   PerfettoCollector — 25 collect_*() methods (incl. collect_io_slices, stdlib modules)
     startup.py               #   StartupAnalyzer — cold start phase splitting & bottleneck ID
   graph/                     # LangGraph orchestration
     nodes/                   #   Graph nodes (orchestrator, collector, attributor, reporter, ...)
@@ -345,6 +345,18 @@ Each `collect_*()` method queries Perfetto SQL tables and returns structured dat
 | `collect_io_slices()` | IO-related slices (net/db/img) | `slice` |
 | `collect_input_events()` | Touch/input event data | `slice` |
 | `collect_block_events()` | SI$block slices merged with logcat SIBlock stack traces | `slice`, `android_logs` |
+| `collect_lock_contention()` | Monitor lock contention (blocked/blocking method, waiter count) | `android.monitor_contention` |
+| `collect_binder_txns()` | Binder transactions (AIDL name, client/server duration, sync/async) | `android.binder` |
+| `collect_binder_breakdown()` | Binder client/server breakdown by reason | `android.binder_breakdown` |
+| `collect_startup_metrics()` | Startup TTID/TTFD and opinionated breakdown | `android.startup.startups`, `android.startup.time_to_display`, `android.startup.startup_breakdowns` |
+| `collect_gc_events()` | GC events (type, duration, reclaimed MB, heap size) | `android.garbage_collection` |
+| `collect_anrs()` | ANR events (subject, component, ANR type, duration) | `android.anrs` |
+| `collect_slice_cpu_time()` | Per-slice CPU time ranking | `slices.cpu_time` |
+| `collect_input_latency()` | Input event latency breakdown (dispatch/handling/ack/total) | `android.input` |
+| `collect_sched_latency()` | Scheduling latency (runnable→running delay) | `sched.latency` |
+| `collect_oom_rss_swap()` | OOM score transitions + RSS/Swap per process + LMK events | `android.memory.process`, `android.memory.lmk` |
+| `collect_cpu_utilization()` | CPU cycles, runtime, frequency stats per process | `linux.cpu.utilization.process` |
+| `collect_surfaceflinger_timeline()` | App↔SF frame timeline match (vsync mapping) | `android.surfaceflinger` |
 
 **Note on `collect_thread_state`**: Currently uses `sched` table overlap calculation. Planned upgrade to use `__intrinsic_thread_state` table for `blocked_function`, `waker_utid`, and `io_wait` data (see `docs/thread-state-blocking-analysis-design.md`).
 
