@@ -2712,7 +2712,7 @@ class PerfettoCollector:
         duration_ms: int = 10000,
         categories: list[str] | None = None,
         target_process: str | None = None,
-        buffer_size_kb: int = 65536,
+        buffer_size_kb: int = 131072,
         cpu_sampling_interval_ms: int = 1,
         collect_cpu_callstacks: bool = True,
         collect_java_heap: bool = True,
@@ -2743,35 +2743,78 @@ class PerfettoCollector:
 
         device_path = "/data/misc/perfetto-traces/smartinspector_trace.pb"
 
+        # Atrace categories covering P0/P1 stdlib modules:
+        #   sched/freq/idle/power/memreclaim — CPU scheduling, freq, memory reclaim
+        #   gfx/view/input — UI rendering, view system, input events
+        #   dalvik — GC events, monitor contention lock stacks
+        #   am/wm — Activity/Window Manager (startup, ANR)
+        #   adb — ADB command traces
+        #   binder_driver — binder transaction details (P0: binder analysis)
+        #   lock_dep — lock dependency traces (P0: lock contention)
         default_categories = [
             "sched", "freq", "idle", "power", "memreclaim",
             "gfx", "view", "input", "dalvik", "am", "wm",
+            "adb", "binder_driver", "lock_dep",
         ]
         cats = ",".join(categories or default_categories)
 
         # Build Perfetto textproto config
+        # Data source → analysis module mapping:
+        #   linux.ftrace (sched_switch, sched_wakeup, sched_blocked_reason)
+        #     → sched, thread_state, sched.latency (P1), slices.cpu_time (P1)
+        #   linux.ftrace (cpu_frequency, cpu_idle)
+        #     → cpu_hotspots, linux.cpu.utilization.process (P1)
+        #   linux.ftrace (binder/binder_transaction, binder/binder_transaction_received,
+        #                 binder/binder_lock, binder/binder_unlock)
+        #     → android.binder (P0), android.binder_breakdown (P0)
+        #   linux.ftrace (kmem/mm_vmscan_direct_reclaim_end)
+        #     → android.memory.lmk (P1: LMK context)
+        #   linux.ftrace (atrace: binder_driver, lock_dep, dalvik)
+        #     → android.monitor_contention (P0), android.garbage_collection (P0)
+        #   linux.process_stats (proc_stats_poll_ms: 1000)
+        #     → android.memory.process (P1: OOM+RSS)
+        #   linux.sys_stats
+        #     → cpu_usage, sys_stats
+        #   android.log
+        #     → block_events (SIBlock logcat), general diagnostics
+        #   android.surfaceflinger.frametimeline
+        #     → frame_timeline, android.surfaceflinger (P1: SF timeline)
+        #   android.input.inputevent
+        #     → android.input (P1: input latency)
         config_lines = [
             f"duration_ms: {duration_ms}",
             f"buffers: {{ size_kb: {buffer_size_kb} fill_policy: DISCARD }}",
             "buffers: { size_kb: 4096 fill_policy: DISCARD }",
             "",
-            "# Ftrace: scheduling + power + atrace",
+            "# Ftrace: scheduling + power + binder + atrace",
             "data_sources: {",
             "  config {",
             '    name: "linux.ftrace"',
             "    ftrace_config {",
+            "# Task lifecycle events",
             '      ftrace_events: "sched/sched_process_exit"',
             '      ftrace_events: "sched/sched_process_free"',
             '      ftrace_events: "task/task_newtask"',
             '      ftrace_events: "task/task_rename"',
+            '      ftrace_events: "sched/sched_process_exec"',
+            "# Scheduling events — required for sched, thread_state, sched.latency (P1)",
             '      ftrace_events: "sched/sched_switch"',
-            '      ftrace_events: "power/suspend_resume"',
             '      ftrace_events: "sched/sched_blocked_reason"',
             '      ftrace_events: "sched/sched_wakeup"',
             '      ftrace_events: "sched/sched_wakeup_new"',
             '      ftrace_events: "sched/sched_waking"',
+            "# Power events — required for cpu frequency, linux.cpu.utilization (P1)",
+            '      ftrace_events: "power/suspend_resume"',
             '      ftrace_events: "power/cpu_frequency"',
             '      ftrace_events: "power/cpu_idle"',
+            "# Binder ftrace — required for android.binder (P0), binder_breakdown (P0)",
+            '      ftrace_events: "binder/binder_transaction"',
+            '      ftrace_events: "binder/binder_transaction_received"',
+            '      ftrace_events: "binder/binder_lock"',
+            '      ftrace_events: "binder/binder_unlock"',
+            "# Memory reclaim — provides context for android.memory.lmk (P1)",
+            '      ftrace_events: "kmem/mm_vmscan_direct_reclaim_end"',
+            "# Generic print + atrace",
             '      ftrace_events: "ftrace/print"',
             f'      atrace_categories: "{cats}"',
             '      atrace_apps: "*"',
@@ -2781,13 +2824,13 @@ class PerfettoCollector:
             "  }",
             "}",
             "",
-            "# Process stats for names, grouping, and memory (RSS/PSS)",
+            "# Process stats — proc_stats_poll_ms: 1000 for finer memory granularity (P1: OOM+RSS)",
             "data_sources: {",
             "  config {",
             '    name: "linux.process_stats"',
             "    process_stats_config {",
             "      scan_all_processes_on_start: true",
-            "      proc_stats_poll_ms: 2000",
+            "      proc_stats_poll_ms: 1000",
             "    }",
             "  }",
             "}",
@@ -2812,10 +2855,17 @@ class PerfettoCollector:
             "  }",
             "}",
             "",
-            "# Frame timeline from SurfaceFlinger",
+            "# Frame timeline from SurfaceFlinger (frame_timeline, P1: SF timeline)",
             "data_sources: {",
             "  config {",
             '    name: "android.surfaceflinger.frametimeline"',
+            "  }",
+            "}",
+            "",
+            "# Input event latency — required for android.input (P1: input latency)",
+            "data_sources: {",
+            "  config {",
+            '    name: "android.input.inputevent"',
             "  }",
             "}",
         ]
