@@ -70,6 +70,13 @@ class HeadlessRunner:
 
         info_log("headless", f"Headless run: cmd={self.cmd}, route={route}, target={self.target}, trace={self.trace_path}")
 
+        # Set module-level trace path for collector node fallback
+        # (LangGraph 1.1.3 may lose _trace_path during orchestrator → collector state merge)
+        if self.trace_path:
+            from smartinspector.graph.nodes.collector import collector_node as _cn
+            import smartinspector.graph.nodes.collector as _cm
+            _cm._headless_trace_path = self.trace_path
+
         graph = create_graph()
         config = {"configurable": {"thread_id": "headless"}}
 
@@ -124,7 +131,7 @@ class HeadlessRunner:
             "full_analysis": RouteDecision.FULL_ANALYSIS,
             "full": RouteDecision.FULL_ANALYSIS,
             "startup": RouteDecision.STARTUP,
-            "analyze": RouteDecision.ANALYZE,
+            "analyze": RouteDecision.FULL_ANALYSIS,
             "trace": RouteDecision.TRACE,
         }
         decision = cmd_to_route.get(cmd, RouteDecision.FULL_ANALYSIS)

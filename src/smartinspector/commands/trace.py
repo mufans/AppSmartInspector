@@ -122,13 +122,14 @@ def cmd_record(args: str, state: dict) -> dict:
 
 
 def cmd_analyze(args: str, state: dict) -> dict:
-    """Analyze a Perfetto trace file via the perf_analyzer_node.
+    """Analyze a Perfetto trace file via the full graph pipeline.
+
+    Routes through collector → analyzer → attributor → reporter,
+    producing a complete performance report with source attribution.
 
     Usage: /analyze [path]
     If no path given, analyzes the last recorded trace.
     """
-    from smartinspector.graph.nodes.analyzer import perf_analyzer_node
-
     trace_path = args.strip() or state.get("_trace_path", "")
     if not trace_path:
         print("Usage: /analyze <trace_path>")
@@ -137,36 +138,22 @@ def cmd_analyze(args: str, state: dict) -> dict:
 
     print(f"Analyzing: {trace_path}", flush=True)
 
-    try:
-        collector = PerfettoCollector(trace_path)
-        summary = collector.summarize()
-        perf_json = summary.to_json()
-        collector.close()
+    from smartinspector.graph import create_graph, _stream_run
+    from smartinspector.graph.state import RouteDecision
+    import smartinspector.graph.nodes.collector as _cm
 
-        state["perf_summary"] = perf_json
-        state["_trace_path"] = trace_path
+    # Set module-level trace path for collector fallback (LangGraph state merge issue)
+    _cm._headless_trace_path = trace_path
 
-        # Reuse graph node for LLM analysis
-        analysis_state = {
-            "messages": state.get("messages", []),
-            "perf_summary": perf_json,
-            "perf_analysis": state.get("perf_analysis", ""),
-            "attribution_data": state.get("attribution_data", ""),
-            "attribution_result": state.get("attribution_result", ""),
-            "_trace_path": trace_path,
-        }
-        result = perf_analyzer_node(analysis_state)
+    graph = create_graph()
 
-        if result.get("perf_analysis"):
-            state["perf_analysis"] = result["perf_analysis"]
-            print(result["perf_analysis"])
-        else:
-            print("  Analysis complete. Use /summary for details or ask AI to analyze.")
+    state["messages"] = state.get("messages", []) + [
+        {"role": "user", "content": "请分析性能trace并生成报告"},
+    ]
+    state["_route"] = RouteDecision.FULL_ANALYSIS
+    state["_trace_path"] = trace_path
 
-    except Exception as e:
-        print(f"ERROR: {e}")
-
-    return state
+    return _stream_run(graph, state)
 
 
 def _parse_ns(value: str) -> int | None:

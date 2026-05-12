@@ -2756,7 +2756,13 @@ class PerfettoCollector:
             "gfx", "view", "input", "dalvik", "am", "wm",
             "adb", "binder_driver", "lock_dep",
         ]
-        cats = ",".join(categories or default_categories)
+        cat_list = categories or default_categories
+        # Build separate atrace_categories lines (protobuf repeated string
+        # requires one entry per line, not comma-separated).
+        atrace_cat_lines = "\n".join(
+            '      atrace_categories: "' + c + '"' for c in cat_list
+        )
+        cats = ",".join(cat_list)  # still used by Strategy 3 CLI fallback
 
         # Build Perfetto textproto config
         # Data source → analysis module mapping:
@@ -2816,7 +2822,7 @@ class PerfettoCollector:
             '      ftrace_events: "kmem/mm_vmscan_direct_reclaim_end"',
             "# Generic print + atrace",
             '      ftrace_events: "ftrace/print"',
-            f'      atrace_categories: "{cats}"',
+            atrace_cat_lines,
             '      atrace_apps: "*"',
             "      symbolize_ksyms: true",
             "      disable_generic_events: true",
@@ -2912,6 +2918,7 @@ class PerfettoCollector:
             ]
 
         config_text = "\n".join(config_lines)
+        debug_log("collector", f"Perfetto textproto config:\n{config_text}")
 
         # --- P1-6 + P1-7: Trace collection with SELinux fallback and auto-degradation ---
         timeout_sec = duration_ms // 1000 + 30
@@ -2924,8 +2931,10 @@ class PerfettoCollector:
                 import threading
                 import time
 
+                adb_cmd = ["adb", "shell", f"perfetto -c - --txt -o {device_path}"]
+                debug_log("collector", f"Perfetto adb command: {' '.join(adb_cmd)}")
                 proc = subprocess.Popen(
-                    ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
+                    adb_cmd,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -2995,8 +3004,10 @@ class PerfettoCollector:
                 if callback_error:
                     info_log("perfetto", f"WARNING: Trace collected but on_record_start had errors: {callback_error}")
             else:
+                adb_cmd = ["adb", "shell", f"perfetto -c - --txt -o {device_path}"]
+                debug_log("collector", f"Perfetto adb command: {' '.join(adb_cmd)}")
                 subprocess.run(
-                    ["adb", "shell", f"perfetto -c - --txt -o {device_path}"],
+                    adb_cmd,
                     input=config_text,
                     check=True, capture_output=True, text=True,
                     timeout=timeout_sec,
@@ -3014,6 +3025,7 @@ class PerfettoCollector:
             # Strategy 2: P1-6 SELinux fallback — push config file, use cat pipe
             try:
                 config_device_path = "/data/local/tmp/si_perfetto_config.pbtx"
+                debug_log("collector", f"Perfetto Strategy 2: adb push config -> cat pipe")
                 # Push config text to device
                 subprocess.run(
                     ["adb", "push", "/dev/stdin", config_device_path],
@@ -3022,8 +3034,10 @@ class PerfettoCollector:
                     timeout=10,
                 )
                 # Use cat pipe to bypass SELinux restrictions
+                adb_cmd_s2 = f"cat {config_device_path} | perfetto -c - --txt -o {device_path}"
+                debug_log("collector", f"Perfetto adb command: adb shell {adb_cmd_s2}")
                 subprocess.run(
-                    ["adb", "shell", f"cat {config_device_path} | perfetto -c - --txt -o {device_path}"],
+                    ["adb", "shell", adb_cmd_s2],
                     check=True, capture_output=True, text=True,
                     timeout=timeout_sec,
                 )
@@ -3054,6 +3068,7 @@ class PerfettoCollector:
                     )
                     if target_process:
                         cmdline += f" --target-cmdline={target_process}"
+                    debug_log("collector", f"Perfetto Strategy 3 adb command: adb shell {cmdline}")
                     subprocess.run(
                         ["adb", "shell", cmdline],
                         check=True, capture_output=True, text=True,

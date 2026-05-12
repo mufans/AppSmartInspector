@@ -41,6 +41,7 @@ class AgentState(TypedDict):
 # State keys that every node must pass through unchanged.
 _PASS_THROUGH_KEYS = (
     "perf_summary", "perf_analysis", "attribution_data", "attribution_result",
+    "_trace_path",
 )
 
 
