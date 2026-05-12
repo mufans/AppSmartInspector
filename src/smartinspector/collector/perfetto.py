@@ -77,6 +77,19 @@ class PerfSummary:
     compose_slices: dict = field(default_factory=dict)
     sys_stats: dict = field(default_factory=dict)
     thread_state: list[dict] = field(default_factory=list)
+    # Stdlib modules (P0)
+    lock_contention: list[dict] = field(default_factory=list)
+    binder_txns: list[dict] = field(default_factory=list)
+    startup_metrics: dict = field(default_factory=dict)
+    gc_events: list[dict] = field(default_factory=list)
+    anrs: list[dict] = field(default_factory=list)
+    # Stdlib modules (P1)
+    slice_cpu_time: list[dict] = field(default_factory=list)
+    input_latency: list[dict] = field(default_factory=list)
+    sched_latency: list[dict] = field(default_factory=list)
+    oom_rss_swap: dict = field(default_factory=dict)
+    cpu_utilization: dict = field(default_factory=dict)
+    surfaceflinger_timeline: list[dict] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, ensure_ascii=False)
@@ -2620,6 +2633,76 @@ class PerfettoCollector:
                     debug_log("perfetto", f"thread_state diagnosis failed: {e2}")
         except Exception as e:
             debug_log("perfetto", f"thread_state collection failed: {e}")
+
+        # --- Stdlib modules (P0) ---
+
+        # Lock contention (android.monitor_contention)
+        try:
+            summary.lock_contention = self.collect_lock_contention()
+        except Exception as e:
+            debug_log("perfetto", f"lock_contention failed: {e}")
+
+        # Binder transactions (android.binder)
+        try:
+            summary.binder_txns = self.collect_binder_txns()
+        except Exception as e:
+            debug_log("perfetto", f"binder_txns failed: {e}")
+
+        # Startup metrics TTID/TTFD (android.startup.*)
+        try:
+            summary.startup_metrics = self.collect_startup_metrics()
+        except Exception as e:
+            debug_log("perfetto", f"startup_metrics failed: {e}")
+
+        # GC events (android.garbage_collection)
+        try:
+            summary.gc_events = self.collect_gc_events()
+        except Exception as e:
+            debug_log("perfetto", f"gc_events failed: {e}")
+
+        # ANR detection (android.anrs)
+        try:
+            summary.anrs = self.collect_anrs()
+        except Exception as e:
+            debug_log("perfetto", f"anrs failed: {e}")
+
+        # --- Stdlib modules (P1) ---
+
+        # Slice CPU time (slices.cpu_time)
+        try:
+            summary.slice_cpu_time = self.collect_slice_cpu_time()
+        except Exception as e:
+            debug_log("perfetto", f"slice_cpu_time failed: {e}")
+
+        # Input latency breakdown (android.input)
+        try:
+            summary.input_latency = self.collect_input_latency()
+        except Exception as e:
+            debug_log("perfetto", f"input_latency failed: {e}")
+
+        # Scheduling latency (sched.latency)
+        try:
+            summary.sched_latency = self.collect_sched_latency()
+        except Exception as e:
+            debug_log("perfetto", f"sched_latency failed: {e}")
+
+        # OOM + RSS/Swap (android.memory.process + android.memory.lmk)
+        try:
+            summary.oom_rss_swap = self.collect_oom_rss_swap()
+        except Exception as e:
+            debug_log("perfetto", f"oom_rss_swap failed: {e}")
+
+        # CPU utilization (linux.cpu.utilization)
+        try:
+            summary.cpu_utilization = self.collect_cpu_utilization()
+        except Exception as e:
+            debug_log("perfetto", f"cpu_utilization failed: {e}")
+
+        # SurfaceFlinger frame timeline (android.surfaceflinger)
+        try:
+            summary.surfaceflinger_timeline = self.collect_surfaceflinger_timeline()
+        except Exception as e:
+            debug_log("perfetto", f"surfaceflinger_timeline failed: {e}")
 
         return summary
 
