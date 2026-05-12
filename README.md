@@ -19,6 +19,7 @@ AI 驱动的跨平台移动端性能分析 CLI 工具。通过自然语言交互
 - 🚀 **冷启动分析** — 自动识别启动阶段（进程启动→Application.onCreate→Activity.onCreate→首帧），定位启动瓶颈
 - 🤖 **Headless/CI 模式** — 非交互式运行全量分析流水线，支持 JSON 结构化输出，可直接集成 CI/CD
 - 🌐 **IO 追踪** — 默认启用网络/数据库/图片加载 IO Hook，独立收集 IO 切片并归因到源码
+- 🔬 **Perfetto Stdlib 模块** — 11 个 stdlib 模块深度分析：锁竞争、Binder 事务、启动指标(TTID/TTFD)、GC 事件、ANR 检测、Slice CPU 时间、输入延迟分解、调度延迟、OOM/RSS/Swap、CPU 利用率、SurfaceFlinger 帧匹配
 
 ## 快速开始
 
@@ -149,7 +150,7 @@ REPL 主循环 ─── 全局 try/except，异常后保留 state 继续输入
 
 ### Android
 
-- Trace 采集：Perfetto (ftrace + atrace + CPU callstack + Java heap + 系统级 CPU)
+- Trace 采集：Perfetto (ftrace + atrace + CPU callstack + Java heap + 系统级 CPU + 11 个 stdlib 模块)
 - 方法 Hook：Pine AOP 框架，运行时 hook Activity/Fragment/RecyclerView 等框架方法
 - 卡顿检测：BlockMonitor (BlockCanary-style)，监测主线程每条 Message 耗时，容量限制防 OOM
 - 通信：WebSocket (adb reverse)，CLI ↔ App 实时配置同步 + 数据传输
@@ -201,7 +202,7 @@ smartinspector/
 │   │   ├── deterministic.py        #     确定性预计算 + SQL Summarizer (减少 LLM token)
 │   │   └── verifier.py             #     分析质量验证 (L1 格式 + L2 一致性, 0 token)
 │   │
-│   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU, context manager)
+│   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU, 11 stdlib modules, context manager)
 │   ├── collector/startup.py        #   冷启动分析器 (启动阶段切分, 关键路径提取, 瓶颈识别)
 │   ├── collector/memory.py         #   内存分配分析器 (heap_graph, 泄漏检测, 内存趋势)
 │   ├── headless.py                 #   Headless/CI 非交互式运行器 (全量流水线, JSON/Markdown 输出)
