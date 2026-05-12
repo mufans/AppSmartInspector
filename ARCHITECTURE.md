@@ -85,7 +85,7 @@ smartinspector/
 │   │   └── deterministic.py     #   Deterministic pre-computation (reduces LLM tokens)
 │   │
 │   ├── collector/               # Data collection & processing
-│   │   ├── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON (CPU调用链, 系统级CPU, WS+SQL合并, context manager, IO slices)
+│   │   ├── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON (CPU调用链, 系统级CPU, WS+SQL合并, context manager, IO slices, 11 stdlib modules)
 │   │   └── startup.py           #   StartupAnalyzer: cold start phase splitting + bottleneck identification
 │   │
 │   ├── headless.py              # HeadlessRunner: non-interactive CI mode (full pipeline, JSON/Markdown output)
@@ -529,6 +529,17 @@ PerfSummary
 ├── io_slices: dict                     # IO slices (SI$net#/SI$db#/SI$img# — all threads)
 │   ├── total_count: int               # Total IO slice count
 │   └── summary: list[dict]            # Aggregated by IO type + class
+├── lock_contention: dict | None        # Monitor lock contention (stdlib)
+├── binder_txns: dict | None            # Binder transactions (stdlib)
+├── startup_metrics: dict | None        # Startup TTID/TTFD (stdlib)
+├── gc_events: dict | None              # GC events (stdlib)
+├── anrs: dict | None                   # ANR events (stdlib)
+├── slice_cpu_time: dict | None         # Per-slice CPU time (stdlib)
+├── input_latency: dict | None          # Input latency breakdown (stdlib)
+├── sched_latency: dict | None          # Scheduling latency (stdlib)
+├── oom_rss_swap: dict | None           # OOM/RSS/Swap + LMK events (stdlib)
+├── cpu_utilization: dict | None        # CPU cycles per process (stdlib)
+├── surfaceflinger_timeline: dict | None # App↔SF vsync match (stdlib)
 └── metadata: dict                      # Trace metadata + table diagnosis
 ```
 
@@ -544,6 +555,18 @@ PerfSummary
 | `collect_io_slices()` | `slice` | IO slices (SI$net#/SI$db#/SI$img#) from all threads |
 | `collect_threads()` | `thread` | Thread listing |
 | `collect_sys_stats()` | `sys_stats` | System-level CPU metrics |
+| `collect_lock_contention()` | `android.monitor_contention` | Monitor lock contention (blocked/blocking method, waiter count, thread state breakdown) |
+| `collect_binder_txns()` | `android.binder` | Binder transactions (AIDL name, client/server duration, sync/async, OOM score) |
+| `collect_binder_breakdown()` | `android.binder_breakdown` | Binder client/server breakdown by delay reason |
+| `collect_startup_metrics()` | `android.startup.*` | Startup list, TTID/TTFD, opinionated breakdown by phase |
+| `collect_gc_events()` | `android.garbage_collection` | GC events (type, duration, reclaimed MB, heap size, running/runnable/IO time) |
+| `collect_anrs()` | `android.anrs` | ANR events (subject, component, ANR type, duration) |
+| `collect_slice_cpu_time()` | `slices.cpu_time` | Per-slice CPU time ranking (thread_slice_cpu_time) |
+| `collect_input_latency()` | `android.input` | Input event latency breakdown (dispatch/handling/ack/total/end-to-end) |
+| `collect_sched_latency()` | `sched.latency` | Scheduling latency (runnable→running delay per interval) |
+| `collect_oom_rss_swap()` | `android.memory.process` + `android.memory.lmk` | OOM score transitions, RSS/Swap per process, LMK kill events |
+| `collect_cpu_utilization()` | `linux.cpu.utilization.process` | CPU cycles, runtime, frequency stats per process |
+| `collect_surfaceflinger_timeline()` | `android.surfaceflinger` | App↔SF frame timeline match (vsync mapping) |
 
 **Perfetto config**:
 - Default categories: sched, freq, idle, power, memreclaim, gfx, view, input, dalvik, am, wm
