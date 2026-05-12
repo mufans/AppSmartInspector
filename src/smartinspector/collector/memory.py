@@ -203,3 +203,242 @@ def analyze_memory_trend(process_memory: dict) -> dict:
         result["processes"].append(entry)
 
     return result
+
+
+class HeapGraphMixin:
+    """Mixin providing heap graph analysis using Perfetto stdlib.
+
+    Expects the host class to provide:
+      - ``self._open()`` -> TraceProcessor
+      - ``self._target_package`` (str | None) — target app package name
+    """
+
+    def collect_heap_graph_stats(self) -> list[dict]:
+        """Collect heap graph summary statistics.
+
+        Uses ``android.memory.heap_graph.heap_graph_stats`` to get per-dump
+        summary (total/reachable object counts, heap sizes, OOM score, RSS).
+        """
+        tp = self._open()
+        target_pkg = getattr(self, "_target_package", None)
+
+        debug_log("memory", f"collect_heap_graph_stats: target_package={target_pkg}")
+        logger.info("Collecting heap graph stats for %s", target_pkg or "all processes")
+
+        where_process = ""
+        if target_pkg:
+            where_process = f"AND p.name GLOB '{target_pkg}'"
+
+        stats: list[dict] = []
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.memory.heap_graph.heap_graph_stats;
+
+                SELECT
+                  s.upid,
+                  p.name AS process_name,
+                  s.graph_sample_ts,
+                  s.total_heap_size,
+                  s.total_native_alloc_registry_size,
+                  s.total_obj_count,
+                  s.reachable_heap_size,
+                  s.reachable_native_alloc_registry_size,
+                  s.reachable_obj_count,
+                  s.oom_score_adj,
+                  s.anon_rss_and_swap_size,
+                  s.dmabuf_rss_size
+                FROM android_heap_graph_stats s
+                JOIN process p ON s.upid = p.upid
+                WHERE 1=1
+                  {where_process}
+                ORDER BY s.graph_sample_ts
+            """)
+
+            for r in rows:
+                entry = {
+                    "upid": r.upid,
+                    "process_name": r.process_name,
+                    "graph_sample_ts": r.graph_sample_ts,
+                    "total_heap_size": r.total_heap_size,
+                    "total_native_alloc_registry_size": r.total_native_alloc_registry_size,
+                    "total_obj_count": r.total_obj_count,
+                    "reachable_heap_size": r.reachable_heap_size,
+                    "reachable_native_alloc_registry_size": r.reachable_native_alloc_registry_size,
+                    "reachable_obj_count": r.reachable_obj_count,
+                    "oom_score_adj": r.oom_score_adj,
+                    "anon_rss_and_swap_size": r.anon_rss_and_swap_size,
+                    "dmabuf_rss_size": r.dmabuf_rss_size,
+                }
+                stats.append(entry)
+        except Exception as e:
+            debug_log("memory", f"heap_graph_stats query failed: {e}")
+            logger.debug("Heap graph stats query failed: %s", e)
+
+        debug_log("memory", f"found {len(stats)} heap graph stats entries")
+        logger.info("Heap graph stats: %d entries", len(stats))
+        return stats
+
+    def collect_heap_class_aggregation(self) -> list[dict]:
+        """Collect per-class heap memory aggregation (Top 20 by total size).
+
+        Uses ``android.memory.heap_graph.heap_graph_class_aggregation`` to get
+        class-level breakdown with object counts, sizes, and dominator stats.
+        """
+        tp = self._open()
+        target_pkg = getattr(self, "_target_package", None)
+
+        debug_log("memory", f"collect_heap_class_aggregation: target_package={target_pkg}")
+        logger.info("Collecting heap class aggregation for %s", target_pkg or "all processes")
+
+        where_process = ""
+        if target_pkg:
+            where_process = f"AND p.name GLOB '{target_pkg}'"
+
+        aggregation: list[dict] = []
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.memory.heap_graph.heap_graph_class_aggregation;
+
+                SELECT
+                  a.upid,
+                  p.name AS process_name,
+                  a.graph_sample_ts,
+                  a.type_name,
+                  a.is_libcore_or_array,
+                  a.obj_count,
+                  a.size_bytes,
+                  a.native_size_bytes,
+                  a.reachable_obj_count,
+                  a.reachable_size_bytes,
+                  a.reachable_native_size_bytes,
+                  a.dominated_obj_count,
+                  a.dominated_size_bytes,
+                  a.dominated_native_size_bytes
+                FROM android_heap_graph_class_aggregation a
+                JOIN process p ON a.upid = p.upid
+                WHERE 1=1
+                  {where_process}
+                ORDER BY a.size_bytes DESC
+                LIMIT 20
+            """)
+
+            for r in rows:
+                entry = {
+                    "upid": r.upid,
+                    "process_name": r.process_name,
+                    "graph_sample_ts": r.graph_sample_ts,
+                    "type_name": r.type_name,
+                    "is_libcore_or_array": bool(r.is_libcore_or_array),
+                    "obj_count": r.obj_count,
+                    "size_bytes": r.size_bytes,
+                    "native_size_bytes": r.native_size_bytes,
+                    "reachable_obj_count": r.reachable_obj_count,
+                    "reachable_size_bytes": r.reachable_size_bytes,
+                    "reachable_native_size_bytes": r.reachable_native_size_bytes,
+                    "dominated_obj_count": r.dominated_obj_count,
+                    "dominated_size_bytes": r.dominated_size_bytes,
+                    "dominated_native_size_bytes": r.dominated_native_size_bytes,
+                }
+                aggregation.append(entry)
+        except Exception as e:
+            debug_log("memory", f"heap_class_aggregation query failed: {e}")
+            logger.debug("Heap class aggregation query failed: %s", e)
+
+        debug_log("memory", f"found {len(aggregation)} class aggregation entries")
+        logger.info("Heap class aggregation: %d entries (Top 20)", len(aggregation))
+        return aggregation
+
+    def collect_heap_dominator_tree(self) -> list[dict]:
+        """Collect heap dominator tree entries (largest retained size).
+
+        Uses ``android.memory.heap_graph.dominator_tree`` to get reachable
+        objects with their immediate dominators and dominated set summaries.
+        """
+        tp = self._open()
+        target_pkg = getattr(self, "_target_package", None)
+
+        debug_log("memory", f"collect_heap_dominator_tree: target_package={target_pkg}")
+        logger.info("Collecting heap dominator tree for %s", target_pkg or "all processes")
+
+        # Build process filter from target_package using heap_graph_object
+        where_process = ""
+        if target_pkg:
+            where_process = f"AND p.name GLOB '{target_pkg}'"
+
+        dominator_tree: list[dict] = []
+        try:
+            rows = tp.query(f"""
+                INCLUDE PERFETTO MODULE android.memory.heap_graph.dominator_tree;
+
+                SELECT
+                  dt.id,
+                  dt.idom_id,
+                  dt.dominated_obj_count,
+                  dt.dominated_size_bytes,
+                  dt.dominated_native_size_bytes,
+                  dt.depth,
+                  hgo.self_size,
+                  hgc.name AS class_name,
+                  p.name AS process_name
+                FROM heap_graph_dominator_tree dt
+                JOIN heap_graph_object hgo ON dt.id = hgo.id
+                JOIN heap_graph_class hgc ON hgo.type_id = hgc.id
+                JOIN heap_graph_reference hgr ON hgo.owner_upid = hgr.owner_upid
+                JOIN process p ON hgo.owner_upid = p.upid
+                WHERE 1=1
+                  {where_process}
+                ORDER BY dt.dominated_size_bytes DESC
+                LIMIT 50
+            """)
+
+            for r in rows:
+                entry = {
+                    "id": r.id,
+                    "idom_id": r.idom_id,
+                    "dominated_obj_count": r.dominated_obj_count,
+                    "dominated_size_bytes": r.dominated_size_bytes,
+                    "dominated_native_size_bytes": r.dominated_native_size_bytes,
+                    "depth": r.depth,
+                    "self_size": r.self_size,
+                    "class_name": r.class_name,
+                    "process_name": r.process_name,
+                }
+                dominator_tree.append(entry)
+        except Exception as e:
+            # Try simpler query without JOINs to heap_graph_object/class
+            # (column availability varies by Perfetto version)
+            debug_log("memory", f"dominator tree full query failed, trying fallback: {e}")
+            logger.debug("Dominator tree full query failed, trying fallback: %s", e)
+            try:
+                rows = tp.query("""
+                    INCLUDE PERFETTO MODULE android.memory.heap_graph.dominator_tree;
+
+                    SELECT
+                      id,
+                      idom_id,
+                      dominated_obj_count,
+                      dominated_size_bytes,
+                      dominated_native_size_bytes,
+                      depth
+                    FROM heap_graph_dominator_tree
+                    ORDER BY dominated_size_bytes DESC
+                    LIMIT 50
+                """)
+
+                for r in rows:
+                    entry = {
+                        "id": r.id,
+                        "idom_id": r.idom_id,
+                        "dominated_obj_count": r.dominated_obj_count,
+                        "dominated_size_bytes": r.dominated_size_bytes,
+                        "dominated_native_size_bytes": r.dominated_native_size_bytes,
+                        "depth": r.depth,
+                    }
+                    dominator_tree.append(entry)
+            except Exception as e2:
+                debug_log("memory", f"dominator tree fallback query failed: {e2}")
+                logger.debug("Dominator tree fallback query failed: %s", e2)
+
+        debug_log("memory", f"found {len(dominator_tree)} dominator tree entries")
+        logger.info("Heap dominator tree: %d entries", len(dominator_tree))
+        return dominator_tree
