@@ -11,7 +11,7 @@ from smartinspector.collector.input import InputMixin
 from smartinspector.collector.sched_latency import SchedLatencyMixin
 from smartinspector.collector.oom import OomMixin
 from smartinspector.collector.cpu_utilization import CpuUtilizationMixin
-from smartinspector.collector.memory import MemoryMixin
+from smartinspector.collector.memory import HeapGraphMixin
 from smartinspector.collector.surfaceflinger import SurfaceFlingerMixin
 
-__all__ = ["PerfettoCollector", "PerfSummary", "LockMixin", "BinderMixin", "StartupMixin", "GcMixin", "AnrMixin", "SliceEnhancedMixin", "InputMixin", "SchedLatencyMixin", "OomMixin", "CpuUtilizationMixin", "MemoryMixin", "SurfaceFlingerMixin"]
+__all__ = ["PerfettoCollector", "PerfSummary", "LockMixin", "BinderMixin", "StartupMixin", "GcMixin", "AnrMixin", "SliceEnhancedMixin", "InputMixin", "SchedLatencyMixin", "OomMixin", "CpuUtilizationMixin", "HeapGraphMixin", "SurfaceFlingerMixin"]
