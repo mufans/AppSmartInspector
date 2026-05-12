@@ -20,6 +20,29 @@ AI 驱动的跨平台移动端性能分析 CLI 工具。通过自然语言交互
 - 🤖 **Headless/CI 模式** — 非交互式运行全量分析流水线，支持 JSON 结构化输出，可直接集成 CI/CD
 - 🌐 **IO 追踪** — 默认启用网络/数据库/图片加载 IO Hook，独立收集 IO 切片并归因到源码
 
+### Stdlib 分析能力
+
+基于 Perfetto SQL Stdlib 的深度性能分析模块，以 Mixin 形式挂载到 PerfettoCollector：
+
+**P0 核心能力**
+
+- 🔒 **Java 锁竞争分析** — 检测 synchronized 锁阻塞，定位阻塞方法和源码位置
+- 📡 **Binder 事务分析** — IPC 延迟分解，client/server 端追踪
+- 🚀 **启动分析增强** — TTID/TTFD 指标、启动瓶颈自动分解
+- ♻️ **GC 分析** — GC pause 检测、回收量统计、线程状态分解
+- ⚠️ **ANR 分析** — ANR 事件检测与期间主线程 slice 分析
+- ⏱️ **Slice CPU 增强** — Slice 级精确 CPU 时间和线程状态分布
+
+**P1 场景增强**
+
+- 📊 **逐帧指标** — per-frame overrun/cpu_time/ui_time/jank 分级
+- 👆 **输入延迟分解** — dispatch→delivery→ACK 全链路延迟
+- ⏳ **调度延迟** — Runnable→Running 等待时间统计
+- 🧠 **OOM+RSS 追踪** — OOM 分数、RSS/Swap 监控、LMK kill 事件
+- 💻 **精确 CPU 利用率** — 进程/线程级频率加权 CPU 利用率
+- 📦 **堆分析增强** — 堆统计摘要、按类聚合 Top 20、支配树最大 retained size
+- 🖥️ **SF 帧匹配** — App 与 SurfaceFlinger 帧时间线关联
+
 ## 快速开始
 
 ```bash
