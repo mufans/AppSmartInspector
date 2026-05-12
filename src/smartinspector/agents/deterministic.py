@@ -276,6 +276,14 @@ def compute_hints(perf_json: str) -> str:
         _analyze_io_slices(data),
         _analyze_compose_slices(data),
         _analyze_memory(data),
+        _analyze_lock_contention(data),
+        _analyze_binder_txns(data),
+        _analyze_startup_metrics(data),
+        _analyze_gc_events(data),
+        _analyze_anrs(data),
+        _analyze_input_latency(data),
+        _analyze_sched_latency(data),
+        _analyze_oom_rss_swap(data),
     ]
 
     return "\n\n".join(s for s in sections if s)
@@ -818,5 +826,298 @@ def _analyze_memory(data: dict) -> str:
 
     if len(lines) <= 1:
         return ""
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 10: Lock contention analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_lock_contention(data: dict) -> str:
+    """Analyze lock contention events, flagging main-thread involvement.
+
+    Reports the most severe lock waits, distinguishing main-thread blockers
+    from background contention.
+    """
+    lock_events = data.get("lock_contention") or []
+    if not lock_events:
+        return ""
+
+    lines = ["[锁竞争分析]"]
+
+    # Sort by duration descending
+    sorted_events = sorted(lock_events, key=lambda x: -_safe_float(x.get("dur_ms")))
+    main_blockers = [e for e in sorted_events if e.get("is_blocked_main")]
+    other_blockers = [e for e in sorted_events if not e.get("is_blocked_main")]
+
+    total_count = len(sorted_events)
+    total_dur = sum(_safe_float(e.get("dur_ms")) for e in sorted_events)
+    lines.append(f"  共{total_count}次锁等待, 总耗时{total_dur:.1f}ms")
+
+    if main_blockers:
+        lines.append("  主线程被阻塞:")
+        for e in main_blockers[:5]:
+            dur = _safe_float(e.get("dur_ms"))
+            blocked = e.get("short_blocked_method", "?")
+            blocking = e.get("short_blocking_method", "?")
+            lines.append(
+                f"    {blocked} 等待 {blocking} ({dur:.1f}ms)"
+            )
+
+    if other_blockers:
+        lines.append("  其他线程锁等待:")
+        for e in other_blockers[:3]:
+            dur = _safe_float(e.get("dur_ms"))
+            blocked_thread = e.get("blocked_thread", "?")
+            blocking = e.get("short_blocking_method", "?")
+            lines.append(
+                f"    {blocked_thread} → {blocking} ({dur:.1f}ms)"
+            )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 11: Binder transaction analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_binder_txns(data: dict) -> str:
+    """Analyze Binder transactions, ranking by client/server latency."""
+    txns = data.get("binder_txns") or []
+    if not txns:
+        return ""
+
+    lines = ["[Binder调用分析]"]
+
+    total = len(txns)
+    main_txns = [t for t in txns if t.get("is_main_thread")]
+    lines.append(f"  共{total}次Binder调用, 其中{len(main_txns)}次在主线程")
+
+    # Sort by client duration descending
+    sorted_txns = sorted(txns, key=lambda x: -_safe_float(x.get("client_dur_ms")))
+
+    for t in sorted_txns[:5]:
+        client_dur = _safe_float(t.get("client_dur_ms"))
+        server_dur = _safe_float(t.get("server_dur_ms"))
+        aidl = t.get("aidl_name", "?")
+        method = t.get("method_name", "")
+        is_main = " [主线程]" if t.get("is_main_thread") else ""
+        label = f"{aidl}.{method}" if method else aidl
+        lines.append(
+            f"  {label}: 客户端{client_dur:.1f}ms, "
+            f"服务端{server_dur:.1f}ms{is_main}"
+        )
+
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
+# ---------------------------------------------------------------------------
+# Helper 12: Startup metrics analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_startup_metrics(data: dict) -> str:
+    """Analyze startup metrics: TTID, TTFD, and bottleneck breakdown."""
+    startup = data.get("startup_metrics") or {}
+    if not startup:
+        return ""
+
+    startups = startup.get("startups") or []
+    breakdown = startup.get("breakdown") or []
+    if not startups and not breakdown:
+        return ""
+
+    lines = ["[启动分析]"]
+
+    for s in startups[:3]:
+        ttid = s.get("ttid_ms")
+        ttfd = s.get("ttfd_ms")
+        pkg = s.get("package", "?")
+        stype = s.get("startup_type", "?")
+        parts = [f"  {pkg} ({stype})"]
+        if ttid is not None:
+            parts.append(f"TTID={ttid:.0f}ms")
+        if ttfd is not None:
+            parts.append(f"TTFD={ttfd:.0f}ms")
+        lines.append(": ".join(parts))
+
+    if breakdown:
+        lines.append("  启动瓶颈分解:")
+        for b in sorted(breakdown, key=lambda x: -_safe_float(x.get("segment_dur_ms")))[:5]:
+            reason = b.get("reason", "?")
+            dur = _safe_float(b.get("segment_dur_ms"))
+            lines.append(f"    {reason}: {dur:.1f}ms")
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+# ---------------------------------------------------------------------------
+# Helper 13: GC events analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_gc_events(data: dict) -> str:
+    """Analyze GC events: type, duration, impact on performance."""
+    gc_events = data.get("gc_events") or []
+    if not gc_events:
+        return ""
+
+    lines = ["[GC分析]"]
+
+    total_count = len(gc_events)
+    total_dur = sum(_safe_float(e.get("gc_dur_ms")) for e in gc_events)
+    total_reclaimed = sum(_safe_float(e.get("reclaimed_mb")) for e in gc_events)
+    mark_compact_count = sum(1 for e in gc_events if e.get("is_mark_compact"))
+
+    lines.append(
+        f"  共{total_count}次GC, 总耗时{total_dur:.1f}ms, "
+        f"回收{total_reclaimed:.1f}MB"
+    )
+    if mark_compact_count > 0:
+        lines.append(f"  其中{mark_compact_count}次Mark-Compact (全堆GC, 耗时较长)")
+
+    for e in sorted(gc_events, key=lambda x: -_safe_float(x.get("gc_dur_ms")))[:3]:
+        dur = _safe_float(e.get("gc_dur_ms"))
+        gc_type = e.get("gc_type", "?")
+        reclaimed = _safe_float(e.get("reclaimed_mb"))
+        running = _safe_float(e.get("running_ms"))
+        runnable = _safe_float(e.get("runnable_ms"))
+        lines.append(
+            f"  {gc_type}: {dur:.1f}ms, "
+            f"回收{reclaimed:.1f}MB, "
+            f"Running={running:.1f}ms, Runnable={runnable:.1f}ms"
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 14: ANR analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_anrs(data: dict) -> str:
+    """Analyze ANR events with main-thread operation details."""
+    anrs = data.get("anrs") or []
+    if not anrs:
+        return ""
+
+    lines = ["[ANR分析]"]
+
+    for a in anrs:
+        subject = a.get("subject", "?")
+        anr_type = a.get("anr_type", "?")
+        dur = _safe_float(a.get("anr_dur_ms"))
+        process = a.get("process_name", "?")
+        lines.append(f"  {subject} ({anr_type}): {dur:.0f}ms, 进程={process}")
+
+        # Show main-thread slices during ANR
+        main_slices = a.get("main_thread_slices") or []
+        if main_slices:
+            top_slices = sorted(main_slices, key=lambda x: -_safe_float(x.get("dur_ms")))[:3]
+            for s in top_slices:
+                s_name = s.get("name", "?")
+                s_dur = _safe_float(s.get("dur_ms"))
+                lines.append(f"    \u2192 {s_name}: {s_dur:.1f}ms")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 15: Input latency analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_input_latency(data: dict) -> str:
+    """Analyze input latency breakdown: dispatch/handling/ack phases."""
+    events = data.get("input_latency") or []
+    if not events:
+        return ""
+
+    lines = ["[输入延迟分析]"]
+
+    total_count = len(events)
+    total_durs = [_safe_float(e.get("total_ms")) for e in events]
+    avg_total = sum(total_durs) / len(total_durs) if total_durs else 0
+    max_total = max(total_durs) if total_durs else 0
+
+    lines.append(f"  共{total_count}次输入事件, 平均延迟{avg_total:.1f}ms, 最大{max_total:.1f}ms")
+
+    for e in sorted(events, key=lambda x: -_safe_float(x.get("total_ms")))[:5]:
+        dispatch = _safe_float(e.get("dispatch_ms"))
+        handling = _safe_float(e.get("handling_ms"))
+        ack = _safe_float(e.get("ack_ms"))
+        total = _safe_float(e.get("total_ms"))
+        event_type = e.get("event_type", "?")
+        event_action = e.get("event_action", "")
+        label = f"{event_type}.{event_action}" if event_action else event_type
+        lines.append(
+            f"  {label}: 总{total:.1f}ms "
+            f"(分发={dispatch:.1f}, 处理={handling:.1f}, 回执={ack:.1f})"
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 16: Schedule latency analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_sched_latency(data: dict) -> str:
+    """Analyze scheduling latency: threads waiting longest for CPU."""
+    events = data.get("sched_latency") or []
+    if not events:
+        return ""
+
+    lines = ["[调度延迟分析]"]
+
+    for e in sorted(events, key=lambda x: -_safe_float(x.get("max_wait_ms")))[:5]:
+        thread = e.get("thread_name", "?")
+        wait_count = e.get("wait_count", 0)
+        total_wait = _safe_float(e.get("total_wait_ms"))
+        avg_wait = _safe_float(e.get("avg_wait_ms"))
+        max_wait = _safe_float(e.get("max_wait_ms"))
+        lines.append(
+            f"  {thread}: 等待{wait_count}次, "
+            f"总{total_wait:.1f}ms, "
+            f"平均{avg_wait:.1f}ms, "
+            f"最大{max_wait:.1f}ms"
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 17: OOM / RSS / Swap analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_oom_rss_swap(data: dict) -> str:
+    """Analyze OOM adj transitions, RSS/Swap trends, and LMK events."""
+    oom_data = data.get("oom_rss_swap") or {}
+    if not oom_data:
+        return ""
+
+    transitions = oom_data.get("oom_transitions") or []
+    lmk_events = oom_data.get("lmk_events") or []
+    if not transitions and not lmk_events:
+        return ""
+
+    lines = ["[OOM/RSS分析]"]
+
+    if transitions:
+        lines.append("  OOM adj变化:")
+        for t in transitions[:5]:
+            score = t.get("oom_score", "?")
+            rss = _safe_float(t.get("rss_mb"))
+            swap = _safe_float(t.get("swap_mb"))
+            reason = t.get("oom_adj_reason", "")
+            lines.append(
+                f"    adj={score}, RSS={rss:.0f}MB, Swap={swap:.0f}MB"
+                + (f", 原因={reason}" if reason else "")
+            )
+
+    if lmk_events:
+        lines.append(f"  LMK事件 ({len(lmk_events)}次):")
+        for lmk in lmk_events[:3]:
+            proc = lmk.get("process_name", "?")
+            reason = lmk.get("kill_reason", "?")
+            lines.append(f"    {proc}: {reason}")
 
     return "\n".join(lines)
