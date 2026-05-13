@@ -24,6 +24,18 @@ _session_state: dict[str, Any] = {
 }
 
 
+def _apply_source_dir(source_dir: str | None) -> None:
+    """Set source code search directory if provided.
+
+    Args:
+        source_dir: Path to source code root, or None to skip.
+    """
+    if source_dir:
+        from smartinspector.config import set_source_dir
+        set_source_dir(source_dir)
+        info_log("mcp", f"Source dir set to: {source_dir}")
+
+
 def _run_command(handler, args: str) -> str:
     """Execute a slash command handler and capture its stdout output.
 
@@ -69,6 +81,7 @@ mcp = FastMCP(
 async def si_full(
     duration_ms: int | None = None,
     package_name: str | None = None,
+    source_dir: str | None = None,
     no_wait: bool = False,
     debug: bool = False,
 ) -> str:
@@ -79,6 +92,7 @@ async def si_full(
     Args:
         duration_ms: Trace duration in milliseconds (100-60000). Default: 10000.
         package_name: Target app package name (e.g. com.example.app).
+        source_dir: Source code directory for attribution (maps code hotspots to source files).
         no_wait: Skip waiting for app connection, start trace immediately.
         debug: Enable debug logging to reports/debug_*.log.
 
@@ -86,6 +100,8 @@ async def si_full(
         Full performance analysis report in markdown.
     """
     from smartinspector.commands.orchestrate import cmd_full
+
+    _apply_source_dir(source_dir)
 
     parts = []
     if no_wait:
@@ -104,17 +120,21 @@ async def si_full(
 async def si_trace(
     duration_ms: int | None = None,
     package_name: str | None = None,
+    source_dir: str | None = None,
 ) -> str:
     """Collect a Perfetto trace and analyze it (stops before attribution/report).
 
     Args:
         duration_ms: Trace duration in milliseconds (100-60000). Default: 10000.
         package_name: Target app package name.
+        source_dir: Source code directory for attribution.
 
     Returns:
         Analysis summary of the collected trace.
     """
     from smartinspector.commands.trace import cmd_trace
+
+    _apply_source_dir(source_dir)
 
     parts = []
     if duration_ms is not None:
@@ -151,18 +171,24 @@ async def si_record(
 
 
 @mcp.tool(title="Analyze Trace")
-async def si_analyze(trace_path: str | None = None) -> str:
+async def si_analyze(
+    trace_path: str | None = None,
+    source_dir: str | None = None,
+) -> str:
     """Analyze a Perfetto trace file.
 
     Uses the last recorded trace if no path is provided.
 
     Args:
         trace_path: Path to the .pb trace file. Uses last recorded trace if omitted.
+        source_dir: Source code directory for attribution.
 
     Returns:
         Performance analysis results in markdown.
     """
     from smartinspector.commands.trace import cmd_analyze
+
+    _apply_source_dir(source_dir)
 
     return _run_command(cmd_analyze, trace_path or "")
 
@@ -171,6 +197,7 @@ async def si_analyze(trace_path: str | None = None) -> str:
 async def si_frame(
     ts: str,
     dur: str,
+    source_dir: str | None = None,
 ) -> str:
     """Analyze a specific frame/slice from a loaded Perfetto trace.
 
@@ -179,33 +206,45 @@ async def si_frame(
     Args:
         ts: Start timestamp (supports ns, us, ms suffixes, e.g. '1234ms', '500000us').
         dur: Duration of the frame (supports ns, us, ms suffixes).
+        source_dir: Source code directory for attribution.
 
     Returns:
         Frame-level analysis results.
     """
     from smartinspector.commands.trace import cmd_frame
 
+    _apply_source_dir(source_dir)
+
     args = f"ts={ts} dur={dur}"
     return _run_command(cmd_frame, args)
 
 
 @mcp.tool(title="Cold Start Analysis")
-async def si_startup(package_name: str) -> str:
+async def si_startup(
+    package_name: str,
+    source_dir: str | None = None,
+) -> str:
     """Analyze app cold start performance: force-stop -> trace -> launch -> analyze.
 
     Args:
         package_name: Target app package name (e.g. com.example.app).
+        source_dir: Source code directory for attribution.
 
     Returns:
         Cold start analysis report with phase breakdown.
     """
     from smartinspector.commands.orchestrate import cmd_startup
 
+    _apply_source_dir(source_dir)
+
     return _run_command(cmd_startup, package_name)
 
 
 @mcp.tool(title="Quick Analysis")
-async def si_quick(trace_path: str | None = None) -> str:
+async def si_quick(
+    trace_path: str | None = None,
+    source_dir: str | None = None,
+) -> str:
     """Run fast deterministic analysis without LLM calls.
 
     Pure computation: collector -> deterministic hints -> fast-path attribution.
@@ -213,11 +252,14 @@ async def si_quick(trace_path: str | None = None) -> str:
 
     Args:
         trace_path: Path to the .pb trace file. Uses last recorded trace if omitted.
+        source_dir: Source code directory for attribution.
 
     Returns:
         Quick analysis report in markdown.
     """
     from smartinspector.commands.quick import cmd_quick
+
+    _apply_source_dir(source_dir)
 
     return _run_command(cmd_quick, trace_path or "")
 
