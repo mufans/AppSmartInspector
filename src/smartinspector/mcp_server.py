@@ -23,17 +23,38 @@ _session_state: dict[str, Any] = {
     "_device": "",
 }
 
+# Global config set via si_init, shared across all tool calls
+_global_config: dict[str, Any] = {
+    "source_dir": "",
+    "api_key": "",
+    "base_url": "",
+    "model": "",
+}
 
-def _apply_source_dir(source_dir: str | None) -> None:
-    """Set source code search directory if provided.
+
+def _apply_global_config(source_dir_override: str | None = None) -> None:
+    """Apply global config from si_init to the runtime environment.
+
+    Applies source_dir (from override or global config) and LLM settings.
+    Called automatically before each analysis tool execution.
 
     Args:
-        source_dir: Path to source code root, or None to skip.
+        source_dir_override: Per-tool source_dir override; falls back to global config.
     """
+    import os
+
+    source_dir = source_dir_override or _global_config["source_dir"]
     if source_dir:
         from smartinspector.config import set_source_dir
         set_source_dir(source_dir)
-        info_log("mcp", f"Source dir set to: {source_dir}")
+        info_log("mcp", f"Source dir: {source_dir}")
+
+    if _global_config["api_key"]:
+        os.environ.setdefault("SI_API_KEY", _global_config["api_key"])
+    if _global_config["base_url"]:
+        os.environ.setdefault("SI_BASE_URL", _global_config["base_url"])
+    if _global_config["model"]:
+        os.environ.setdefault("SI_MODEL", _global_config["model"])
 
 
 def _run_command(handler, args: str) -> str:
@@ -74,6 +95,57 @@ mcp = FastMCP(
 
 
 # ---------------------------------------------------------------------------
+# Initialization tool
+# ---------------------------------------------------------------------------
+
+@mcp.tool(title="Initialize Session")
+async def si_init(
+    source_dir: str = "",
+    api_key: str = "",
+    base_url: str = "",
+    model: str = "",
+) -> str:
+    """Initialize SmartInspector session with global configuration.
+
+    Call this once before using analysis tools. Sets source code directory for
+    attribution and LLM parameters. These values persist across all subsequent
+    tool calls in this session.
+
+    Args:
+        source_dir: Path to the app source code root (for source attribution).
+        api_key: LLM API key (also reads from SI_API_KEY env var).
+        base_url: LLM API base URL (also reads from SI_BASE_URL env var).
+        model: LLM model name (also reads from SI_MODEL env var).
+
+    Returns:
+        Current session configuration summary.
+    """
+    import os
+
+    if source_dir:
+        _global_config["source_dir"] = source_dir
+    if api_key:
+        _global_config["api_key"] = api_key
+        os.environ["SI_API_KEY"] = api_key
+    if base_url:
+        _global_config["base_url"] = base_url
+        os.environ["SI_BASE_URL"] = base_url
+    if model:
+        _global_config["model"] = model
+        os.environ["SI_MODEL"] = model
+
+    info_log("mcp", f"Session initialized: source_dir={_global_config['source_dir'] or '(not set)'}, "
+                       f"model={_global_config['model'] or os.environ.get('SI_MODEL', '(default)')}")
+
+    lines = ["SmartInspector session configured:"]
+    lines.append(f"  source_dir: {_global_config['source_dir'] or '(not set)'}")
+    lines.append(f"  model: {_global_config['model'] or os.environ.get('SI_MODEL', '(default)')}")
+    lines.append(f"  base_url: {_global_config['base_url'] or os.environ.get('SI_BASE_URL', '(default)')}")
+    lines.append(f"  api_key: {'***' if _global_config['api_key'] or os.environ.get('SI_API_KEY') else '(not set)'}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Trace & Analysis tools
 # ---------------------------------------------------------------------------
 
@@ -101,7 +173,7 @@ async def si_full(
     """
     from smartinspector.commands.orchestrate import cmd_full
 
-    _apply_source_dir(source_dir)
+    _apply_global_config(source_dir)
 
     parts = []
     if no_wait:
@@ -134,7 +206,7 @@ async def si_trace(
     """
     from smartinspector.commands.trace import cmd_trace
 
-    _apply_source_dir(source_dir)
+    _apply_global_config(source_dir)
 
     parts = []
     if duration_ms is not None:
@@ -188,7 +260,7 @@ async def si_analyze(
     """
     from smartinspector.commands.trace import cmd_analyze
 
-    _apply_source_dir(source_dir)
+    _apply_global_config(source_dir)
 
     return _run_command(cmd_analyze, trace_path or "")
 
@@ -213,7 +285,7 @@ async def si_frame(
     """
     from smartinspector.commands.trace import cmd_frame
 
-    _apply_source_dir(source_dir)
+    _apply_global_config(source_dir)
 
     args = f"ts={ts} dur={dur}"
     return _run_command(cmd_frame, args)
@@ -235,7 +307,7 @@ async def si_startup(
     """
     from smartinspector.commands.orchestrate import cmd_startup
 
-    _apply_source_dir(source_dir)
+    _apply_global_config(source_dir)
 
     return _run_command(cmd_startup, package_name)
 
@@ -259,7 +331,7 @@ async def si_quick(
     """
     from smartinspector.commands.quick import cmd_quick
 
-    _apply_source_dir(source_dir)
+    _apply_global_config(source_dir)
 
     return _run_command(cmd_quick, trace_path or "")
 
