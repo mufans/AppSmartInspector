@@ -34,6 +34,7 @@ src/smartinspector/          # Main Python package (installed via hatchling)
   tools/                     # File search tools (glob, grep, read) — used by agents
   ws/                        # WebSocket server for app communication
   headless.py                # Headless/CI non-interactive runner
+  mcp_server.py              # MCP Server — exposes CLI commands as MCP tools (si-mcp entry point)
   config.py                  # Runtime configuration (env vars: SI_*)
   debug_log.py               # Debug logging utility → reports/debug_*.log
   perfetto_compat.py         # macOS IPv4 fix for perfetto trace_processor
@@ -287,7 +288,49 @@ uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--dura
 
 **前置条件**：必须先通过 `/full`、`/trace`、`/analyze` 等命令完成分析。若无数据，提示用户先采集。
 
-## Configuration
+### MCP Server
+
+MCP Server 将所有 CLI 命令暴露为 MCP tools，供外部 Agent（Claude Desktop、OpenClaw 等）调用。
+
+**启动方式**：
+```bash
+si-mcp                    # stdio transport (标准 MCP 模式)
+uv run si-mcp             # 开发模式
+```
+
+**入口点**：`si-mcp = "smartinspector.mcp_server:main"`（已添加到 pyproject.toml）
+
+**工具列表**（23 个工具）：
+
+| 工具 | 对应命令 | 说明 |
+|------|---------|------|
+| `si_full` | /full | 完整分析流水线 |
+| `si_trace` | /trace | 采集 + 分析 trace |
+| `si_record` | /record | 仅录制 trace |
+| `si_analyze` | /analyze | 分析已有 trace |
+| `si_frame` | /frame | 帧级分析 |
+| `si_startup` | /startup | 冷启动分析 |
+| `si_quick` | /quick | 快速确定性分析（无 LLM） |
+| `si_report` | /report | 生成报告 |
+| `si_ci_analyze` | --ci | CI/自动化非交互分析 |
+| `si_compare` | /compare | 对比分析报告 |
+| `si_devices` | /devices | 列出设备 |
+| `si_connect` | /connect | 连接设备 |
+| `si_status` | /status | 会话状态 |
+| `si_disconnect` | /disconnect | 断开设备 |
+| `si_config` | /config | Hook 配置 |
+| `si_hooks` | /hooks | 列出 hooks |
+| `si_hook` | /hook | 管理单个 hook |
+| `si_summary` | /summary | 性能摘要 |
+| `si_clear` | /clear | 清除会话 |
+| `si_tokens` | /tokens | Token 用量 |
+| `si_open` | /open | 打开 Perfetto UI |
+| `si_close` | /close | 关闭 Perfetto UI |
+| `si_help` | /help | 帮助信息 |
+
+**依赖**：`mcp>=1.0.0`（已添加到 dependencies 和 `[project.optional-dependencies]`）
+
+**详细文档**：`docs/mcp-server.md`
 
 Environment variables with `SI_` prefix:
 

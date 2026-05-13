@@ -13,10 +13,15 @@ dependencies = [
     "websockets>=16.0,<18.0",
     "prompt_toolkit>=3.0,<4.0",
     "python-dotenv>=1.0.0,<2.0",
+    "mcp>=1.0.0",
 ]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0.0"]
 
 [project.scripts]
 smartinspector = "smartinspector.graph:main"
+si-mcp = "smartinspector.mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]
