@@ -105,7 +105,7 @@ Or use `uv run` for development:
   "mcpServers": {
     "smartinspector": {
       "command": "uv",
-      "args": ["run", "smartinspector.mcp_server:main"],
+      "args": ["run", "si-mcp"],
       "env": {
         "SI_API_KEY": "your-api-key"
       }
