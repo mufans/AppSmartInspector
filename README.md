@@ -62,6 +62,80 @@ uv run smartinspector --ci --target com.example.app --duration 5000 --output rep
 uv run smartinspector --ci --trace trace.pb --format json | jq '.issues[] | select(.severity == "P0")'
 ```
 
+## MCP Server
+
+SmartInspector 提供 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) Server，将所有分析指令暴露为 MCP Tools，供外部 AI Agent（Claude Desktop、OpenClaw、Cursor 等）直接调用。
+
+### 安装与启动
+
+```bash
+# 安装依赖（mcp 已包含在项目依赖中）
+uv sync
+
+# 启动 MCP Server（stdio transport）
+uv run si-mcp
+```
+
+### si_init 统一初始化
+
+首次使用时调用 `si_init` 完成会话配置，参数在整个会话中持久化：
+
+```python
+si_init(
+    source_dir="/path/to/app/source",   # 源码目录（源码归因需要）
+    target_process="com.example.app",   # 默认目标包名
+    debug=False,                        # 启用 debug 日志
+    api_key="your-api-key",             # LLM API Key（也可通过环境变量设置）
+    base_url="https://api.deepseek.com", # API Base URL
+    model="deepseek-chat"               # LLM 模型名
+)
+```
+
+### 核心工具
+
+| 工具 | 说明 |
+|------|------|
+| `si_full` | 全量流水线：采集 → 分析 → 源码归因 → 报告 |
+| `si_trace` | 采集 + 分析 trace（跳过归因） |
+| `si_analyze` | 分析已有 trace 文件 |
+| `si_startup` | 冷启动分析（自动 force-stop + 启动 App） |
+| `si_quick` | 快速确定性分析（不调用 LLM，秒级完成） |
+| `si_ci_analyze` | CI/自动化非交互分析，支持 JSON 输出 |
+| `si_compare` | 对比两份分析报告 |
+
+完整工具列表（23 个）和参数说明见 [docs/mcp-server.md](docs/mcp-server.md)。
+
+### Claude Desktop 配置
+
+在 `~/Library/Application Support/Claude/claude_desktop_config.json` 中添加：
+
+```json
+{
+  "mcpServers": {
+    "smartinspector": {
+      "command": "uv",
+      "args": ["run", "si-mcp"],
+      "env": {
+        "SI_API_KEY": "your-api-key"
+      }
+    }
+  }
+}
+```
+
+### OpenClaw 配置
+
+```yaml
+mcp_servers:
+  - name: smartinspector
+    command: uv
+    args:
+      - run
+      - si-mcp
+    env:
+      SI_API_KEY: your-api-key
+```
+
 ## 架构概览
 
 ```
