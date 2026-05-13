@@ -26,28 +26,32 @@ _session_state: dict[str, Any] = {
 # Global config set via si_init, shared across all tool calls
 _global_config: dict[str, Any] = {
     "source_dir": "",
+    "target_process": "",
+    "debug": False,
     "api_key": "",
     "base_url": "",
     "model": "",
 }
 
 
-def _apply_global_config(source_dir_override: str | None = None) -> None:
+def _apply_global_config() -> None:
     """Apply global config from si_init to the runtime environment.
 
-    Applies source_dir (from override or global config) and LLM settings.
+    Applies source_dir, target_process, debug, and LLM settings.
     Called automatically before each analysis tool execution.
-
-    Args:
-        source_dir_override: Per-tool source_dir override; falls back to global config.
     """
     import os
 
-    source_dir = source_dir_override or _global_config["source_dir"]
-    if source_dir:
+    if _global_config["source_dir"]:
         from smartinspector.config import set_source_dir
-        set_source_dir(source_dir)
-        info_log("mcp", f"Source dir: {source_dir}")
+        set_source_dir(_global_config["source_dir"])
+        info_log("mcp", f"Source dir: {_global_config['source_dir']}")
+
+    if _global_config["target_process"]:
+        _session_state["trace_target_process"] = _global_config["target_process"]
+
+    if _global_config["debug"]:
+        os.environ["SI_DEBUG"] = "1"
 
     if _global_config["api_key"]:
         os.environ.setdefault("SI_API_KEY", _global_config["api_key"])
@@ -101,18 +105,21 @@ mcp = FastMCP(
 @mcp.tool(title="Initialize Session")
 async def si_init(
     source_dir: str = "",
+    target_process: str = "",
+    debug: bool = False,
     api_key: str = "",
     base_url: str = "",
     model: str = "",
 ) -> str:
     """Initialize SmartInspector session with global configuration.
 
-    Call this once before using analysis tools. Sets source code directory for
-    attribution and LLM parameters. These values persist across all subsequent
-    tool calls in this session.
+    Call this once before using analysis tools. All parameters persist across
+    subsequent tool calls in this session.
 
     Args:
         source_dir: Path to the app source code root (for source attribution).
+        target_process: Default target app package name (e.g. com.example.app).
+        debug: Enable debug logging to reports/debug_*.log.
         api_key: LLM API key (also reads from SI_API_KEY env var).
         base_url: LLM API base URL (also reads from SI_BASE_URL env var).
         model: LLM model name (also reads from SI_MODEL env var).
@@ -124,6 +131,11 @@ async def si_init(
 
     if source_dir:
         _global_config["source_dir"] = source_dir
+    if target_process:
+        _global_config["target_process"] = target_process
+    if debug:
+        _global_config["debug"] = True
+        os.environ["SI_DEBUG"] = "1"
     if api_key:
         _global_config["api_key"] = api_key
         os.environ["SI_API_KEY"] = api_key
@@ -135,10 +147,14 @@ async def si_init(
         os.environ["SI_MODEL"] = model
 
     info_log("mcp", f"Session initialized: source_dir={_global_config['source_dir'] or '(not set)'}, "
+                       f"target={_global_config['target_process'] or '(not set)'}, "
+                       f"debug={_global_config['debug']}, "
                        f"model={_global_config['model'] or os.environ.get('SI_MODEL', '(default)')}")
 
     lines = ["SmartInspector session configured:"]
     lines.append(f"  source_dir: {_global_config['source_dir'] or '(not set)'}")
+    lines.append(f"  target_process: {_global_config['target_process'] or '(not set)'}")
+    lines.append(f"  debug: {_global_config['debug']}")
     lines.append(f"  model: {_global_config['model'] or os.environ.get('SI_MODEL', '(default)')}")
     lines.append(f"  base_url: {_global_config['base_url'] or os.environ.get('SI_BASE_URL', '(default)')}")
     lines.append(f"  api_key: {'***' if _global_config['api_key'] or os.environ.get('SI_API_KEY') else '(not set)'}")
@@ -153,37 +169,29 @@ async def si_init(
 async def si_full(
     duration_ms: int | None = None,
     package_name: str | None = None,
-    source_dir: str | None = None,
-    no_wait: bool = False,
-    debug: bool = False,
 ) -> str:
     """Run the full analysis pipeline: collect trace -> analyze -> attribute -> report.
 
     This is the primary entry point for comprehensive performance analysis.
+    Uses target_process from si_init if package_name is not provided.
 
     Args:
         duration_ms: Trace duration in milliseconds (100-60000). Default: 10000.
-        package_name: Target app package name (e.g. com.example.app).
-        source_dir: Source code directory for attribution (maps code hotspots to source files).
-        no_wait: Skip waiting for app connection, start trace immediately.
-        debug: Enable debug logging to reports/debug_*.log.
+        package_name: Target app package name (overrides si_init target_process).
 
     Returns:
         Full performance analysis report in markdown.
     """
     from smartinspector.commands.orchestrate import cmd_full
 
-    _apply_global_config(source_dir)
+    _apply_global_config()
 
     parts = []
-    if no_wait:
-        parts.append("--no-wait")
-    if debug:
-        parts.append("--debug")
     if duration_ms is not None:
         parts.append(str(duration_ms))
-    if package_name:
-        parts.append(package_name)
+    target = package_name or _global_config["target_process"]
+    if target:
+        parts.append(target)
 
     return _run_command(cmd_full, " ".join(parts))
 
@@ -192,27 +200,28 @@ async def si_full(
 async def si_trace(
     duration_ms: int | None = None,
     package_name: str | None = None,
-    source_dir: str | None = None,
 ) -> str:
     """Collect a Perfetto trace and analyze it (stops before attribution/report).
 
+    Uses target_process from si_init if package_name is not provided.
+
     Args:
         duration_ms: Trace duration in milliseconds (100-60000). Default: 10000.
-        package_name: Target app package name.
-        source_dir: Source code directory for attribution.
+        package_name: Target app package name (overrides si_init target_process).
 
     Returns:
         Analysis summary of the collected trace.
     """
     from smartinspector.commands.trace import cmd_trace
 
-    _apply_global_config(source_dir)
+    _apply_global_config()
 
     parts = []
     if duration_ms is not None:
         parts.append(str(duration_ms))
-    if package_name:
-        parts.append(package_name)
+    target = package_name or _global_config["target_process"]
+    if target:
+        parts.append(target)
 
     return _run_command(cmd_trace, " ".join(parts))
 
@@ -224,53 +233,50 @@ async def si_record(
 ) -> str:
     """Record a Perfetto trace without analysis.
 
+    Uses target_process from si_init if package_name is not provided.
+
     Args:
         duration_ms: Trace duration in milliseconds (100-60000). Default: 10000.
-        package_name: Target app package name.
+        package_name: Target app package name (overrides si_init target_process).
 
     Returns:
         Path to the recorded trace file.
     """
     from smartinspector.commands.trace import cmd_record
 
+    _apply_global_config()
+
     parts = []
     if duration_ms is not None:
         parts.append(str(duration_ms))
-    if package_name:
-        parts.append(package_name)
+    target = package_name or _global_config["target_process"]
+    if target:
+        parts.append(target)
 
     return _run_command(cmd_record, " ".join(parts))
 
 
 @mcp.tool(title="Analyze Trace")
-async def si_analyze(
-    trace_path: str | None = None,
-    source_dir: str | None = None,
-) -> str:
+async def si_analyze(trace_path: str | None = None) -> str:
     """Analyze a Perfetto trace file.
 
     Uses the last recorded trace if no path is provided.
 
     Args:
         trace_path: Path to the .pb trace file. Uses last recorded trace if omitted.
-        source_dir: Source code directory for attribution.
 
     Returns:
         Performance analysis results in markdown.
     """
     from smartinspector.commands.trace import cmd_analyze
 
-    _apply_global_config(source_dir)
+    _apply_global_config()
 
     return _run_command(cmd_analyze, trace_path or "")
 
 
 @mcp.tool(title="Frame Analysis")
-async def si_frame(
-    ts: str,
-    dur: str,
-    source_dir: str | None = None,
-) -> str:
+async def si_frame(ts: str, dur: str) -> str:
     """Analyze a specific frame/slice from a loaded Perfetto trace.
 
     Requires a trace to be already loaded (via si_trace, si_record, or si_analyze).
@@ -278,45 +284,42 @@ async def si_frame(
     Args:
         ts: Start timestamp (supports ns, us, ms suffixes, e.g. '1234ms', '500000us').
         dur: Duration of the frame (supports ns, us, ms suffixes).
-        source_dir: Source code directory for attribution.
 
     Returns:
         Frame-level analysis results.
     """
     from smartinspector.commands.trace import cmd_frame
 
-    _apply_global_config(source_dir)
+    _apply_global_config()
 
     args = f"ts={ts} dur={dur}"
     return _run_command(cmd_frame, args)
 
 
 @mcp.tool(title="Cold Start Analysis")
-async def si_startup(
-    package_name: str,
-    source_dir: str | None = None,
-) -> str:
+async def si_startup(package_name: str | None = None) -> str:
     """Analyze app cold start performance: force-stop -> trace -> launch -> analyze.
 
+    Uses target_process from si_init if package_name is not provided.
+
     Args:
-        package_name: Target app package name (e.g. com.example.app).
-        source_dir: Source code directory for attribution.
+        package_name: Target app package name (overrides si_init target_process).
 
     Returns:
         Cold start analysis report with phase breakdown.
     """
     from smartinspector.commands.orchestrate import cmd_startup
 
-    _apply_global_config(source_dir)
+    _apply_global_config()
 
-    return _run_command(cmd_startup, package_name)
+    target = package_name or _global_config["target_process"]
+    if not target:
+        return "Error: package_name required. Provide it here or set target_process in si_init."
+    return _run_command(cmd_startup, target)
 
 
 @mcp.tool(title="Quick Analysis")
-async def si_quick(
-    trace_path: str | None = None,
-    source_dir: str | None = None,
-) -> str:
+async def si_quick(trace_path: str | None = None) -> str:
     """Run fast deterministic analysis without LLM calls.
 
     Pure computation: collector -> deterministic hints -> fast-path attribution.
@@ -324,14 +327,13 @@ async def si_quick(
 
     Args:
         trace_path: Path to the .pb trace file. Uses last recorded trace if omitted.
-        source_dir: Source code directory for attribution.
 
     Returns:
         Quick analysis report in markdown.
     """
     from smartinspector.commands.quick import cmd_quick
 
-    _apply_global_config(source_dir)
+    _apply_global_config()
 
     return _run_command(cmd_quick, trace_path or "")
 
@@ -630,20 +632,19 @@ async def si_ci_analyze(
     cmd: str = "full_analysis",
     target: str | None = None,
     duration: int = 10000,
-    source_dir: str = ".",
     output_format: str = "markdown",
 ) -> str:
     """Run a non-interactive analysis pipeline for CI/automation use.
 
     Executes the full LangGraph pipeline in headless mode. Supports all
     pipeline routes: full_analysis, startup, analyze, trace.
+    Uses source_dir and debug from si_init.
 
     Args:
         trace_path: Path to the Perfetto trace file (.pb).
         cmd: Pipeline command: 'full_analysis', 'startup', 'analyze', or 'trace'.
-        target: Target process package name.
+        target: Target process package name (overrides si_init target_process).
         duration: Trace duration in milliseconds (default 10000).
-        source_dir: Source code search directory.
         output_format: Output format: 'markdown' or 'json'.
 
     Returns:
@@ -651,14 +652,20 @@ async def si_ci_analyze(
     """
     from smartinspector.headless import HeadlessRunner
 
-    info_log("mcp", f"CI analysis: cmd={cmd}, trace={trace_path}, target={target}")
+    _apply_global_config()
+
+    resolved_target = target or _global_config["target_process"]
+    resolved_source_dir = _global_config["source_dir"] or "."
+
+    info_log("mcp", f"CI analysis: cmd={cmd}, trace={trace_path}, target={resolved_target}")
 
     runner = HeadlessRunner(
-        source_dir=source_dir,
-        target=target,
+        source_dir=resolved_source_dir,
+        target=resolved_target,
         trace_path=trace_path,
         fmt=output_format,
         duration=duration,
+        debug=_global_config["debug"],
         cmd=cmd,
     )
 
