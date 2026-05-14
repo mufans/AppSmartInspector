@@ -20,14 +20,11 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /build
 
 # Copy dependency declarations first for Docker layer caching
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
 
 # Install dependencies into isolated venv using lock file
 RUN uv venv /opt/venv && \
-    uv pip install --python /opt/venv/bin/python \
-    --frozen \
-    --no-dev \
-    .
+    uv pip install --python /opt/venv/bin/python .
 
 # -- Stage 2a: Analyzer Runtime ----------------------------------------------
 FROM python:3.12-slim AS si-analyzer
@@ -53,19 +50,24 @@ WORKDIR /app
 # Copy application code
 COPY src/smartinspector/ /app/src/smartinspector/
 COPY prompts/ /app/prompts/
-COPY pyproject.toml /app/
+COPY pyproject.toml README.md /app/
 
-# Download Linux trace_processor_shell binary
-ARG PERFETTO_VERSION=49.0
+# Download Linux trace_processor_shell binary from Perfetto CI artifacts
+# Use TARGETARCH to get correct binary for the platform
+ARG PERFETTO_VERSION=55.1
+ARG TARGETARCH=arm64
 RUN mkdir -p /app/bin && \
     curl -fsSL \
-    "https://github.com/google/perfetto/releases/download/v${PERFETTO_VERSION}/trace_processor_shell-linux-amd64" \
+    "https://storage.googleapis.com/perfetto-luci-artifacts/v${PERFETTO_VERSION}/linux-${TARGETARCH}/trace_processor_shell" \
     -o /app/bin/trace_processor_shell && \
     chmod +x /app/bin/trace_processor_shell
 
-# Install project in editable mode (no extra deps, venv already has them)
-RUN pip install hatchling && \
-    cd /app && pip install -e . --no-deps
+# Install project (non-editable, no extra deps, venv already has them)
+RUN /opt/venv/bin/python -m ensurepip && \
+    /opt/venv/bin/python -m pip install hatchling && \
+    cd /app && /opt/venv/bin/python -m pip install . --no-deps && \
+    # Fix prompts path: code resolves to /opt/venv/lib/python3.12/prompts
+    ln -sf /app/prompts /opt/venv/lib/python3.12/prompts
 
 # Create runtime directories
 RUN mkdir -p /app/reports /traces
@@ -86,7 +88,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
         /app/bin/trace_processor_shell --version || exit 1
 
 # Default entrypoint
-ENTRYPOINT ["python", "-m", "smartinspector.graph"]
+ENTRYPOINT ["smartinspector"]
 CMD ["--help"]
 
 # -- Stage 2b: MCP Server Runtime --------------------------------------------
