@@ -1,0 +1,136 @@
+# =============================================================================
+# SmartInspector Docker Compose
+# =============================================================================
+# Usage:
+#   Dev:     docker compose --profile dev up
+#   CI:      docker compose --profile ci run --rm si-analyzer smartinspector --ci ...
+#   MCP:     docker compose --profile mcp up -d si-mcp-server
+#   Prod:    docker compose --profile prod up -d
+# =============================================================================
+
+services:
+  # -- CI/Headless Analyzer ---------------------------------------------------
+  si-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: si-analyzer
+    image: smartinspector:analyzer
+    container_name: si-analyzer
+    restart: "no"
+    environment:
+      - SI_MODEL=${SI_MODEL:-deepseek-chat}
+      - SI_BASE_URL=${SI_BASE_URL:-https://api.deepseek.com}
+      - SI_API_KEY=${SI_API_KEY:?SI_API_KEY is required}
+      - SI_DEBUG=${SI_DEBUG:-0}
+      - SI_REPORT_MAX_TOKENS=${SI_REPORT_MAX_TOKENS:-4000}
+    volumes:
+      - ${TRACE_DIR:-./traces}:/traces:ro
+      - ./reports:/app/reports
+      - ${SOURCE_DIR:-./src}:/source:ro
+    working_dir: /app
+    profiles:
+      - ci
+    healthcheck:
+      test: ["CMD", "test", "-x", "/app/bin/trace_processor_shell"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # -- MCP Server -------------------------------------------------------------
+  si-mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: si-mcp
+    image: smartinspector:mcp
+    container_name: si-mcp-server
+    restart: unless-stopped
+    environment:
+      - SI_MODEL=${SI_MODEL:-deepseek-chat}
+      - SI_BASE_URL=${SI_BASE_URL:-https://api.deepseek.com}
+      - SI_API_KEY=${SI_API_KEY:?SI_API_KEY is required}
+      - SI_DEBUG=${SI_DEBUG:-0}
+    volumes:
+      - ${TRACE_DIR:-./traces}:/traces:ro
+      - ./reports:/app/reports
+      - ${SOURCE_DIR:-./src}:/source:ro
+    stdin_open: true
+    profiles:
+      - mcp
+    healthcheck:
+      test: ["CMD", "python", "-c", "from smartinspector.mcp_server import main; print('ok')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+  # -- Development Environment ------------------------------------------------
+  si-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: si-analyzer
+    image: smartinspector:dev
+    container_name: si-dev
+    restart: "no"
+    environment:
+      - SI_MODEL=${SI_MODEL:-deepseek-chat}
+      - SI_BASE_URL=${SI_BASE_URL:-https://api.deepseek.com}
+      - SI_API_KEY=${SI_API_KEY:-}
+      - SI_DEBUG=1
+      - SI_WS_PORT=${SI_WS_PORT:-9876}
+    volumes:
+      - .:/app
+      - ./reports:/app/reports
+    ports:
+      - "${SI_WS_PORT:-9876}:9876"
+    profiles:
+      - dev
+    stdin_open: true
+    tty: true
+
+  # -- Production (long-running analysis service) -----------------------------
+  si-prod:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: si-analyzer
+    image: smartinspector:prod
+    container_name: si-prod
+    restart: unless-stopped
+    environment:
+      - SI_MODEL=${SI_MODEL}
+      - SI_BASE_URL=${SI_BASE_URL}
+      - SI_API_KEY=${SI_API_KEY}
+      - SI_DEBUG=0
+      - SI_REPORT_MAX_TOKENS=${SI_REPORT_MAX_TOKENS:-4000}
+    volumes:
+      - ${TRACE_DIR:-/data/traces}:/traces:ro
+      - ${REPORT_DIR:-/data/reports}:/app/reports
+      - ${SOURCE_DIR:-/data/source}:/source:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+    profiles:
+      - prod
+    healthcheck:
+      test: ["CMD", "test", "-x", "/app/bin/trace_processor_shell"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  default:
+    name: si-network
+    driver: bridge
