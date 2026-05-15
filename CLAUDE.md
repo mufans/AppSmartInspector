@@ -52,6 +52,10 @@ perfetto-build/              # Forked Perfetto repo with plugin built in
 reports/                     # Generated output: debug_*.log + perf_report_*.md
 docs/                        # Design documents
 bin/                         # trace_processor_shell binary (used by PerfettoCollector)
+Dockerfile                   # Multi-stage Docker build (si-analyzer / si-mcp targets)
+docker-compose.yml           # Docker Compose profiles (ci/dev/mcp/prod)
+docker/healthcheck.sh        # Container health check script
+.env.docker.example          # Docker environment variable template
 ```
 
 ## Python Conventions
@@ -364,7 +368,8 @@ Trace config in `PerfettoCollector.pull_trace_from_device()`:
 ### trace_processor_shell
 
 `PerfettoCollector` uses a local `trace_processor_shell` binary (not the Python pip package's bundled one):
-- Binary location: `bin/trace_processor_shell`
+- Binary location: `bin/trace_processor_shell` (local dev)
+- Docker image: downloaded from Perfetto CI artifacts (v55.1), supports AMD64 and ARM64 via `TARGETARCH` build arg
 - Configured via `TraceProcessorConfig(bin_path=str(SHELL_BIN))`
 - macOS IPv4 fix applied via `perfetto_compat.patch()` (forces `127.0.0.1` instead of `localhost`)
 
