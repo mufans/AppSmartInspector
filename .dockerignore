@@ -1,0 +1,46 @@
+# Version control
+.git/
+.gitignore
+
+# CI/CD
+.github/
+
+# Development environment
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.claude/
+
+# macOS
+.DS_Store
+
+# Large directories -- must not be included in image
+perfetto-build/
+perfetto-plugin/
+platform/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Environment config (inject via env vars or volume)
+.env
+
+# Generated reports (use volume mount)
+reports/
+
+# Documentation (not needed at runtime)
+docs/
+*.md
+!README.md
+
+# Tests (not needed in production image)
+tests/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
