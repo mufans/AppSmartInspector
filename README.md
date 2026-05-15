@@ -241,7 +241,10 @@ smartinspector/
 ├── prompts/                        # LLM Prompt 模板
 ├── bin/                            # trace_processor_shell
 ├── reports/                        # 生成的性能报告 (Markdown)
-└── tests/                          # 单元测试
+├── tests/                          # 单元测试
+├── Dockerfile                      # 多阶段 Docker 构建 (si-analyzer / si-mcp)
+├── docker-compose.yml              # Docker Compose (ci/dev/mcp/prod profiles)
+└── docker/healthcheck.sh           # 容器健康检查脚本
 ```
 
 ## Hook 体系 (Android)
@@ -465,7 +468,8 @@ TOTAL                   65.6k     5.0k    70.6k     27
 | 方法 Hook (Android) | Pine AOP Framework                                     |
 | CLI 交互            | prompt_toolkit (Tab 补全, REPL) + argparse (CI 模式)     |
 | 通信                | WebSocket (CLI ↔ App, 心跳检测, 动态端口)                      |
-| Trace 分析          | trace_processor_shell (SQL)                            |
+| Trace 分析          | trace_processor_shell (SQL, v55.1 multi-arch)          |
+| 容器化              | Docker multi-stage build (AMD64/ARM64)                 |
 | 状态管理              | LangGraph MemorySaver (get_state)                      |
 
 
@@ -512,10 +516,82 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 ## 环境要求
 
 - Python 3.12+
-- macOS (trace_processor_shell 为 arm64 二进制)
+- macOS / Linux / Windows (通过 Docker)
 - **Android**: 设备 API 28+，开启 USB 调试，adb 已加入 PATH
 - **HarmonyOS**: hdc 已加入 PATH (规划)
 - **iOS**: Xcode + Instruments (规划)
+
+## Docker 部署
+
+SmartInspector 提供多阶段 Docker 构建，支持 **AMD64** 和 **ARM64** 架构，内置 Perfetto v55.1 `trace_processor_shell`，可直接在 CI/CD 环境中运行。
+
+### 构建
+
+```bash
+# 默认构建 (analyzer 镜像)
+docker build -t smartinspector:latest .
+
+# 指定目标
+docker build --target si-analyzer -t smartinspector:analyzer .
+docker build --target si-mcp -t smartinspector:mcp .
+
+# ARM64 平台构建
+docker build --build-arg TARGETARCH=arm64 -t smartinspector:arm64 .
+```
+
+### Docker Compose
+
+提供四种运行 Profile，按场景选择：
+
+| Profile | 用途 | 命令 |
+|---------|------|------|
+| `ci` | CI/Headless 分析 | `docker compose --profile ci run --rm si-analyzer smartinspector --ci ...` |
+| `dev` | 开发环境（挂载源码，暴露 WS 端口） | `docker compose --profile dev up` |
+| `mcp` | MCP Server（stdio transport） | `docker compose --profile mcp up -d si-mcp-server` |
+| `prod` | 生产环境（资源限制 + 日志轮转） | `docker compose --profile prod up -d` |
+
+### CI 模式示例
+
+```bash
+# 1. 配置环境变量
+cp .env.docker.example .env
+# 编辑 .env 填入 SI_API_KEY
+
+# 2. 分析已有 trace 文件，输出 JSON 报告
+docker compose --profile ci run --rm \
+  -e SI_API_KEY=$SI_API_KEY \
+  si-analyzer \
+  smartinspector --ci --trace /traces/trace.pb --format json --src /source
+
+# 3. 生成 Markdown 报告到文件
+docker compose --profile ci run --rm \
+  -e SI_API_KEY=$SI_API_KEY \
+  si-analyzer \
+  smartinspector --ci --trace /traces/trace.pb --output /app/reports/report.md
+```
+
+### 卷挂载
+
+| 宿主机路径 | 容器路径 | 用途 |
+|-----------|---------|------|
+| `${TRACE_DIR:-./traces}` | `/traces` | Trace 文件输入（只读） |
+| `./reports` | `/app/reports` | 报告输出 |
+| `${SOURCE_DIR:-./src}` | `/source` | 源码目录（归因用，只读） |
+
+### 镜像结构
+
+```
+python:3.12-slim (builder)
+  └── uv install dependencies → /opt/venv
+      └── si-analyzer (runtime)
+          ├── /opt/venv (Python dependencies)
+          ├── /app/bin/trace_processor_shell (Perfetto v55.1, multi-arch)
+          ├── /app/src/smartinspector/ (application code)
+          ├── /app/prompts/ → /opt/venv/lib/python3.12/prompts (symlink)
+          └── ENTRYPOINT ["smartinspector"]
+              └── si-mcp (extends si-analyzer)
+                  └── ENTRYPOINT ["si-mcp"]
+```
 
 ## 路线图
 
@@ -539,6 +615,7 @@ SI_ATTRIBUTOR_MODEL=claude-sonnet-4-20250514
 
 ### 工程优化
 
+- Docker 容器化部署 (multi-stage build, AMD64/ARM64, CI/CD 集成)
 - 帧严重度阈值区分刷新率 (120Hz 设备帧预算 8.33ms)
 - 输入事件关联 (touch event → frame jank 因果)
 - RV Instance 区分 create vs bind 开销
