@@ -11,10 +11,10 @@ from langchain_openai import ChatOpenAI
 
 from smartinspector.config import get_llm_kwargs
 from smartinspector.debug_log import info_log
-from smartinspector.prompts import load_prompt
+from smartinspector.prompts import load_prompt_with_skills
 from smartinspector.token_tracker import get_tracker
 
-_prompt = load_prompt("frame-analyzer")
+_prompt = load_prompt_with_skills("frame-analyzer", "ui-jank", "shared:si-tag-system")
 _llm = None
 _llm_lock = threading.Lock()
 

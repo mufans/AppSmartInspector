@@ -16,11 +16,11 @@ from smartinspector.graph.nodes.reporter.persistence import save_report
 
 def reporter_node(state: AgentState) -> dict:
     """Generate the final performance report using LLM with streaming output."""
-    from smartinspector.prompts import load_prompt
+    from smartinspector.prompts import load_prompt_with_skills
     from smartinspector.commands.orchestrate import _build_report_header
     from smartinspector.graph.state import RouteDecision
 
-    report_prompt = load_prompt("report-generator")
+    report_prompt = load_prompt_with_skills("report-generator")
 
     perf_json = state.get("perf_summary", "")
     perf_analysis = state.get("perf_analysis", "")

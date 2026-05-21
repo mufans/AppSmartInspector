@@ -24,7 +24,7 @@ from smartinspector.debug_log import debug_log
 from smartinspector.tools.grep import grep
 from smartinspector.tools.glob import glob
 from smartinspector.tools.read import read
-from smartinspector.prompts import load_prompt
+from smartinspector.prompts import load_prompt_with_skills
 from smartinspector.token_tracker import get_tracker
 
 
@@ -107,7 +107,7 @@ def _get_llm():
             return _llm_with_tools, _system_prompt
         llm = ChatOpenAI(**get_llm_kwargs(role="attributor", temperature=0))
         _llm_with_tools = llm.bind_tools([grep, glob, read])
-        _system_prompt = load_prompt("attributor")
+        _system_prompt = load_prompt_with_skills("attributor", "shared:si-tag-system", "shared:search-strategy")
         # Skip structured output entirely — with_structured_output uses
         # response_format which activates DeepSeek's thinking mode, causing
         # reasoning_content errors on subsequent calls. Text parsing fallback
