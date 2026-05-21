@@ -156,3 +156,67 @@ def test_lock_contention_format_section():
     section = dim.format_section(data)
     assert "锁竞争" in section
     assert "main" in section
+
+
+# --- SchedLatencyDimension tests ---
+
+from smartinspector.collector.dimensions.sched_latency import SchedLatencyDimension
+
+
+def test_sched_latency_name_and_keys():
+    dim = SchedLatencyDimension()
+    assert dim.name == "sched_latency"
+    assert dim.perf_summary_key == "sched_latency"
+    assert "sched_latency" in dim.metric_keys
+    assert "调度延迟" in dim.metric_triggers
+
+
+def test_sched_latency_hint_over_budget():
+    dim = SchedLatencyDimension()
+    data = {
+        "threads": [
+            {"thread_name": "main", "runnable_count": 50, "avg_runnable_ms": 12.0, "max_runnable_ms": 45.0},
+            {"thread_name": "worker", "runnable_count": 30, "avg_runnable_ms": 1.0, "max_runnable_ms": 3.0},
+        ],
+        "summary": {"total_threads": 2, "over_budget_count": 1, "worst_thread": "main"},
+    }
+    ctx = HintContext(frame_budget_ms=16.67)
+    hint = dim.compute_hint(data, ctx)
+    assert "[调度延迟]" in hint
+    assert "main" in hint
+    assert "worker" not in hint
+
+
+def test_sched_latency_hint_no_data():
+    dim = SchedLatencyDimension()
+    assert dim.compute_hint({}, HintContext()) == ""
+    assert dim.compute_hint({"threads": []}, HintContext()) == ""
+
+
+def test_sched_latency_hint_all_below_threshold():
+    dim = SchedLatencyDimension()
+    data = {
+        "threads": [
+            {"thread_name": "bg", "runnable_count": 10, "avg_runnable_ms": 0.5, "max_runnable_ms": 1.0},
+        ]
+    }
+    assert dim.compute_hint(data, HintContext(frame_budget_ms=16.67)) == ""
+
+
+def test_sched_latency_format_section():
+    dim = SchedLatencyDimension()
+    data = {
+        "threads": [
+            {"thread_name": "main", "runnable_count": 50, "avg_runnable_ms": 12.0, "max_runnable_ms": 45.0},
+        ]
+    }
+    section = dim.format_section(data)
+    assert "调度延迟" in section
+    assert "main" in section
+    assert "| " in section
+
+
+def test_sched_latency_format_empty():
+    dim = SchedLatencyDimension()
+    assert dim.format_section({}) == ""
+    assert dim.format_section({"threads": []}) == ""
