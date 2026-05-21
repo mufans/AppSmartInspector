@@ -244,7 +244,7 @@ def test_file_io_hint_main_thread_blocked():
     }
     hint = dim.compute_hint(data, HintContext())
     assert "[主线程IO]" in hint
-    assert "main" in hint
+    assert "folio_wait_bit_common" in hint
 
 
 def test_file_io_hint_no_main_thread():
@@ -357,7 +357,7 @@ def test_binder_ipc_format():
     dim = BinderIPCDimension()
     data = {
         "threads": [
-            {"thread_name": "main", "binder_waits": 12, "total_wait_ms": 180.0, "max_wait_ms": 35.0},
+            {"thread_name": "main", "binder_waits": 12, "total_wait_ms": 180.0, "max_wait_ms": 35.0, "avg_wait_ms": 15.0},
         ]
     }
     section = dim.format_section(data)
