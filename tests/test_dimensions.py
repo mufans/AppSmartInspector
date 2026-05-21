@@ -220,3 +220,267 @@ def test_sched_latency_format_empty():
     dim = SchedLatencyDimension()
     assert dim.format_section({}) == ""
     assert dim.format_section({"threads": []}) == ""
+
+
+# --- FileIODimension tests ---
+
+from smartinspector.collector.dimensions.file_io import FileIODimension
+
+
+def test_file_io_name_and_keys():
+    dim = FileIODimension()
+    assert dim.name == "file_io"
+    assert "文件io" in dim.metric_triggers
+    assert dim.skill_name == "io-analysis"
+
+
+def test_file_io_hint_main_thread_blocked():
+    dim = FileIODimension()
+    data = {
+        "blocking_events": [
+            {"blocked_function": "folio_wait_bit_common", "thread_name": "main", "occurrences": 8, "total_ms": 120.0, "max_ms": 45.0},
+        ],
+        "main_thread_total_ms": 120.0,
+    }
+    hint = dim.compute_hint(data, HintContext())
+    assert "[主线程IO]" in hint
+    assert "main" in hint
+
+
+def test_file_io_hint_no_main_thread():
+    dim = FileIODimension()
+    data = {
+        "blocking_events": [
+            {"blocked_function": "folio_wait_bit_common", "thread_name": "bg_thread", "occurrences": 3, "total_ms": 5.0, "max_ms": 2.0},
+        ],
+        "main_thread_total_ms": 0.0,
+    }
+    assert dim.compute_hint(data, HintContext()) == ""
+
+
+def test_file_io_hint_empty():
+    dim = FileIODimension()
+    assert dim.compute_hint({}, HintContext()) == ""
+    assert dim.compute_hint({"blocking_events": []}, HintContext()) == ""
+
+
+def test_file_io_format():
+    dim = FileIODimension()
+    data = {
+        "blocking_events": [
+            {"blocked_function": "folio_wait_bit_common", "thread_name": "main", "occurrences": 8, "total_ms": 120.0, "max_ms": 45.0},
+        ],
+        "main_thread_total_ms": 120.0,
+    }
+    section = dim.format_section(data)
+    assert "IO" in section
+    assert "folio_wait_bit_common" in section
+
+
+# --- MemoryTrendDimension tests ---
+
+from smartinspector.collector.dimensions.memory_trend import MemoryTrendDimension
+
+
+def test_memory_trend_name_and_keys():
+    dim = MemoryTrendDimension()
+    assert dim.name == "memory_trend"
+    assert "内存趋势" in dim.metric_triggers
+    assert dim.skill_name == "memory-analysis"
+
+
+def test_memory_trend_hint_growth():
+    dim = MemoryTrendDimension()
+    data = {
+        "process_name": "com.example.app",
+        "samples": 50,
+        "start_rss_mb": 120.0,
+        "end_rss_mb": 180.0,
+        "delta_mb": 60.0,
+        "delta_pct": 50.0,
+        "trend_slope_mb_per_s": 6.0,
+    }
+    hint = dim.compute_hint(data, HintContext())
+    assert "[内存趋势]" in hint
+    assert "50.0%" in hint or "50%" in hint
+
+
+def test_memory_trend_hint_stable():
+    dim = MemoryTrendDimension()
+    data = {
+        "process_name": "com.example.app",
+        "samples": 50,
+        "start_rss_mb": 120.0,
+        "end_rss_mb": 130.0,
+        "delta_mb": 10.0,
+        "delta_pct": 8.3,
+        "trend_slope_mb_per_s": 1.0,
+    }
+    assert dim.compute_hint(data, HintContext()) == ""
+
+
+def test_memory_trend_hint_empty():
+    dim = MemoryTrendDimension()
+    assert dim.compute_hint({}, HintContext()) == ""
+
+
+def test_memory_trend_format():
+    dim = MemoryTrendDimension()
+    data = {
+        "process_name": "com.example.app",
+        "samples": 50,
+        "start_rss_mb": 120.0,
+        "end_rss_mb": 180.0,
+        "delta_mb": 60.0,
+        "delta_pct": 50.0,
+        "trend_slope_mb_per_s": 6.0,
+    }
+    section = dim.format_section(data)
+    assert "内存" in section
+    assert "120" in section
+    assert "180" in section
+
+
+# --- BinderIPCDimension tests ---
+
+from smartinspector.collector.dimensions.binder_ipc import BinderIPCDimension
+
+
+def test_binder_ipc_name_and_keys():
+    dim = BinderIPCDimension()
+    assert dim.name == "binder_ipc"
+    assert "binder" in dim.metric_triggers
+    assert dim.skill_name == "binder-ipc"
+
+
+def test_binder_ipc_format():
+    dim = BinderIPCDimension()
+    data = {
+        "threads": [
+            {"thread_name": "main", "binder_waits": 12, "total_wait_ms": 180.0, "max_wait_ms": 35.0},
+        ]
+    }
+    section = dim.format_section(data)
+    assert "Binder" in section
+    assert "main" in section
+
+
+def test_binder_ipc_format_empty():
+    dim = BinderIPCDimension()
+    assert dim.format_section({}) == ""
+    assert dim.format_section({"threads": []}) == ""
+
+
+# --- CpuThrottlingDimension tests ---
+
+from smartinspector.collector.dimensions.cpu_throttling import CpuThrottlingDimension
+
+
+def test_cpu_throttling_name_and_keys():
+    dim = CpuThrottlingDimension()
+    assert dim.name == "cpu_throttling"
+    assert "降频" in dim.metric_triggers
+    assert dim.skill_name == "cpu-throttling"
+    assert "sys_stats" in dim.metric_keys
+
+
+def test_cpu_throttling_hint_throttled():
+    dim = CpuThrottlingDimension()
+    data = {
+        "cpu_freq_by_core": {
+            "0": {"min_mhz": 300, "max_mhz": 2841, "avg_mhz": 800, "samples": 100},
+            "4": {"min_mhz": 300, "max_mhz": 2841, "avg_mhz": 400, "samples": 100},
+        },
+        "throttled_cores": [
+            {"core": 4, "max_mhz": 2841, "avg_mhz": 400, "throttle_pct": 85.9},
+        ],
+    }
+    hint = dim.compute_hint(data, HintContext())
+    assert "[CPU降频]" in hint
+
+
+def test_cpu_throttling_hint_normal():
+    dim = CpuThrottlingDimension()
+    data = {
+        "cpu_freq_by_core": {
+            "0": {"min_mhz": 300, "max_mhz": 2841, "avg_mhz": 2000, "samples": 100},
+        },
+        "throttled_cores": [],
+    }
+    assert dim.compute_hint(data, HintContext()) == ""
+
+
+def test_cpu_throttling_hint_empty():
+    dim = CpuThrottlingDimension()
+    assert dim.compute_hint({}, HintContext()) == ""
+
+
+# --- GcEventsDimension tests ---
+
+from smartinspector.collector.dimensions.gc_events import GcEventsDimension
+
+
+def test_gc_events_name_and_keys():
+    dim = GcEventsDimension()
+    assert dim.name == "gc_events"
+    assert "gc" in dim.metric_triggers
+    assert "垃圾回收" in dim.metric_triggers
+    assert dim.skill_name == "gc-analysis"
+
+
+def test_gc_events_hint_with_pause():
+    dim = GcEventsDimension()
+    data = {
+        "total_count": 15,
+        "total_pause_ms": 120.0,
+        "max_pause_ms": 35.0,
+        "main_thread_pause_ms": 80.0,
+        "events": [
+            {"name": "GC: Wait For Concurrent", "dur_ms": 35.0, "gc_reason": "Alloc", "gc_type": "Concurrent"},
+            {"name": "GC: Alloc", "dur_ms": 8.0, "gc_reason": "Alloc", "gc_type": "Non-concurrent"},
+        ],
+    }
+    hint = dim.compute_hint(data, HintContext(frame_budget_ms=16.67))
+    assert "[GC分析]" in hint
+    assert "35.0" in hint
+
+
+def test_gc_events_hint_below_threshold():
+    dim = GcEventsDimension()
+    data = {
+        "total_count": 2,
+        "total_pause_ms": 3.0,
+        "max_pause_ms": 2.0,
+        "main_thread_pause_ms": 0.0,
+        "events": [
+            {"name": "GC: Background", "dur_ms": 2.0, "gc_reason": "Background", "gc_type": "Concurrent"},
+        ],
+    }
+    assert dim.compute_hint(data, HintContext(frame_budget_ms=16.67)) == ""
+
+
+def test_gc_events_hint_empty():
+    dim = GcEventsDimension()
+    assert dim.compute_hint({}, HintContext()) == ""
+    assert dim.compute_hint({"events": []}, HintContext()) == ""
+
+
+def test_gc_events_format_section():
+    dim = GcEventsDimension()
+    data = {
+        "total_count": 5,
+        "total_pause_ms": 50.0,
+        "max_pause_ms": 20.0,
+        "main_thread_pause_ms": 30.0,
+        "events": [
+            {"name": "GC: Alloc", "dur_ms": 20.0, "gc_reason": "Alloc", "gc_type": "Non-concurrent"},
+        ],
+    }
+    section = dim.format_section(data)
+    assert "GC" in section
+    assert "20.0" in section
+
+
+def test_gc_events_format_empty():
+    dim = GcEventsDimension()
+    assert dim.format_section({"events": []}) == ""
