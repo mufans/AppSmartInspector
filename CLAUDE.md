@@ -203,6 +203,11 @@ end            → END
 - 超过3行的 prompt 必须抽取到 `prompts/` 目录
 - Prompt 文件命名：`{功能名}.txt`（如 `report-generator.txt`、`attributor.txt`）
 
+### Skill 知识文件规则
+- Skill 知识文件存放在 `prompts/skills/dimensions/`（按维度）和 `prompts/skills/shared/`（共享知识）
+- 通过 `load_prompt_with_skills(name, *skill_names)` 按需加载维度知识
+- 新增维度必须同步创建对应的 `prompts/skills/dimensions/<name>.md` 知识文件
+
 ### CLI Mode (Headless/CI)
 
 ```
@@ -278,11 +283,11 @@ uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--dura
 
 | 类别 | 指标 ID | 触发词 |
 |------|---------|--------|
-| CPU | `cpu`, `cpu_hotspot`, `sched`, `blocked` | cpu占用/热点/调度/阻塞 |
-| 内存 | `memory`, `heap` | 内存/RSS/堆/泄漏 |
+| CPU | `cpu`, `cpu_hotspot`, `sched`, `blocked`, `sched_latency`, `cpu_throttling` | cpu占用/热点/调度/阻塞/调度延迟/降频 |
+| 内存 | `memory`, `heap`, `memory_trend` | 内存/RSS/堆/泄漏/内存趋势 |
 | UI | `frame`, `rv`, `view`, `compose`, `inflate`, `startup` | 帧率/列表/绘制/重组/布局/启动 |
-| IO | `io`, `network`, `db`, `image` | io/网络/数据库/图片 |
-| 系统 | `thread_state`, `sys`, `input` | 线程状态/系统/触摸 |
+| IO | `io`, `network`, `db`, `image`, `file_io` | io/网络/数据库/图片/文件io/磁盘 |
+| 系统 | `thread_state`, `sys`, `input`, `lock_contention`, `gc`, `binder_ipc` | 线程状态/系统/触摸/锁/futex/gc/垃圾回收/binder/ipc/跨进程 |
 | 总览 | `overview` | 性能总览 |
 
 **前置条件**：必须先通过 `/full`、`/trace`、`/analyze` 等命令完成分析。若无数据，提示用户先采集。
@@ -329,22 +334,32 @@ Trace config in `PerfettoCollector.pull_trace_from_device()`:
 
 Each `collect_*()` method queries Perfetto SQL tables and returns structured data:
 
-| Method | Returns | SQL Tables |
-|--------|---------|------------|
-| `collect_sched()` | Scheduling stats, hot threads, blocked reasons | `sched`, `thread` |
-| `collect_cpu_hotspots()` | CPU flame graph data with callchain reconstruction | `perf_sample`, `stack_profile_callsite`, `stack_profile_frame` |
-| `collect_thread_state()` | Running/Sleeping/DiskSleep per SI$ slice | `sched` (see note below) |
-| `collect_frame_timeline()` | Frame timing + jank detection | `actual_frame_timeline_slice`, `expected_frame_timeline_slice` |
-| `collect_cpu_usage()` | CPU usage per-core over time | `counter`, `cpu` |
-| `collect_sys_stats()` | System stats (memory, CPU freq) | `counter` |
-| `collect_process_memory()` | Per-process memory (RSS, anon) | `process_memory_snapshot` |
-| `collect_memory()` | Aggregated memory summary | `process_memory_snapshot` |
-| `collect_threads()` | Thread list for target process | `thread`, `process` |
-| `collect_view_slices()` | View system slices (doFrame, measure, layout, draw, RV) with parent chains | `slice`, `args` |
-| `collect_io_slices()` | IO-related slices (net/db/img) from all threads | `slice` |
-| `collect_io_slices()` | IO-related slices (net/db/img) | `slice` |
-| `collect_input_events()` | Touch/input event data | `slice` |
-| `collect_block_events()` | SI$block slices merged with logcat SIBlock stack traces | `slice`, `android_logs` |
+| # | 能力 | 数据源 | 实现 | 标签 | 描述 |
+|---|------|--------|------|------|------|
+| 1 | 调度分析 | `sched`, `thread` | `sched()` | `[调度分析]` | 线程调度、热线程、阻塞原因 |
+| 2 | CPU 火焰图 | `perf_sample`, `stack_profile_callsite`, `stack_profile_frame` | `collect_cpu_hotspots()` | `[CPU分析]` | CPU 调用链重构 |
+| 3 | 线程状态 | `sched` (见下文) | `collect_thread_state()` | `[线程状态]` | 运行中/休眠/磁盘休眠 |
+| 4 | 帧时间线 | `actual_frame_timeline_slice`, `expected_frame_timeline_slice` | `collect_frame_timeline()` | `[UI性能]` | 帧率检测、卡顿分析 |
+| 5 | CPU 占用率 | `counter`, `cpu` | `collect_cpu_usage()` | `[CPU分析]` | 各核心 CPU 使用率 |
+| 6 | 系统统计 | `counter` | `collect_sys_stats()` | `[系统]` | 内存、CPU 频率 |
+| 7 | 进程内存 | `process_memory_snapshot` | `collect_process_memory()` | `[内存]` | RSS、匿名内存 |
+| 8 | 内存汇总 | `process_memory_snapshot` | `collect_memory()` | `[内存]` | 内存使用汇总 |
+| 9 | 线程列表 | `thread`, `process` | `collect_threads()` | `[线程]` | 目标进程线程 |
+| 10 | View 切片 | `slice`, `args` | `collect_view_slices()` | `[UI性能]` | 绘制流程、RV 摘要 |
+| 11 | IO 切片 | `slice` | `collect_io_slices()` | `[IO分析]` | 网络/数据库/图片 |
+| 12 | 输入事件 | `slice` | `collect_input_events()` | `[UI性能]` | 触摸/输入事件 |
+| 13 | 阻塞事件 | `slice`, `android_logs` | `collect_block_events()` | `[阻塞分析]` | 主线程阻塞日志 |
+| 14 | CPU 调度延迟 | `sched_runnable` | `SchedLatencyDimension` (Registry) | `[调度延迟]` | runnable → running 延迟 |
+| 15 | 锁竞争 | `__intrinsic_thread_state` | `LockContentionDimension` (Registry) | `[锁竞争]` | futex 等待分析 |
+| 16 | GC 事件 | `slice` (GC*) | `GcEventsDimension` (Registry) | `[GC分析]` | GC pause 分析 |
+| 17 | 文件 IO | `__intrinsic_thread_state` | `FileIODimension` (Registry) | `[主线程IO]` | io_wait 阻塞 |
+| 18 | 内存趋势 | `process_counter_track` | `MemoryTrendDimension` (Registry) | `[内存趋势]` | RSS 增长检测 |
+| 19 | Binder IPC | `__intrinsic_thread_state` | `BinderIPCDimension` (Registry) | `[Binder IPC]` | binder_thread_read |
+| 20 | CPU 降频 | `cpu_counter_track` | `CpuThrottlingDimension` (Registry) | `[CPU降频]` | thermal throttling |
+| 21 | 源码归因 | N/A | `AttributionDimension` (Registry) | `[源码归因]` | SI$ 切片源码定位 |
+| 22 | 预计算提示 | N/A | `DeterministicHints` (Registry) | `[预计算]` | 确定性分析结论 |
+
+总计: 22 个分析维度
 
 **Note on `collect_thread_state`**: Currently uses `sched` table overlap calculation. Planned upgrade to use `__intrinsic_thread_state` table for `blocked_function`, `waker_utid`, and `io_wait` data (see `docs/thread-state-blocking-analysis-design.md`).
 
@@ -424,6 +439,16 @@ Sections are ordered by priority to survive truncation at `SI_REPORT_MAX_TOKENS`
 - `frame_timeline.jank_detail/slowest_frames` (>10 rows) → keep top 3 + summary
 - `cpu_usage.top_processes[].threads` (>10 rows) → keep top 3 + summary
 - `thread_state` (>10 rows) → keep top 5 + summary
+
+### Dimension Registry
+
+新增分析维度通过 `src/smartinspector/collector/dimensions/` 包注册：
+
+1. 创建 `dimensions/xxx.py`，继承 `AnalysisDimension` 并用 `@register_dimension` 装饰
+2. 实现 `collect()` (SQL 查询), `compute_hint()` (确定性分析), `format_section()` (Markdown 格式化)
+3. 在 `prompts/skills/dimensions/` 创建对应知识文件
+
+Registry 通过 `DimensionRegistry.discover()` 自动发现所有维度模块。Pipeline 的 summarize/compute_hints/format_perf_sections/metric_qa 四个环节统一从 Registry 驱动。
 
 ### Analysis Verifier
 
