@@ -80,3 +80,79 @@ def test_register_decorator():
     assert registered.name == "decorated"
     assert isinstance(registered, DecoratedDim)
     DimensionRegistry.clear()
+
+
+# --- LockContentionDimension tests ---
+
+from smartinspector.collector.dimensions.lock_contention import LockContentionDimension
+
+
+def test_lock_contention_name_and_keys():
+    dim = LockContentionDimension()
+    assert dim.name == "lock_contention"
+    assert "锁竞争" in dim.metric_triggers
+    assert "futex" in dim.metric_triggers
+    assert dim.skill_name == "lock-contention"
+
+
+def test_lock_contention_hint_main_thread():
+    dim = LockContentionDimension()
+    data = {
+        "threads": [
+            {
+                "thread_name": "main",
+                "futex_wait_count": 35,
+                "total_wait_ms": 250.0,
+                "max_wait_ms": 45.0,
+                "avg_wait_ms": 7.1,
+            },
+        ],
+        "contention_hotspots": [
+            {
+                "blocked_function": "futex_wait_queue_me",
+                "thread_name": "main",
+                "occurrences": 20,
+                "total_ms": 150.0,
+            }
+        ],
+    }
+    hint = dim.compute_hint(data, HintContext())
+    assert "[锁竞争]" in hint
+    assert "main" in hint
+
+
+def test_lock_contention_hint_below_threshold():
+    dim = LockContentionDimension()
+    data = {
+        "threads": [
+            {
+                "thread_name": "bg_thread",
+                "futex_wait_count": 5,
+                "total_wait_ms": 2.0,
+                "max_wait_ms": 1.0,
+                "avg_wait_ms": 0.4,
+            },
+        ]
+    }
+    assert dim.compute_hint(data, HintContext()) == ""
+
+
+def test_lock_contention_hint_empty():
+    dim = LockContentionDimension()
+    assert dim.compute_hint({}, HintContext()) == ""
+    assert dim.compute_hint({"threads": []}, HintContext()) == ""
+
+
+def test_lock_contention_format_section():
+    dim = LockContentionDimension()
+    data = {
+        "threads": [
+            {"thread_name": "main", "futex_wait_count": 35, "total_wait_ms": 250.0, "max_wait_ms": 45.0, "avg_wait_ms": 7.1},
+        ],
+        "contention_hotspots": [
+            {"blocked_function": "futex_wait_queue_me", "thread_name": "main", "occurrences": 20, "total_ms": 150.0},
+        ],
+    }
+    section = dim.format_section(data)
+    assert "锁竞争" in section
+    assert "main" in section
