@@ -77,6 +77,7 @@ class PerfSummary:
     compose_slices: dict = field(default_factory=dict)
     sys_stats: dict = field(default_factory=dict)
     thread_state: list[dict] = field(default_factory=list)
+    dimensions: dict = field(default_factory=dict)  # Registry 维度数据
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, ensure_ascii=False)
