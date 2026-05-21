@@ -278,6 +278,26 @@ def compute_hints(perf_json: str) -> str:
         _analyze_memory(data),
     ]
 
+    # 维度注册表 hints
+    dimensions_data = data.get("dimensions", {})
+    if dimensions_data:
+        try:
+            from smartinspector.collector.dimensions import DimensionRegistry, HintContext
+            DimensionRegistry.discover()
+            ctx = HintContext(
+                frame_budget_ms=frame_budget_ms,
+                target_process=data.get("metadata", {}).get("target_process", {}).get("package", ""),
+                trace_duration_ms=float(data.get("metadata", {}).get("trace_duration_ns", 0)) / 1e6,
+            )
+            for dim in DimensionRegistry.all():
+                dim_data = dimensions_data.get(dim.perf_summary_key)
+                if dim_data and not dim_data.get("error"):
+                    hint = dim.compute_hint(dim_data, ctx)
+                    if hint:
+                        sections.append(hint)
+        except Exception:
+            pass
+
     return "\n\n".join(s for s in sections if s)
 
 

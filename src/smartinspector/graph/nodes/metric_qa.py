@@ -77,6 +77,21 @@ METRIC_DATA_MAP: dict[str, list[str]] = {
 }
 
 
+def _extend_metric_map_from_registry() -> None:
+    """从 DimensionRegistry 扩展 METRIC_DATA_MAP。"""
+    try:
+        from smartinspector.collector.dimensions import DimensionRegistry
+        DimensionRegistry.discover()
+        for dim in DimensionRegistry.all():
+            for trigger in dim.metric_triggers:
+                METRIC_DATA_MAP[trigger] = dim.metric_keys
+    except Exception:
+        pass
+
+
+_extend_metric_map_from_registry()
+
+
 def _filter_rv(data: dict) -> dict:
     """Keep only rv_instances from view_slices."""
     vs = data.get("view_slices", {})

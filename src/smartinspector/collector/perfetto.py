@@ -1724,6 +1724,21 @@ class PerfettoCollector:
         except Exception as e:
             debug_log("perfetto", f"thread_state collection failed: {e}")
 
+        # 维度注册表分析
+        try:
+            from smartinspector.collector.dimensions import DimensionRegistry
+            DimensionRegistry.discover()
+            for dim in DimensionRegistry.all():
+                try:
+                    dim_data = dim.collect(tp)
+                    summary.dimensions[dim.perf_summary_key] = dim_data
+                    info_log("collector", f"Dimension {dim.name}: collected")
+                except Exception as e:
+                    info_log("collector", f"Dimension {dim.name} collect failed: {e}")
+                    summary.dimensions[dim.perf_summary_key] = {"error": str(e)}
+        except Exception as e:
+            info_log("collector", f"DimensionRegistry discover failed: {e}")
+
         return summary
 
     @staticmethod
