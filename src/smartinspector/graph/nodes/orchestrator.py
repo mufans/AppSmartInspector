@@ -37,6 +37,13 @@ Categories (pick ONE):
   系统状态/cpu频率 → metric_qa:sys
   触摸/touch → metric_qa:input
   性能怎么样/overall/summary → metric_qa:overview
+  锁竞争/lock/futex → metric_qa:lock_contention
+  调度延迟/sched_latency/runnable → metric_qa:sched_latency
+  GC/垃圾回收 → metric_qa:gc_events
+  文件io/磁盘io/file_io → metric_qa:file_io
+  内存趋势/内存泄漏趋势 → metric_qa:memory_trend
+  binder/ipc/跨进程 → metric_qa:binder_ipc
+  降频/throttling/cpu频率 → metric_qa:cpu_throttling
 - end : general Q&A, advice, or vague analysis request WITHOUT existing data (keywords: 什么是/怎么优化/如何/为什么)
 
 CRITICAL:

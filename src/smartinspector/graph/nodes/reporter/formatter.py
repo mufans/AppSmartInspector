@@ -171,6 +171,22 @@ def format_perf_sections(perf_json: str) -> list[str]:
             compose_lines.append(f"\nCompose总计: {compose_slices.get('total_count', 0)}次")
             user_parts.append("\n".join(compose_lines))
 
+    # Dimension registry sections (extensible dimensions)
+    dimensions_data = perf_data.get("dimensions", {})
+    if dimensions_data:
+        try:
+            from smartinspector.collector.dimensions import DimensionRegistry
+            DimensionRegistry.discover()
+            for dim in DimensionRegistry.all():
+                dim_data = dimensions_data.get(dim.name)
+                if not dim_data:
+                    continue
+                section = dim.format_section(dim_data)
+                if section:
+                    user_parts.append(section)
+        except Exception:
+            pass
+
     return user_parts
 
 

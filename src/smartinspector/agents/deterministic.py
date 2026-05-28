@@ -286,6 +286,11 @@ def compute_hints(perf_json: str) -> str:
         _analyze_oom_rss_swap(data),
     ]
 
+    # Dimension registry hints
+    dim_hints = _compute_dimension_hints(data, frame_budget_ms)
+    if dim_hints:
+        sections.append(dim_hints)
+
     return "\n\n".join(s for s in sections if s)
 
 
@@ -1145,3 +1150,36 @@ def _analyze_oom_rss_swap(data: dict) -> str:
             lines.append(f"    {proc}: {reason}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 18: Dimension registry hints (extensible dimensions)
+# ---------------------------------------------------------------------------
+
+def _compute_dimension_hints(data: dict, frame_budget_ms: float) -> str:
+    """Compute hints from all registered dimension modules."""
+    try:
+        from smartinspector.collector.dimensions import DimensionRegistry, HintContext
+        DimensionRegistry.discover()
+    except Exception:
+        return ""
+
+    dimensions_data = data.get("dimensions", {})
+    if not dimensions_data:
+        return ""
+
+    context = HintContext(
+        frame_budget_ms=frame_budget_ms,
+        target_process=data.get("metadata", {}).get("target_process", {}).get("name", ""),
+    )
+
+    hints = []
+    for dim in DimensionRegistry.all():
+        dim_data = dimensions_data.get(dim.name)
+        if not dim_data:
+            continue
+        hint = dim.compute_hint(dim_data, context)
+        if hint:
+            hints.append(hint)
+
+    return "\n\n".join(hints) if hints else ""

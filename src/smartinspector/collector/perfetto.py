@@ -90,6 +90,8 @@ class PerfSummary:
     oom_rss_swap: dict = field(default_factory=dict)
     cpu_utilization: dict = field(default_factory=dict)
     surfaceflinger_timeline: list[dict] = field(default_factory=list)
+    # Dimension registry data
+    dimensions: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, ensure_ascii=False)
@@ -2703,6 +2705,23 @@ class PerfettoCollector:
             summary.surfaceflinger_timeline = self.collect_surfaceflinger_timeline()
         except Exception as e:
             debug_log("perfetto", f"surfaceflinger_timeline failed: {e}")
+
+        # --- Dimension registry (extensible dimensions) ---
+        try:
+            from smartinspector.collector.dimensions import DimensionRegistry
+            DimensionRegistry.discover()
+            tp = self._open()
+            for dim in DimensionRegistry.all():
+                try:
+                    dim_data = dim.collect(tp)
+                    if dim_data:
+                        summary.dimensions[dim.name] = dim_data
+                except Exception as e:
+                    debug_log("perfetto", f"dimension {dim.name} failed: {e}")
+            if summary.dimensions:
+                debug_log("perfetto", f"dimensions: collected {len(summary.dimensions)} dimensions")
+        except Exception as e:
+            debug_log("perfetto", f"dimension registry discovery failed: {e}")
 
         return summary
 
