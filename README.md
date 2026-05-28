@@ -20,6 +20,8 @@ AI 驱动的跨平台移动端性能分析 CLI 工具。通过自然语言交互
 - 🤖 **Headless/CI 模式** — 非交互式运行全量分析流水线，支持 JSON 结构化输出，可直接集成 CI/CD
 - 🌐 **IO 追踪** — 默认启用网络/数据库/图片加载 IO Hook，独立收集 IO 切片并归因到源码
 - 🔬 **Perfetto Stdlib 模块** — 11 个 stdlib 模块深度分析：锁竞争、Binder 事务、启动指标(TTID/TTFD)、GC 事件、ANR 检测、Slice CPU 时间、输入延迟分解、调度延迟、OOM/RSS/Swap、CPU 利用率、SurfaceFlinger 帧匹配
+- 🧩 **维度注册体系** — 7 个可扩展分析维度（锁竞争/调度延迟/GC/文件IO/内存趋势/Binder/CPU降频），插件式架构，`@register_dimension` 装饰器自动注册
+- 📚 **Prompt Skill 系统** — 知识/指令分离架构，维度专家知识按需注入 LLM，每个 Agent 只加载所需领域知识
 
 ## 快速开始
 
@@ -212,6 +214,85 @@ REPL 主循环 ─── 全局 try/except，异常后保留 state 继续输入
 
 详细架构见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
+### 维度注册体系
+
+维度注册体系提供插件式架构，将性能分析能力拆分为独立的、自包含的分析维度。每个维度封装了从 SQL 采集到预计算结论的完整逻辑。
+
+**架构**：
+
+```
+AnalysisDimension (ABC)
+  ├── collect(tp) → dict        # SQL 查询采集
+  ├── compute_hint(data, ctx)   # 确定性预计算（不调用 LLM）
+  ├── format_section(data)      # Markdown 格式化（供 LLM 消费）
+  ├── metric_filter(data)       # Metric QA 数据过滤
+  ├── skill_name                # 关联的专家知识文件
+  └── metric_triggers           # 自然语言触发词
+```
+
+**已注册维度**（7 个内置维度）：
+
+| 维度 | SQL 数据源 | Hint 触发条件 | Metric 触发词 |
+|------|-----------|--------------|--------------|
+| `lock_contention` | `__intrinsic_thread_state` (futex) | 主线程 >5ms，其他 >10ms | 锁竞争/lock/futex |
+| `sched_latency` | `sched.runnable` stdlib 模块 | 平均延迟 > 帧预算 50% | 调度延迟/runnable |
+| `gc_events` | `slice` (GC/GarbageCollector) | pause >10ms 或超过帧预算 | gc/垃圾回收 |
+| `file_io` | `__intrinsic_thread_state` (io_wait) | 主线程 IO >5ms | 文件io/磁盘 |
+| `memory_trend` | `process_counter_track` (mem.rss) | RSS 增长 >20% | 内存趋势/内存泄漏 |
+| `binder_ipc` | `__intrinsic_thread_state` (binder) | 主线程 binder 等待 >10ms | binder/ipc/跨进程 |
+| `cpu_throttling` | `cpu_counter_track` + `counter` | 平均频率 < 最大频率 50% | 降频/throttling |
+
+**扩展新维度**：
+
+1. 创建 `src/smartinspector/collector/dimensions/<name>.py`
+2. 继承 `AnalysisDimension`，用 `@register_dimension` 装饰
+3. 实现 `collect()` 方法（必需），可选实现 `compute_hint()`/`format_section()`/`metric_filter()`
+4. 添加专家知识到 `prompts/skills/dimensions/<name>.md`
+5. 下次流水线运行时自动发现（`DimensionRegistry.discover()`）
+
+### Prompt Skill 系统
+
+Prompt Skill 系统将 LLM 指令与领域知识分离，实现按需加载：每个 Agent 只注入其所需的专业知识，避免无关上下文干扰。
+
+**目录结构**：
+
+```
+prompts/
+├── *.txt                          # LLM 指令模板（行为定义）
+└── skills/
+    ├── SKILL.md                   #   Skill 索引
+    ├── shared/                    #   共享知识（所有 Agent 共用）
+    │   ├── si-tag-system.md       #     SI$ 标签体系说明
+    │   └── search-strategy.md     #   源码搜索策略
+    └── dimensions/                #   维度专家知识（按需注入）
+        ├── lock-contention.md     #     锁竞争分析知识
+        ├── cpu-scheduling.md      #     CPU 调度分析知识
+        ├── cpu-throttling.md      #     降频分析知识
+        ├── gc-analysis.md         #     GC 分析知识
+        ├── io-analysis.md         #     IO 分析知识
+        ├── memory-analysis.md     #     内存分析知识
+        ├── binder-ipc.md          #     Binder IPC 分析知识
+        ├── startup.md             #     启动分析知识
+        └── ui-jank.md             #     UI 卡顿分析知识
+```
+
+**API**：
+
+| 函数 | 用途 |
+|------|------|
+| `load_prompt(name)` | 加载 `prompts/{name}.txt` 指令模板 |
+| `load_skill(name, category)` | 加载 `prompts/skills/{category}/{name}.md` 知识文件（缓存） |
+| `load_prompt_with_skills(name, *skills)` | 加载指令 + 追加多个 skill 知识 |
+
+**Skill 引用格式**：
+- `"gc-analysis"` → `prompts/skills/dimensions/gc-analysis.md`
+- `"shared:si-tag-system"` → `prompts/skills/shared/si-tag-system.md`
+
+**设计原则**：
+- **知识/指令分离**：指令（`.txt`）定义 Agent 行为规则，知识（`.md`）提供领域事实
+- **按需加载**：Agent 根据当前分析任务动态组合需要的知识文件
+- **维度关联**：每个维度通过 `skill_name` 属性自动关联对应的专家知识
+
 ## 平台支持
 
 
@@ -224,7 +305,7 @@ REPL 主循环 ─── 全局 try/except，异常后保留 state 继续输入
 
 ### Android
 
-- Trace 采集：Perfetto (ftrace + atrace + CPU callstack + Java heap + 系统级 CPU + 11 个 stdlib 模块)
+- Trace 采集：Perfetto (ftrace + atrace + CPU callstack + Java heap + 系统级 CPU + 11 个 stdlib 模块 + 7 个维度注册模块)
 - 方法 Hook：Pine AOP 框架，运行时 hook Activity/Fragment/RecyclerView 等框架方法
 - 卡顿检测：BlockMonitor (BlockCanary-style)，监测主线程每条 Message 耗时，容量限制防 OOM
 - 通信：WebSocket (adb reverse)，CLI ↔ App 实时配置同步 + 数据传输
@@ -276,7 +357,17 @@ smartinspector/
 │   │   ├── deterministic.py        #     确定性预计算 + SQL Summarizer (减少 LLM token)
 │   │   └── verifier.py             #     分析质量验证 (L1 格式 + L2 一致性, 0 token)
 │   │
-│   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU, 11 stdlib modules, context manager)
+│   ├── collector/perfetto.py       #   PerfettoCollector (adb→SQL→JSON, CPU调用链, 系统级CPU, 11 stdlib modules, 7 维度注册, context manager)
+│   ├── collector/dimensions/       #   维度注册体系 (插件式分析维度)
+│   │   ├── __init__.py             #     DimensionRegistry + @register_dimension
+│   │   ├── base.py                 #     AnalysisDimension ABC + HintContext
+│   │   ├── lock_contention.py      #     锁竞争维度 (futex)
+│   │   ├── sched_latency.py        #     调度延迟维度
+│   │   ├── gc_events.py            #     GC 事件维度
+│   │   ├── file_io.py              #     文件 IO 维度
+│   │   ├── memory_trend.py         #     内存趋势维度
+│   │   ├── binder_ipc.py           #     Binder IPC 维度
+│   │   └── cpu_throttling.py       #     CPU 降频维度
 │   ├── collector/startup.py        #   冷启动分析器 (启动阶段切分, 关键路径提取, 瓶颈识别)
 │   ├── collector/memory.py         #   内存分配分析器 (heap_graph, 泄漏检测, 内存趋势)
 │   ├── headless.py                 #   Headless/CI 非交互式运行器 (全量流水线, JSON/Markdown 输出)
@@ -314,6 +405,11 @@ smartinspector/
 │   └── build.sh                    #   构建脚本 (clone Perfetto + 复制插件 + build)
 │
 ├── prompts/                        # LLM Prompt 模板
+│   ├── *.txt                      #   指令模板 (attributor, report-generator, perf-analyzer 等)
+│   └── skills/                    #   Skill 知识文件 (按需加载)
+│       ├── SKILL.md               #     索引文件
+│       ├── shared/                #     共享知识 (SI$ 标签, 搜索策略)
+│       └── dimensions/            #     维度专家知识 (9 个 .md 文件)
 ├── bin/                            # trace_processor_shell
 ├── reports/                        # 生成的性能报告 (Markdown)
 ├── tests/                          # 单元测试
@@ -422,6 +518,22 @@ Orchestrator 通过 LLM 分类将用户请求路由到对应 Agent：
 - **源码搜索** (`explorer`): "搜索 XXX 类源码" / "查看 LazyForEach 的实现" / "定位 DataManager.loadData 方法" → Code Explorer
 - **通用问答** (`end`): "什么是卡顿" / "怎么优化列表滑动" / "你好" → Fallback 回复
 - **指标追问** (`metric_qa`): "CPU 占用率怎么样" / "帧率怎么样" / "内存有没有泄漏" / "性能怎么样" → Metric QA（需要先完成分析）
+
+### Metric QA 指标
+
+在已有 `perf_summary` 数据的基础上，用自然语言追问具体性能指标：
+
+| 类别 | 指标 ID | 触发词 |
+|------|---------|--------|
+| CPU | `cpu`, `cpu_hotspot`, `sched`, `blocked` | cpu占用/热点/调度/阻塞 |
+| 内存 | `memory`, `heap` | 内存/RSS/堆/泄漏 |
+| UI | `frame`, `rv`, `view`, `compose`, `inflate`, `startup` | 帧率/列表/绘制/重组/布局/启动 |
+| IO | `io`, `network`, `db`, `image` | io/网络/数据库/图片 |
+| 系统 | `thread_state`, `sys`, `input` | 线程状态/系统/触摸 |
+| 维度 | `lock_contention`, `sched_latency`, `gc_events`, `file_io`, `memory_trend`, `binder_ipc`, `cpu_throttling` | 锁竞争/调度延迟/GC/文件IO/内存趋势/Binder/降频 |
+| 总览 | `overview` | 性能总览 |
+
+> 前置条件：必须先通过 `/full`、`/trace`、`/analyze` 等命令完成分析。
 
 ## 报告示例
 
