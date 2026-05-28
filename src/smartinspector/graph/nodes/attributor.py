@@ -62,7 +62,7 @@ def attributor_node(state: AgentState) -> dict:
     for s in attributable[:5]:
         print(f"    {s['dur_ms']:>8.2f}ms  {s['class_name']}.{s['method_name']}  ({s.get('search_type', 'java')})", flush=True)
 
-    results = run_attribution(attributable)
+    results = run_attribution(attributable, perf_json=perf_json)
     debug_log("attributor", f"run_attribution results: {json.dumps(results, ensure_ascii=False)}")
 
     # Summarize results

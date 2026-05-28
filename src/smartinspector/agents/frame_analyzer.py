@@ -286,7 +286,7 @@ def _run_source_attribution(frame_data: dict, existing_summary: str,
 
             if unmatched:
                 debug_log("frame", f"  {len(matched)} matched from cache, {len(unmatched)} new")
-                new_results = run_attribution(unmatched, on_progress)
+                new_results = run_attribution(unmatched, on_progress, perf_json=existing_summary)
                 matched.extend(new_results)
             else:
                 debug_log("frame", f"  All {len(matched)} matched from cache (0 new)")
@@ -294,9 +294,9 @@ def _run_source_attribution(frame_data: dict, existing_summary: str,
             results = matched
         except Exception:
             debug_log("frame", "  Cache parse failed, running full attribution")
-            results = run_attribution(attributable, on_progress)
+            results = run_attribution(attributable, on_progress, perf_json=existing_summary)
     else:
-        results = run_attribution(attributable, on_progress)
+        results = run_attribution(attributable, on_progress, perf_json=existing_summary)
 
     found = sum(1 for r in results if r.get("attributable"))
     system = sum(1 for r in results if r.get("reason") == "system_class")

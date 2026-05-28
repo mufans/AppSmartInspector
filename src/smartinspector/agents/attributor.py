@@ -24,7 +24,7 @@ from smartinspector.debug_log import debug_log
 from smartinspector.tools.grep import grep
 from smartinspector.tools.glob import glob
 from smartinspector.tools.read import read
-from smartinspector.prompts import load_prompt, load_prompt_with_skills
+from smartinspector.prompts import load_prompt, load_prompt_with_skills, load_skills_for_dimensions
 from smartinspector.token_tracker import get_tracker
 
 
@@ -119,6 +119,23 @@ def _get_llm():
         global _structured_ok
         _structured_ok = False
     return _llm_with_tools, _system_prompt
+
+
+def _build_system_prompt_with_dimensions(perf_json: str) -> str:
+    """Build system prompt with dimension skills based on perf data.
+
+    Args:
+        perf_json: PerfSummary JSON string used to determine which
+            dimension skills to load.
+
+    Returns:
+        System prompt string with relevant dimension knowledge appended.
+    """
+    _, base_prompt = _get_llm()
+    dim_skills = load_skills_for_dimensions(perf_json)
+    if dim_skills:
+        return base_prompt + dim_skills
+    return base_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -584,13 +601,16 @@ def _analyze_snippets(results: list[dict]) -> None:
         debug_log("attributor", f"  [fast-path] LLM analysis failed: {e}, keeping raw snippets")
 
 
-def run_attribution(attributable: list[dict], on_progress=None) -> list[dict]:
+def run_attribution(attributable: list[dict], on_progress=None,
+                    perf_json: str = "") -> list[dict]:
     """Run source code attribution on a list of SI$ slices.
 
     Args:
         attributable: List of dicts from extract_attributable_slices().
                       Each must have: class_name, method_name, dur_ms,
                       raw_name, search_type.
+        on_progress: Optional progress callback.
+        perf_json: Optional PerfSummary JSON for dimension-aware skill loading.
 
     Returns:
         List of attribution result dicts with fields:
@@ -638,11 +658,11 @@ def run_attribution(attributable: list[dict], on_progress=None) -> list[dict]:
                 else:
                     failed_issues.append(issue)
             if failed_issues:
-                llm_results = _search_group(failed_issues, file_cache, on_progress)
+                llm_results = _search_group(failed_issues, file_cache, on_progress, perf_json)
                 results.extend(llm_results)
             continue
 
-        group_results = _search_group(group, file_cache, on_progress)
+        group_results = _search_group(group, file_cache, on_progress, perf_json)
         results.extend(group_results)
 
     # Analyze fast-path results with lightweight LLM call
@@ -666,7 +686,8 @@ def run_attribution(attributable: list[dict], on_progress=None) -> list[dict]:
     return results
 
 
-def _search_group(group: list[dict], file_cache: _FileCache, on_progress=None) -> list[dict]:
+def _search_group(group: list[dict], file_cache: _FileCache, on_progress=None,
+                  perf_json: str = "") -> list[dict]:
     """Search source code for a group of issues using manual tool-call loop.
 
     Uses llm.bind_tools() + manual tool dispatch to avoid message history
@@ -675,6 +696,8 @@ def _search_group(group: list[dict], file_cache: _FileCache, on_progress=None) -
     Args:
         group: List of issues sharing the same target file/class.
         file_cache: Shared LRU cache for glob/read results across groups.
+        on_progress: Optional progress callback.
+        perf_json: Optional PerfSummary JSON for dimension-aware system prompt.
     """
     global _structured_ok
     results: list[dict] = []
@@ -717,7 +740,9 @@ def _search_group(group: list[dict], file_cache: _FileCache, on_progress=None) -
 
     # Build prompt for the agent
     prompt = _build_group_prompt(group)
-    llm, system_prompt = _get_llm()
+    llm, _ = _get_llm()
+    # Use dimension-aware system prompt when perf_json is available
+    system_prompt = _build_system_prompt_with_dimensions(perf_json) if perf_json else _get_llm()[1]
 
     try:
         # Manual tool-call loop: each iteration sends only the current messages
