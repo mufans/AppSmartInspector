@@ -33,3 +33,4 @@ reports/
 platform/android/.gradle/
 platform/android/build/
 platform/android/.idea/
+perfetto-build/

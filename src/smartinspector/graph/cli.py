@@ -1,6 +1,7 @@
 """CLI entry: main() REPL loop."""
 
 from smartinspector.commands import handle_slash_command
+from smartinspector.debug_log import info_log
 from smartinspector.graph.builder import create_graph
 from smartinspector.graph.streaming import _stream_run
 
@@ -8,25 +9,58 @@ from smartinspector.graph.streaming import _stream_run
 def main():
     """Run the interactive chat loop."""
     import argparse
+    import os
     import subprocess
     import pathlib
 
     from smartinspector.config import get_source_dir, set_source_dir, get_ws_port, get_api_key
+    from smartinspector.debug_log import info_log, debug_log
     from smartinspector.ws.server import SIServer
 
+    # Silence third-party loggers — all SmartInspector logging goes via info_log/debug_log
+    import logging
+    logging.disable(logging.CRITICAL)
+
     parser = argparse.ArgumentParser(description="SmartInspector CLI")
-    parser.add_argument("--source-dir", default="", help="Source code directory for attribution search")
+    parser.add_argument("--src", "--source-dir", default="", dest="source_dir", help="Source code directory for attribution search")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to reports/debug_*.log")
+    parser.add_argument("--ci", action="store_true", help="Non-interactive CI mode: run pipeline and exit")
+    parser.add_argument("--target", default="", help="Target process package name (CI mode)")
+    parser.add_argument("--trace", default="", help="Path to existing trace file (CI mode)")
+    parser.add_argument("--duration", type=int, default=10000, help="Trace duration in ms (CI mode, default: 10000)")
+    parser.add_argument("--output", default="", help="Output file path (CI mode)")
+    parser.add_argument("--format", choices=["markdown", "json"], default="markdown",
+                        help="Report format (CI mode, default: markdown)")
+    parser.add_argument("--cmd", default="full_analysis",
+                        choices=["full_analysis", "full", "startup", "analyze", "trace"],
+                        help="Pipeline command to execute (CI mode, default: full_analysis)")
     args, _ = parser.parse_known_args()
 
     if args.source_dir:
         set_source_dir(args.source_dir)
 
     if args.debug:
-        import os
         os.environ["SI_DEBUG"] = "1"
-        from smartinspector.debug_log import debug_log
         debug_log("cli", "Debug logging enabled via --debug flag")
+
+    # ── CI / headless mode ──
+    if args.ci:
+        from smartinspector.headless import HeadlessRunner
+        runner = HeadlessRunner(
+            source_dir=args.source_dir or ".",
+            target=args.target or None,
+            trace_path=args.trace or None,
+            output=args.output or None,
+            fmt=args.format,
+            duration=args.duration,
+            debug=args.debug,
+            cmd=args.cmd,
+        )
+        report = runner.run()
+        # In CI mode, print report to stdout if no output file specified
+        if not args.output:
+            print(report)
+        return
 
     from importlib.metadata import version as pkg_version
     try:
@@ -38,7 +72,7 @@ def main():
     if args.source_dir:
         print(f"Source dir: {get_source_dir()}")
     else:
-        print(f"Source dir: {get_source_dir()} (use --source-dir or /config source_dir <path> to change)")
+        print(f"Source dir: {get_source_dir()} (use --src or /config source_dir <path> to change)")
     print("Type /help for commands, 'quit' or Ctrl+C to exit\n")
 
     # Check prerequisites
@@ -55,7 +89,8 @@ def main():
     if not get_api_key():
         issues.append("No API key configured. Set SI_API_KEY or OPENAI_API_KEY.")
     for issue in issues:
-        print(f"  Warning: {issue}")
+        info_log("cli", f"WARNING: {issue}")
+        print(f"  WARNING: {issue}")
 
     # Auto-start WS server + adb reverse so app can connect on launch
     port = get_ws_port()
@@ -78,6 +113,7 @@ def main():
         "perf_analysis": "",
         "attribution_data": "",
         "attribution_result": "",
+        "trace_target_process": args.target or "",
         "_trace_path": "",
     }
 

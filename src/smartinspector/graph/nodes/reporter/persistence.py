@@ -3,6 +3,8 @@
 import os
 import datetime
 
+from smartinspector.debug_log import info_log
+
 
 def save_report(content: str) -> str | None:
     """Save *content* to a timestamped markdown file under ./reports/.
@@ -17,8 +19,8 @@ def save_report(content: str) -> str | None:
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(content)
         size_kb = len(content.encode("utf-8")) / 1024
-        print(f"  [reporter] Report saved to {report_path} ({size_kb:.1f}KB)", flush=True)
+        info_log("reporter", f"Report saved to {report_path} ({size_kb:.1f}KB)")
         return report_path
     except OSError as e:
-        print(f"  [reporter] Failed to save report: {e}", flush=True)
+        info_log("reporter", f"ERROR: Failed to save report: {e}")
         return None

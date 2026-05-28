@@ -14,11 +14,14 @@ class RouteDecision(str, Enum):
     continue to work without any ``.value`` conversion.
     """
     FULL_ANALYSIS = "full_analysis"
+    STARTUP = "startup"          # cold start analysis: collector → startup_analyzer
     ANDROID = "android"
     ANALYZE = "analyze"
     EXPLORER = "explorer"
     END = "end"
     TRACE = "trace"              # /trace command: collector → analyzer
+    QUICK = "quick"              # /quick command: deterministic, no LLM
+    METRIC_QA = "metric_qa"      # natural language metric query (format: metric_qa:<id>)
 
 
 class AgentState(TypedDict):
@@ -38,6 +41,7 @@ class AgentState(TypedDict):
 # State keys that every node must pass through unchanged.
 _PASS_THROUGH_KEYS = (
     "perf_summary", "perf_analysis", "attribution_data", "attribution_result",
+    "_trace_path",
 )
 
 

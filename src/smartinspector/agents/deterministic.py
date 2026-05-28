@@ -7,6 +7,223 @@ LLM only needs to organize language around these conclusions.
 """
 
 import json
+import statistics
+
+
+# ---------------------------------------------------------------------------
+# SQL Summarizer: compress raw SQL results for LLM consumption
+# ---------------------------------------------------------------------------
+
+# Default histogram buckets (milliseconds)
+_HIST_BUCKETS = [
+    (0, 16, "<16ms"),
+    (16, 32, "16-32ms"),
+    (32, 64, "32-64ms"),
+    (64, float("inf"), ">64ms"),
+]
+
+
+def summarize_sql_result(
+    rows: list[dict],
+    metric_col: str,
+    top_n: int = 10,
+    threshold_pct: float = 2.0,
+    group_col: str | None = None,
+) -> str:
+    """Compress SQL query results into a statistical summary + outlier samples.
+
+    Applies four compression strategies:
+    1. Statistics: count, min, max, avg, p95, p99
+    2. Distribution histogram: bucket values into ranges
+    3. Outlier sampling: top N rows exceeding avg * threshold_pct
+    4. Dedup aggregation: rows sharing the same group_col key are merged
+
+    Args:
+        rows: SQL query result rows.
+        metric_col: Name of the numeric column to summarize.
+        top_n: Max number of outlier rows to include.
+        threshold_pct: Outlier threshold as multiple of the average.
+        group_col: Optional column to group/dedup by (e.g. "name").
+
+    Returns:
+        Compressed text summary suitable for LLM input.
+    """
+    if not rows:
+        return "[SQL摘要] 无数据"
+
+    # Extract numeric values from metric_col
+    values: list[float] = []
+    for r in rows:
+        v = r.get(metric_col)
+        if v is not None:
+            try:
+                values.append(float(v))
+            except (ValueError, TypeError):
+                pass
+
+    if not values:
+        return f"[SQL摘要] {len(rows)} 行, {metric_col} 列无数值"
+
+    lines: list[str] = []
+    count = len(values)
+    min_v = min(values)
+    max_v = max(values)
+    avg_v = sum(values) / count
+
+    # Percentiles
+    sorted_vals = sorted(values)
+    p95 = sorted_vals[int(count * 0.95)] if count >= 20 else max_v
+    p99 = sorted_vals[int(count * 0.99)] if count >= 100 else max_v
+
+    lines.append(
+        f"[SQL摘要] {count} 行, "
+        f"min={min_v:.2f}, max={max_v:.2f}, avg={avg_v:.2f}, "
+        f"p95={p95:.2f}, p99={p99:.2f}"
+    )
+
+    # Distribution histogram
+    bucket_counts = [0] * len(_HIST_BUCKETS)
+    for v in values:
+        for i, (lo, hi, _) in enumerate(_HIST_BUCKETS):
+            if lo <= v < hi:
+                bucket_counts[i] += 1
+                break
+    hist_parts = [
+        f"{label}={cnt}" for (_, _, label), cnt in zip(_HIST_BUCKETS, bucket_counts) if cnt > 0
+    ]
+    lines.append(f"  分布: {', '.join(hist_parts)}")
+
+    # Dedup aggregation by group_col
+    if group_col:
+        groups: dict[str, dict] = {}
+        for r in rows:
+            key = str(r.get(group_col, "?"))
+            v = r.get(metric_col, 0)
+            try:
+                v = float(v)
+            except (ValueError, TypeError):
+                continue
+            if key in groups:
+                groups[key]["total"] += v
+                groups[key]["count"] += 1
+                groups[key]["max"] = max(groups[key]["max"], v)
+            else:
+                groups[key] = {"total": v, "count": 1, "max": v}
+
+        if groups:
+            sorted_groups = sorted(groups.items(), key=lambda x: -x[1]["total"])
+            agg_lines = []
+            for name, stats in sorted_groups[:10]:
+                cnt = stats["count"]
+                avg_g = stats["total"] / cnt if cnt > 0 else 0
+                cnt_label = f", {cnt}次" if cnt > 1 else ""
+                agg_lines.append(f"  {name}: 总{stats['total']:.2f}ms, 最大{stats['max']:.2f}ms{cnt_label}")
+            lines.append(f"  聚合 (按{group_col}, top {min(len(sorted_groups), 10)}):")
+            lines.extend(agg_lines)
+
+    # Outlier sampling
+    threshold = avg_v * threshold_pct
+    outliers = [(r, float(r.get(metric_col, 0))) for r in rows
+                if _safe_float(r.get(metric_col)) > threshold]
+    outliers.sort(key=lambda x: -x[1])
+
+    if outliers:
+        lines.append(f"  异常采样 (>{threshold:.2f}ms, top {min(len(outliers), top_n)}):")
+        for r, v in outliers[:top_n]:
+            # Build a compact representation of the row
+            parts = [f"{metric_col}={v:.2f}"]
+            for k, val in r.items():
+                if k != metric_col and val is not None:
+                    parts.append(f"{k}={val}")
+            lines.append(f"    {', '.join(parts[:4])}")  # max 4 fields per row
+
+    return "\n".join(lines)
+
+
+def compress_perf_json(perf_json: str) -> str:
+    """Compress large list fields in a perf JSON string using summarize_sql_result.
+
+    Targets the heaviest fields that bloat LLM token usage:
+    - view_slices.slowest_slices
+    - view_slices.call_chains
+    - block_events
+    - frame_timeline.jank_detail / slowest_frames
+    - cpu_usage.top_processes[].threads
+    - thread_state
+
+    Each list is replaced with its summarized text if it exceeds a size threshold.
+
+    Args:
+        perf_json: Raw perf summary JSON string.
+
+    Returns:
+        JSON string with large lists replaced by compressed summaries.
+    """
+    try:
+        data = json.loads(perf_json)
+    except (json.JSONDecodeError, TypeError):
+        return perf_json
+
+    modified = False
+
+    # view_slices.slowest_slices
+    vs = data.get("view_slices") or {}
+    slowest = vs.get("slowest_slices") or []
+    if len(slowest) > 20:
+        summary = summarize_sql_result(slowest, "dur_ms", top_n=10, group_col="name")
+        vs["slowest_slices_summary"] = summary
+        vs["slowest_slices"] = slowest[:5]  # keep top 5 raw rows
+        modified = True
+
+    # block_events
+    block_events = data.get("block_events") or []
+    if len(block_events) > 10:
+        summary = summarize_sql_result(block_events, "dur_ms", top_n=5, group_col="name")
+        data["block_events_summary"] = summary
+        data["block_events"] = block_events[:3]
+        modified = True
+
+    # frame_timeline jank_detail / slowest_frames
+    ft = data.get("frame_timeline") or {}
+    for key in ("jank_detail", "slowest_frames"):
+        frames = ft.get(key) or []
+        if len(frames) > 10:
+            summary = summarize_sql_result(frames, "dur_ms", top_n=5)
+            ft[f"{key}_summary"] = summary
+            ft[key] = frames[:3]
+            modified = True
+
+    # cpu_usage top_processes threads
+    cpu = data.get("cpu_usage") or {}
+    top_procs = cpu.get("top_processes") or []
+    for proc in top_procs:
+        threads = proc.get("threads") or []
+        if len(threads) > 10:
+            summary = summarize_sql_result(threads, "cpu_pct", top_n=5, group_col="name")
+            proc["threads_summary"] = summary
+            proc["threads"] = threads[:3]
+            modified = True
+
+    # thread_state
+    thread_states = data.get("thread_state") or []
+    if len(thread_states) > 10:
+        summary = summarize_sql_result(thread_states, "dur_ms", top_n=5, group_col="slice_name")
+        data["thread_state_summary"] = summary
+        data["thread_state"] = thread_states[:5]
+        modified = True
+
+    if not modified:
+        return perf_json
+
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _safe_float(v) -> float:
+    """Safely convert a value to float, returning 0 on failure."""
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return 0.0
 
 
 def _detect_frame_budget_ms(data: dict) -> float:
@@ -55,6 +272,18 @@ def compute_hints(perf_json: str) -> str:
         _rank_rv_hotspots(data),
         _correlate_jank_frames(data, frame_budget_ms),
         _identify_cpu_hotspots(data),
+        _analyze_thread_state(data),
+        _analyze_io_slices(data),
+        _analyze_compose_slices(data),
+        _analyze_memory(data),
+        _analyze_lock_contention(data),
+        _analyze_binder_txns(data),
+        _analyze_startup_metrics(data),
+        _analyze_gc_events(data),
+        _analyze_anrs(data),
+        _analyze_input_latency(data),
+        _analyze_sched_latency(data),
+        _analyze_oom_rss_swap(data),
     ]
 
     return "\n\n".join(s for s in sections if s)
@@ -319,3 +548,600 @@ def _identify_cpu_hotspots(data: dict) -> str:
             lines.append(f"    {t.get('name', '?')}: {t['cpu_pct']:.1f}%")
 
     return "\n".join(lines) if len(lines) > 1 else ""
+
+
+# ---------------------------------------------------------------------------
+# Helper 6: Thread state analysis (Running vs Sleeping vs DiskSleep)
+# ---------------------------------------------------------------------------
+
+# blocked_function to human-readable meaning mapping
+BLOCKED_FN_MEANING: dict[str, str] = {
+    "futex_wait_queue_me": "等待锁释放 (futex)",
+    "futex_wait": "等待锁释放 (futex)",
+    "folio_wait_bit_common": "等待磁盘IO (页缓存)",
+    "wait_woken": "等待被唤醒",
+    "msleep": "内核主动睡眠",
+    "rpmh_write_batch": "等待硬件资源电源管理",
+    "sde_encoder_helper_wait_for_irq": "等待显示硬件中断",
+    "spi_geni_transfer_one": "等待SPI总线传输 (通常为触控IC)",
+    "do_writepages": "等待磁盘写入",
+    "journal_commit": "等待文件系统日志提交",
+    "bio_wait": "等待块IO完成",
+    "pipe_wait": "等待管道数据",
+    "unix_stream_recvmsg": "等待Unix Socket数据",
+    "binder_thread_read": "等待Binder IPC回复",
+    "worker_thread": "工作线程等待",
+    "rcu_gp_fqs_loop": "RCU内核周期",
+}
+
+
+def _analyze_thread_state(data: dict) -> str:
+    """Analyze per-slice thread state distribution to distinguish code-slow vs blocked.
+
+    For each SI$ slice with thread_state data, reports whether the thread was
+    primarily Running (code is slow) or Sleeping/DiskSleep (blocked by IO/lock).
+    When blocked_function data is available, provides human-readable blocking reasons.
+    """
+    thread_states = data.get("thread_state") or []
+    if not thread_states:
+        return ""
+
+    lines = ["[线程状态分析]"]
+
+    # Classify slices by dominant state
+    blocked_slices = []   # Sleeping/DiskSleep dominant
+    running_slices = []   # Running dominant, slow
+
+    for ts in thread_states:
+        dominant = ts.get("dominant_state", "unknown")
+        dur = ts.get("dur_ms", 0)
+        name = ts.get("slice_name", "?")
+        dist = ts.get("state_distribution", {})
+
+        if dominant in ("Sleeping", "DiskSleep"):
+            blocked_slices.append((name, dominant, dur, dist, ts))
+        elif dominant == "Running" and dur > 5:
+            running_slices.append((name, dur, dist, ts))
+
+    if blocked_slices:
+        lines.append("  以下切片主要处于阻塞状态（非代码慢，而是被IO/锁挂起）：")
+        for name, state, dur, dist, ts in sorted(blocked_slices, key=lambda x: -x[2]):
+            dist_str = ", ".join(f"{k} {v:.0f}%" for k, v in dist.items())
+            # Shorten slice name for readability
+            short = name.replace("SI$", "").split("#")[0] if "#" in name else name.replace("SI$", "")
+            lines.append(f"    {short} ({dur:.1f}ms): {dist_str}")
+            # Show blocking reason if available
+            bf = ts.get("blocked_function")
+            if bf:
+                meaning = BLOCKED_FN_MEANING.get(bf, bf)
+                lines.append(f"      阻塞原因: {meaning}")
+            if ts.get("io_wait"):
+                lines.append("      类型: IO等待")
+            if ts.get("waker_name"):
+                lines.append(f"      唤醒者: {ts['waker_name']}")
+
+    if running_slices:
+        lines.append("  以下切片主要在执行用户代码（无IO/锁阻塞）：")
+        for name, dur, dist, ts in sorted(running_slices, key=lambda x: -x[1])[:5]:
+            running_pct = dist.get("Running", 0)
+            short = name.replace("SI$", "").split("#")[0] if "#" in name else name.replace("SI$", "")
+            lines.append(f"    {short} ({dur:.1f}ms): Running {running_pct:.0f}%")
+
+    if not blocked_slices and not running_slices:
+        return ""
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 7: IO slices analysis (network / database / image)
+# ---------------------------------------------------------------------------
+
+_IO_TYPE_LABELS: dict[str, str] = {
+    "network": "网络IO",
+    "database": "数据库IO",
+    "image": "图片加载",
+}
+
+
+def _analyze_io_slices(data: dict) -> str:
+    """Analyze IO slices: aggregate by type, flag main-thread IO.
+
+    Collects SI$net#/SI$db#/SI$img# slices from the io_slices field,
+    groups them by IO type, and reports total/max/count per category.
+    """
+    io_slices = data.get("io_slices") or {}
+    if not io_slices:
+        return ""
+
+    summary = io_slices.get("summary") or []
+    if not summary:
+        return ""
+
+    # Aggregate by IO type
+    by_type: dict[str, dict] = {}
+    for s in summary:
+        io_type = s.get("io_type", "unknown")
+        if io_type not in by_type:
+            by_type[io_type] = {
+                "count": 0,
+                "total_ms": 0.0,
+                "max_ms": 0.0,
+                "top_items": [],
+            }
+        entry = by_type[io_type]
+        entry["count"] += s.get("count", 0)
+        entry["total_ms"] += s.get("total_ms", 0)
+        entry["max_ms"] = max(entry["max_ms"], s.get("max_ms", 0))
+        entry["top_items"].append(s)
+
+    lines = ["[IO分析]"]
+
+    for io_type, stats in sorted(by_type.items(), key=lambda x: -x[1]["total_ms"]):
+        label = _IO_TYPE_LABELS.get(io_type, io_type)
+        lines.append(
+            f"  {label}: {stats['count']}次, "
+            f"总耗时{stats['total_ms']:.1f}ms, "
+            f"最大{stats['max_ms']:.1f}ms"
+        )
+        # Show top 3 slowest items per type
+        top_items = sorted(stats["top_items"], key=lambda x: -x.get("max_ms", 0))[:3]
+        for item in top_items:
+            name = item.get("name", "?")
+            # Shorten: SI$net#com.example.ApiClient.execute → ApiClient.execute
+            short = name.replace("SI$", "")
+            for prefix in ("net#", "db#", "img#"):
+                if short.startswith(prefix):
+                    short = short[len(prefix):]
+                    break
+            count = item.get("count", 0)
+            max_ms = item.get("max_ms", 0)
+            total_ms = item.get("total_ms", 0)
+            lines.append(
+                f"    → {short}: {count}次, "
+                f"最大{max_ms:.1f}ms, "
+                f"总{total_ms:.1f}ms"
+            )
+
+    total_count = io_slices.get("total_count", 0)
+    if total_count > 0:
+        lines.append(f"  IO操作总计: {total_count}次")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 8: Compose recomposition analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_compose_slices(data: dict) -> str:
+    """Analyze Jetpack Compose recomposition data.
+
+    Reports composables with excessive recompositions and high duration,
+    highlighting first-composition vs recomposition counts.
+    """
+    compose_slices = data.get("compose_slices") or {}
+    if not compose_slices:
+        return ""
+
+    composables = compose_slices.get("composables") or []
+    if not composables:
+        return ""
+
+    lines = ["[Compose重组分析]"]
+
+    # Filter to composables with significant recompositions or duration
+    significant = [
+        c for c in composables
+        if c.get("recompose_count", 0) > 0 or c.get("total_ms", 0) > 1.0
+    ]
+
+    if not significant:
+        return ""
+
+    # Sort by total_ms descending
+    significant.sort(key=lambda x: -x.get("total_ms", 0))
+
+    for c in significant[:10]:
+        name = c.get("name", "?")
+        first = c.get("first_count", 0)
+        recompose = c.get("recompose_count", 0)
+        total_ms = c.get("total_ms", 0)
+        max_ms = c.get("max_ms", 0)
+
+        parts = [f"  {name}:"]
+        parts.append(f"首次组合{first}次")
+        if recompose > 0:
+            parts.append(f"重组{recompose}次")
+        parts.append(f"总耗时{total_ms:.1f}ms")
+        parts.append(f"最大{max_ms:.1f}ms")
+        lines.append(" ".join(parts))
+
+        # Flag excessive recompositions (more than 3 recompositions per first composition)
+        if first > 0 and recompose / first > 3:
+            lines.append(f"    ⚠ 重组率过高: {recompose}/{first} = {recompose/first:.1f}x, 建议检查state稳定性")
+
+    total_count = compose_slices.get("total_count", 0)
+    if total_count > 0:
+        lines.append(f"  Compose操作总计: {total_count}次")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 9: Memory allocation analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_memory(data: dict) -> str:
+    """Analyze heap memory allocation and detect potential leaks.
+
+    Reports top heap objects by size, leak suspects (destroyed Activities/Fragments
+    still in heap), and memory growth anomalies.
+    """
+    memory = data.get("memory")
+    if not memory:
+        return ""
+
+    lines = ["[内存分配分析]"]
+
+    # Top heap objects
+    heap_objects = memory.get("heap_objects") or memory.get("heap_graph_classes") or []
+    if heap_objects:
+        lines.append("  堆内存Top对象:")
+        for obj in heap_objects[:10]:
+            name = obj.get("class_name", "?")
+            count = obj.get("obj_count", 0)
+            size_kb = obj.get("total_size_kb", 0)
+            # Shorten class name for readability
+            short = name.rsplit(".", 1)[-1] if "." in name else name
+            lines.append(f"    {short}: {count}个, {size_kb:.1f}KB")
+
+    # Leak suspects
+    leak_suspects = memory.get("leak_suspects") or []
+    if leak_suspects:
+        lines.append("  潜在泄漏:")
+        for suspect in leak_suspects[:5]:
+            name = suspect.get("class_name", "?")
+            count = suspect.get("obj_count", 0)
+            size_kb = suspect.get("total_size_kb", 0)
+            short = name.rsplit(".", 1)[-1] if "." in name else name
+            lines.append(f"    ⚠ {short}: {count}个实例, {size_kb:.1f}KB")
+
+    # Process memory trend
+    proc_mem = data.get("process_memory") or {}
+    processes = proc_mem.get("processes", [])
+    if processes:
+        from smartinspector.collector.memory import analyze_memory_trend
+        trend = analyze_memory_trend(proc_mem)
+        trend_procs = trend.get("processes", [])
+        for p in trend_procs:
+            if p.get("anomaly") or p.get("high_anon"):
+                peak = p.get("peak_rss_mb", 0)
+                name = p.get("name", "?")
+                lines.append(f"  {name}: 峰值{peak:.0f}MB")
+                if p.get("anomaly"):
+                    lines.append(f"    {p['anomaly']}")
+                if p.get("high_anon"):
+                    lines.append(f"    {p['high_anon']}")
+
+    if len(lines) <= 1:
+        return ""
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 10: Lock contention analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_lock_contention(data: dict) -> str:
+    """Analyze lock contention events, flagging main-thread involvement.
+
+    Reports the most severe lock waits, distinguishing main-thread blockers
+    from background contention.
+    """
+    lock_data = data.get("lock_contention") or {}
+    if not lock_data:
+        return ""
+    contentions = lock_data.get("top_contentions") or []
+    total_count = lock_data.get("total_count", len(contentions))
+    if not contentions:
+        return ""
+
+    lines = ["[锁竞争分析]"]
+
+    # Sort by duration descending
+    sorted_events = sorted(contentions, key=lambda x: -_safe_float(x.get("dur_ms")))
+    main_blockers = [e for e in sorted_events if e.get("is_main_thread_blocked")]
+    other_blockers = [e for e in sorted_events if not e.get("is_main_thread_blocked")]
+
+    total_dur = sum(_safe_float(e.get("dur_ms")) for e in sorted_events)
+    lines.append(f"  共{total_count}次锁等待, 总耗时{total_dur:.1f}ms")
+
+    if main_blockers:
+        lines.append("  主线程被阻塞:")
+        for e in main_blockers[:5]:
+            dur = _safe_float(e.get("dur_ms"))
+            blocked = e.get("short_blocked_method", "?")
+            blocking = e.get("short_blocking_method", "?")
+            lines.append(
+                f"    {blocked} 等待 {blocking} ({dur:.1f}ms)"
+            )
+
+    if other_blockers:
+        lines.append("  其他线程锁等待:")
+        for e in other_blockers[:3]:
+            dur = _safe_float(e.get("dur_ms"))
+            blocked_thread = e.get("blocked_thread", "?")
+            blocking = e.get("short_blocking_method", "?")
+            lines.append(
+                f"    {blocked_thread} → {blocking} ({dur:.1f}ms)"
+            )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 11: Binder transaction analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_binder_txns(data: dict) -> str:
+    """Analyze Binder transactions, ranking by client/server latency."""
+    binder_data = data.get("binder_txns") or {}
+    if not binder_data:
+        return ""
+    txns = binder_data.get("top_by_duration") or []
+    if not txns:
+        return ""
+
+    lines = ["[Binder调用分析]"]
+
+    total = binder_data.get("total_count", len(txns))
+    main_count = binder_data.get("main_thread_count", 0)
+    lines.append(f"  共{total}次Binder调用, 其中{main_count}次在主线程")
+
+    # Sort by client duration descending
+    sorted_txns = sorted(txns, key=lambda x: -_safe_float(x.get("client_dur_ms")))
+
+    for t in sorted_txns[:5]:
+        client_dur = _safe_float(t.get("client_dur_ms"))
+        server_dur = _safe_float(t.get("server_dur_ms"))
+        aidl = t.get("aidl_name", "?")
+        method = t.get("method_name", "")
+        is_main = " [主线程]" if t.get("is_main_thread") else ""
+        label = f"{aidl}.{method}" if method else aidl
+        lines.append(
+            f"  {label}: 客户端{client_dur:.1f}ms, "
+            f"服务端{server_dur:.1f}ms{is_main}"
+        )
+
+    return "\n".join(lines) if len(lines) > 2 else ""
+
+
+# ---------------------------------------------------------------------------
+# Helper 12: Startup metrics analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_startup_metrics(data: dict) -> str:
+    """Analyze startup metrics: TTID, TTFD, and bottleneck breakdown."""
+    startup = data.get("startup_metrics") or {}
+    if not startup:
+        return ""
+
+    startups = startup.get("startups") or []
+    breakdown = startup.get("breakdowns") or []
+    if not startups and not breakdown:
+        return ""
+
+    lines = ["[启动分析]"]
+
+    for s in startups[:3]:
+        ttid = s.get("ttid_ms")
+        ttfd = s.get("ttfd_ms")
+        pkg = s.get("package", "?")
+        stype = s.get("startup_type", "?")
+        parts = [f"  {pkg} ({stype})"]
+        if ttid is not None:
+            parts.append(f"TTID={ttid:.0f}ms")
+        if ttfd is not None:
+            parts.append(f"TTFD={ttfd:.0f}ms")
+        lines.append(": ".join(parts))
+
+    if breakdown:
+        lines.append("  启动瓶颈分解:")
+        for b in sorted(breakdown, key=lambda x: -_safe_float(x.get("segment_dur_ms")))[:5]:
+            reason = b.get("reason", "?")
+            dur = _safe_float(b.get("segment_dur_ms"))
+            lines.append(f"    {reason}: {dur:.1f}ms")
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+# ---------------------------------------------------------------------------
+# Helper 13: GC events analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_gc_events(data: dict) -> str:
+    """Analyze GC events: type, duration, impact on performance."""
+    gc_data = data.get("gc_events") or {}
+    if not gc_data:
+        return ""
+    gc_list = gc_data.get("events") or []
+    if not gc_list:
+        return ""
+
+    lines = ["[GC分析]"]
+
+    total_count = gc_data.get("total_count", len(gc_list))
+    total_dur = sum(_safe_float(e.get("gc_dur_ms")) for e in gc_list)
+    total_reclaimed = gc_data.get("total_reclaimed_mb", sum(_safe_float(e.get("reclaimed_mb")) for e in gc_list))
+    mark_compact_count = sum(1 for e in gc_list if e.get("is_mark_compact"))
+
+    lines.append(
+        f"  共{total_count}次GC, 总耗时{total_dur:.1f}ms, "
+        f"回收{total_reclaimed:.1f}MB"
+    )
+    if mark_compact_count > 0:
+        lines.append(f"  其中{mark_compact_count}次Mark-Compact (全堆GC, 耗时较长)")
+
+    for e in sorted(gc_list, key=lambda x: -_safe_float(x.get("gc_dur_ms")))[:3]:
+        dur = _safe_float(e.get("gc_dur_ms"))
+        gc_type = e.get("gc_type", "?")
+        reclaimed = _safe_float(e.get("reclaimed_mb"))
+        running = _safe_float(e.get("running_ms"))
+        runnable = _safe_float(e.get("runnable_ms"))
+        lines.append(
+            f"  {gc_type}: {dur:.1f}ms, "
+            f"回收{reclaimed:.1f}MB, "
+            f"Running={running:.1f}ms, Runnable={runnable:.1f}ms"
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 14: ANR analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_anrs(data: dict) -> str:
+    """Analyze ANR events with main-thread operation details."""
+    anr_data = data.get("anrs") or {}
+    if not anr_data:
+        return ""
+    anrs = anr_data.get("anr_events") if isinstance(anr_data, dict) else []
+    if isinstance(anr_data, list):
+        anrs = anr_data
+    if not anrs:
+        return ""
+
+    lines = ["[ANR分析]"]
+
+    for a in anrs:
+        subject = a.get("subject", "?")
+        anr_type = a.get("anr_type", "?")
+        dur = _safe_float(a.get("anr_dur_ms"))
+        process = a.get("process_name", "?")
+        lines.append(f"  {subject} ({anr_type}): {dur:.0f}ms, 进程={process}")
+
+        # Show main-thread slices during ANR
+        main_slices = a.get("main_thread_slices") or []
+        if main_slices:
+            top_slices = sorted(main_slices, key=lambda x: -_safe_float(x.get("dur_ms")))[:3]
+            for s in top_slices:
+                s_name = s.get("name", "?")
+                s_dur = _safe_float(s.get("dur_ms"))
+                lines.append(f"    \u2192 {s_name}: {s_dur:.1f}ms")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 15: Input latency analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_input_latency(data: dict) -> str:
+    """Analyze input latency breakdown: dispatch/handling/ack phases."""
+    input_data = data.get("input_latency") or {}
+    if not input_data:
+        return ""
+    events = input_data.get("top_events") if isinstance(input_data, dict) else []
+    if isinstance(input_data, list):
+        events = input_data
+    if not events:
+        return ""
+
+    lines = ["[输入延迟分析]"]
+
+    total_count = len(events)
+    total_durs = [_safe_float(e.get("total_ms")) for e in events]
+    avg_total = sum(total_durs) / len(total_durs) if total_durs else 0
+    max_total = max(total_durs) if total_durs else 0
+
+    lines.append(f"  共{total_count}次输入事件, 平均延迟{avg_total:.1f}ms, 最大{max_total:.1f}ms")
+
+    for e in sorted(events, key=lambda x: -_safe_float(x.get("total_ms")))[:5]:
+        dispatch = _safe_float(e.get("dispatch_ms"))
+        handling = _safe_float(e.get("handling_ms"))
+        ack = _safe_float(e.get("ack_ms"))
+        total = _safe_float(e.get("total_ms"))
+        event_type = e.get("event_type", "?")
+        event_action = e.get("event_action", "")
+        label = f"{event_type}.{event_action}" if event_action else event_type
+        lines.append(
+            f"  {label}: 总{total:.1f}ms "
+            f"(分发={dispatch:.1f}, 处理={handling:.1f}, 回执={ack:.1f})"
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 16: Schedule latency analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_sched_latency(data: dict) -> str:
+    """Analyze scheduling latency: threads waiting longest for CPU."""
+    sched_data = data.get("sched_latency") or {}
+    if not sched_data:
+        return ""
+    events = sched_data.get("top_threads") if isinstance(sched_data, dict) else []
+    if isinstance(sched_data, list):
+        events = sched_data
+    if not events:
+        return ""
+
+    lines = ["[调度延迟分析]"]
+
+    for e in sorted(events, key=lambda x: -_safe_float(x.get("max_wait_ms")))[:5]:
+        thread = e.get("thread_name", "?")
+        wait_count = e.get("wait_count", 0)
+        total_wait = _safe_float(e.get("total_wait_ms"))
+        avg_wait = _safe_float(e.get("avg_wait_ms"))
+        max_wait = _safe_float(e.get("max_wait_ms"))
+        lines.append(
+            f"  {thread}: 等待{wait_count}次, "
+            f"总{total_wait:.1f}ms, "
+            f"平均{avg_wait:.1f}ms, "
+            f"最大{max_wait:.1f}ms"
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 17: OOM / RSS / Swap analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_oom_rss_swap(data: dict) -> str:
+    """Analyze OOM adj transitions, RSS/Swap trends, and LMK events."""
+    oom_data = data.get("oom_rss_swap") or {}
+    if not oom_data:
+        return ""
+
+    transitions = oom_data.get("oom_transitions") or []
+    lmk_events = oom_data.get("lmk_events") or []
+    if not transitions and not lmk_events:
+        return ""
+
+    lines = ["[OOM/RSS分析]"]
+
+    if transitions:
+        lines.append("  OOM adj变化:")
+        for t in transitions[:5]:
+            score = t.get("oom_score", "?")
+            rss = _safe_float(t.get("rss_mb"))
+            swap = _safe_float(t.get("swap_mb"))
+            reason = t.get("oom_adj_reason", "")
+            lines.append(
+                f"    adj={score}, RSS={rss:.0f}MB, Swap={swap:.0f}MB"
+                + (f", 原因={reason}" if reason else "")
+            )
+
+    if lmk_events:
+        lines.append(f"  LMK事件 ({len(lmk_events)}次):")
+        for lmk in lmk_events[:3]:
+            proc = lmk.get("process_name", "?")
+            reason = lmk.get("kill_reason", "?")
+            lines.append(f"    {proc}: {reason}")
+
+    return "\n".join(lines)

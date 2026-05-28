@@ -6,7 +6,12 @@ import json
 def format_perf_sections(perf_json: str) -> list[str]:
     """Build user-facing markdown sections from perf JSON.
 
-    Returns a list of markdown strings to include in the LLM prompt.
+    Section ordering follows CLAUDE.md priority to survive truncation:
+      1. 预计算结论 (deterministic hints)
+      2. 线程状态分析 (thread state)
+      3. 帧时间线 (frame timeline)
+      4. 自定义切片统计 (view slices summary)
+      5. IO操作分析 / Compose重组分析
     """
     user_parts: list[str] = []
 
@@ -23,7 +28,53 @@ def format_perf_sections(perf_json: str) -> list[str]:
     except Exception:
         perf_data = {}
 
+    # Thread state analysis — Running vs Sleeping vs DiskSleep with blocking details
+    # Priority 2: must appear before frame timeline to survive truncation
+    thread_states = perf_data.get("thread_state", [])
+    if thread_states:
+        ts_lines = ["## 线程状态分析\n"]
+        ts_lines.append("区分\"代码慢\"(Running)和\"被阻塞\"(Sleeping/DiskSleep)：")
+
+        # Split into blocked and running groups
+        blocked = [ts for ts in thread_states
+                   if ts.get("dominant_state") in ("Sleeping", "DiskSleep")]
+        running = [ts for ts in thread_states
+                   if ts.get("dominant_state") == "Running"]
+
+        if blocked:
+            ts_lines.append("")
+            ts_lines.append("**阻塞切片**（线程被IO/锁挂起，优化方向不是代码本身）：")
+            for ts in blocked[:5]:
+                short = ts["slice_name"].replace("SI$", "") if ts["slice_name"].startswith("SI$") else ts["slice_name"]
+                dur = ts.get("dur_ms", 0)
+                dist = ts.get("state_distribution", {})
+                dist_str = ", ".join(f"{k} {v:.0f}%" for k, v in dist.items())
+                ts_lines.append(f"- {short} ({dur:.1f}ms): {dist_str}")
+                # Blocking reason
+                bf = ts.get("blocked_function")
+                if bf:
+                    from smartinspector.agents.deterministic import BLOCKED_FN_MEANING
+                    meaning = BLOCKED_FN_MEANING.get(bf, bf)
+                    ts_lines.append(f"  阻塞原因: {meaning}")
+                if ts.get("io_wait"):
+                    ts_lines.append("  类型: IO等待")
+                if ts.get("waker_name"):
+                    ts_lines.append(f"  唤醒者: {ts['waker_name']}")
+
+        if running:
+            ts_lines.append("")
+            ts_lines.append("**Running切片**（代码执行慢，需优化算法或异步化）：")
+            for ts in running[:5]:
+                short = ts["slice_name"].replace("SI$", "") if ts["slice_name"].startswith("SI$") else ts["slice_name"]
+                dur = ts.get("dur_ms", 0)
+                dist = ts.get("state_distribution", {})
+                running_pct = dist.get("Running", 100)
+                ts_lines.append(f"- {short} ({dur:.1f}ms): Running {running_pct:.0f}%")
+
+        user_parts.append("\n".join(ts_lines))
+
     # Frame timeline detail
+    # Priority 3
     ft = perf_data.get("frame_timeline", {})
     _total_frames = ft.get("total_frames", 0) if ft else 0
     _avg_fps = ft.get("fps", 0) if ft else 0
@@ -45,6 +96,7 @@ def format_perf_sections(perf_json: str) -> list[str]:
         user_parts.append("\n".join(ft_lines))
 
     # View slices summary (top 10 only, compact)
+    # Priority 4
     vs = perf_data.get("view_slices", {})
     if vs:
         vs_summary = vs.get("summary", [])
@@ -58,7 +110,77 @@ def format_perf_sections(perf_json: str) -> list[str]:
             if len(vs_lines) > 1:
                 user_parts.append("\n".join(vs_lines))
 
+    # IO slices summary (network / database / image)
+    io_slices = perf_data.get("io_slices", {})
+    if io_slices:
+        io_summary = io_slices.get("summary", [])
+        if io_summary:
+            io_lines = ["## IO操作分析\n"]
+
+            # Aggregate by IO type
+            by_type: dict[str, list] = {}
+            for s in io_summary:
+                io_type = s.get("io_type", "unknown")
+                if io_type not in by_type:
+                    by_type[io_type] = []
+                by_type[io_type].append(s)
+
+            _IO_LABELS = {"network": "网络IO", "database": "数据库IO", "image": "图片加载"}
+            for io_type, items in sorted(by_type.items(), key=lambda x: -sum(s.get("total_ms", 0) for s in x[1])):
+                label = _IO_LABELS.get(io_type, io_type)
+                total_count = sum(s.get("count", 0) for s in items)
+                total_ms = sum(s.get("total_ms", 0) for s in items)
+                max_ms = max(s.get("max_ms", 0) for s in items)
+                io_lines.append(f"**{label}**: {total_count}次, 总耗时{total_ms:.1f}ms, 最大{max_ms:.1f}ms")
+
+                # Top 5 slowest
+                for s in sorted(items, key=lambda x: -x.get("max_ms", 0))[:5]:
+                    name = s.get("name", "?")
+                    short = name.replace("SI$", "")
+                    for prefix in ("net#", "db#", "img#"):
+                        if short.startswith(prefix):
+                            short = short[len(prefix):]
+                            break
+                    io_lines.append(
+                        f"  - {short}: {s.get('count', 0)}次, "
+                        f"最大{s.get('max_ms', 0):.1f}ms, "
+                        f"总{s.get('total_ms', 0):.1f}ms"
+                    )
+
+            io_lines.append(f"\nIO操作总计: {io_slices.get('total_count', 0)}次")
+            user_parts.append("\n".join(io_lines))
+
+    # Compose recomposition analysis
+    compose_slices = perf_data.get("compose_slices", {})
+    if compose_slices:
+        composables = compose_slices.get("composables", [])
+        if composables:
+            compose_lines = ["## Compose重组分析\n"]
+            for c in composables[:10]:
+                name = c.get("name", "?")
+                first = c.get("first_count", 0)
+                recompose = c.get("recompose_count", 0)
+                total_ms = c.get("total_ms", 0)
+                max_ms = c.get("max_ms", 0)
+                compose_lines.append(
+                    f"- **{name}**: 首次{first}次, 重组{recompose}次, "
+                    f"总{total_ms:.1f}ms, 最大{max_ms:.1f}ms"
+                )
+                if first > 0 and recompose / first > 3:
+                    compose_lines.append(f"  ⚠ 重组率过高 ({recompose/first:.1f}x), 检查state稳定性")
+            compose_lines.append(f"\nCompose总计: {compose_slices.get('total_count', 0)}次")
+            user_parts.append("\n".join(compose_lines))
+
     return user_parts
+
+
+def _to_relative_path(file_path: str) -> str:
+    """Convert absolute file path to relative path from source dir."""
+    from smartinspector.config import get_source_dir
+    source_dir = get_source_dir()
+    if file_path and file_path.startswith(source_dir):
+        return file_path[len(source_dir):].lstrip("/")
+    return file_path
 
 
 def format_attribution_section(attribution_result: str) -> list[str]:
@@ -75,8 +197,17 @@ def format_attribution_section(attribution_result: str) -> list[str]:
 
     found = [r for r in attr_data if r.get("attributable")]
     system = [r for r in attr_data if r.get("reason") == "system_class"]
+    failed = [r for r in attr_data if r.get("reason") in ("parse_failed", "error")]
     unresolved = [r for r in attr_data
-                  if not r.get("attributable") and r.get("reason") not in ("system_class", "found")]
+                  if not r.get("attributable")
+                  and r.get("reason") not in ("system_class", "found", "parse_failed", "error")]
+
+    if failed:
+        from smartinspector.debug_log import debug_log
+        debug_log(
+            "reporter",
+            f"Skipped {len(failed)} failed/error attribution entries (parse_failed or error)",
+        )
 
     if found:
         parts = ["## 源码归因结果\n"]
@@ -85,10 +216,28 @@ def format_attribution_section(attribution_result: str) -> list[str]:
             raw_name = r.get("raw_name", "")
             if raw_name.startswith("SI$block#"):
                 type_tag = " [主线程卡顿]"
-            parts.append(f"- {r['class_name']}.{r['method_name']} ({r['dur_ms']:.2f}ms){type_tag}")
-            parts.append(f"  位置: {r.get('file_path', '?')}:{r.get('line_start', '?')}-{r.get('line_end', '?')}")
+            elif raw_name.startswith("SI$net#"):
+                type_tag = " [网络IO]"
+            elif raw_name.startswith("SI$db#"):
+                type_tag = " [数据库IO]"
+            elif raw_name.startswith("SI$img#"):
+                type_tag = " [图片加载]"
+            elif raw_name.startswith("CPU$hotspot#"):
+                type_tag = " [CPU热点]"
+            elif r.get("method_name") == "inflate":
+                type_tag = " [XML布局]"
+            if r.get("count", 0) > 1:
+                type_tag += f", 调用{r['count']}次"
+                if r.get("total_ms"):
+                    type_tag += f", 累计{r['total_ms']:.1f}ms"
+            display_method = r['method_name']
+            if r.get("context_method"):
+                display_method = f"{r['context_method']}${display_method}"
+            parts.append(f"- {r['class_name']}.{display_method} ({r['dur_ms']:.2f}ms){type_tag}")
+            fp = _to_relative_path(r.get('file_path', '?'))
+            parts.append(f"  位置: {fp}:{r.get('line_start', '?')}-{r.get('line_end', '?')}")
             if r.get("source_snippet"):
-                parts.append(f"  发现: {r['source_snippet'][:200]}")
+                parts.append(f"  发现: {r['source_snippet'][:300]}")
         user_parts.append("\n".join(parts))
 
     if system:

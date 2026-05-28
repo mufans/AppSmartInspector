@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
 
     <application
         android:name=".App"
@@ -10,7 +11,7 @@
         android:networkSecurityConfig="@xml/network_security_config"
         android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
 
-        <!-- Main activity: triggers hook init, shows a demo RecyclerView -->
+        <!-- Main activity: triggers hook init, shows scenario list -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -19,5 +20,59 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Compose demo page for testing ComposeHook recomposition tracking -->
+        <activity
+            android:name=".ui.ComposeDemoActivity"
+            android:exported="false"
+            android:label="Compose Demo" />
+
+        <!-- P0: Lock contention — android.monitor_contention -->
+        <activity
+            android:name=".ui.LockContentionActivity"
+            android:exported="false"
+            android:label="Lock Contention" />
+
+        <!-- P0: Binder IPC — android.binder, android.binder_breakdown -->
+        <activity
+            android:name=".ui.BinderCallsActivity"
+            android:exported="false"
+            android:label="Binder Calls" />
+
+        <!-- P0: GC stress — android.garbage_collection -->
+        <activity
+            android:name=".ui.GcStressActivity"
+            android:exported="false"
+            android:label="GC Stress" />
+
+        <!-- P0: ANR trigger — android.anrs -->
+        <activity
+            android:name=".ui.AnrTriggerActivity"
+            android:exported="false"
+            android:label="ANR Trigger" />
+
+        <!-- P0: Cold start — android.startup -->
+        <activity
+            android:name=".ui.ColdStartActivity"
+            android:exported="true"
+            android:label="Cold Start" />
+
+        <!-- P1: Input latency — android.input -->
+        <activity
+            android:name=".ui.InputLatencyActivity"
+            android:exported="false"
+            android:label="Input Latency" />
+
+        <!-- P1: Memory pressure — android.memory.process -->
+        <activity
+            android:name=".ui.MemoryPressureActivity"
+            android:exported="false"
+            android:label="Memory Pressure" />
+
+        <!-- P1: Sched latency — sched.latency -->
+        <activity
+            android:name=".ui.SchedLatencyActivity"
+            android:exported="false"
+            android:label="Sched Latency" />
     </application>
 </manifest>

@@ -1,10 +1,12 @@
 """Slash command registry for SmartInspector CLI."""
 
 from smartinspector.commands.device import cmd_devices, cmd_connect, cmd_status, cmd_disconnect
-from smartinspector.commands.trace import cmd_trace, cmd_record, cmd_analyze
+from smartinspector.commands.trace import cmd_trace, cmd_record, cmd_analyze, cmd_frame, cmd_open, cmd_close
 from smartinspector.commands.hook import cmd_config, cmd_hooks, cmd_hook, cmd_debug
 from smartinspector.commands.session import cmd_help, cmd_clear, cmd_summary, cmd_tokens
-from smartinspector.commands.orchestrate import cmd_full, cmd_report
+from smartinspector.commands.orchestrate import cmd_full, cmd_startup, cmd_report
+from smartinspector.commands.compare import cmd_compare
+from smartinspector.commands.quick import cmd_quick
 
 # Command registry: name → handler function
 SLASH_COMMANDS = {
@@ -16,6 +18,9 @@ SLASH_COMMANDS = {
     "/trace": cmd_trace,
     "/record": cmd_record,
     "/analyze": cmd_analyze,
+    "/frame": cmd_frame,
+    "/open": cmd_open,
+    "/close": cmd_close,
     "/config": cmd_config,
     "/hooks": cmd_hooks,
     "/hook": cmd_hook,
@@ -24,7 +29,10 @@ SLASH_COMMANDS = {
     "/summary": cmd_summary,
     "/tokens": cmd_tokens,
     "/full": cmd_full,
+    "/startup": cmd_startup,
     "/report": cmd_report,
+    "/compare": cmd_compare,
+    "/quick": cmd_quick,
 }
 
 

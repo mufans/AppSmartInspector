@@ -42,7 +42,7 @@ def _stream_run(graph, state):
             last_updates = chunk["data"]
             for node_name, node_state in chunk["data"].items():
                 if node_name in ("android_expert", "perf_analyzer", "explorer", "collector",
-                                 "analyzer", "attributor", "reporter"):
+                                 "analyzer", "attributor", "reporter", "frame_analyzer"):
                     pass
                 else:
                     # fallback and other nodes: print AI message content

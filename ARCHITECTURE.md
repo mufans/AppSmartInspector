@@ -73,6 +73,7 @@ smartinspector/
 │   │           ├── __init__.py  #       reporter_node entry (streaming output)
 │   │           ├── generator.py #       LLM report generation (streaming + retry + token estimation)
 │   │           ├── formatter.py #       Data formatting (perf JSON + attribution → Markdown)
+│   │           ├── json_formatter.py #  JSON structured report formatting (CI/automation)
 │   │           └── persistence.py #     Report file saving (./reports/)
 │   │
 │   ├── agents/                  # Agent definitions (LLM + tools)
@@ -80,11 +81,14 @@ smartinspector/
 │   │   ├── explorer.py          #   Code Explorer: grep/glob/read
 │   │   ├── perf_analyzer.py     #   Perf Analyzer: single-shot LLM interpretation
 │   │   ├── attributor.py        #   Source attribution: run_attribution()
+│   │   ├── frame_analyzer.py    #   Frame Analyzer: Perfetto UI 交互帧分析 (query→attribution→LLM)
 │   │   └── deterministic.py     #   Deterministic pre-computation (reduces LLM tokens)
 │   │
 │   ├── collector/               # Data collection & processing
-│   │   └── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON (CPU调用链, 系统级CPU, WS+SQL合并, context manager)
+│   │   ├── perfetto.py          #   PerfettoCollector: adb collect → SQL query → JSON (CPU调用链, 系统级CPU, WS+SQL合并, context manager, IO slices, 11 stdlib modules)
+│   │   └── startup.py           #   StartupAnalyzer: cold start phase splitting + bottleneck identification
 │   │
+│   ├── headless.py              # HeadlessRunner: non-interactive CI mode (full pipeline, JSON/Markdown output)
 │   ├── commands/                # Slash command implementations
 │   │   ├── __init__.py          #   Command registry (SLASH_COMMANDS dict + handle_slash_command)
 │   │   ├── attribution.py       #   SI$ tag parsing + attribution extraction
@@ -92,7 +96,7 @@ smartinspector/
 │   │   ├── hook.py              #   /config, /hooks, /hook, /debug
 │   │   ├── orchestrate.py       #   /full, /report (文件输出)
 │   │   ├── session.py           #   /help, /clear (全字段清理), /summary, /tokens
-│   │   └── trace.py             #   /trace, /record, /analyze
+│   │   └── trace.py             #   /trace, /record, /analyze, /frame, /open, /close
 │   │
 │   ├── tools/                   # LangChain @tool functions
 │   │   ├── perfetto.py          #   analyze_perfetto, collect_android_trace
@@ -103,13 +107,19 @@ smartinspector/
 │   │   └── path_utils.py        #   shared path validation (prevent traversal)
 │   │
 │   └── ws/                      # WebSocket communication
-│       └── server.py            #   SIServer (心跳检测, ready event, 动态端口, msg_id+ACK)
+│       ├── server.py            #   SIServer (心跳检测, ready event, 动态端口, msg_id+ACK)
+│       └── bridge_server.py     #   BridgeServer (自托管 Perfetto UI + WS 桥接帧分析)
+│
+├── perfetto-plugin/             # Perfetto UI SI Bridge 插件
+│   ├── com.smartinspector.Bridge/  插件源码 (TypeScript, AreaSelection tab)
+│   └── build.sh                 #   构建脚本 (clone Perfetto + 复制插件 + build)
 │
 ├── prompts/                     # System prompts (text files)
 │   ├── main.txt                 #   Main persona (HarmonyOS perf tool)
 │   ├── android-expert.txt       #   Android agent prompt
 │   ├── perf-analyzer.txt        #   Perf analysis prompt
 │   ├── code-explorer.txt        #   Code search prompt
+│   ├── frame-analyzer.txt       #   Frame analysis prompt (Perfetto UI /frame)
 │   ├── report-generator.txt     #   Report format prompt
 │   ├── compaction.txt           #   Context compression prompt
 │   ├── monkey-driver.txt        #   Monkey test driver prompt
@@ -233,6 +243,20 @@ you> /debug         → 打开设备端 Hook 调试配置面板
 | `/record [duration_ms] [pkg]` | 只采集不分析，返回 .pb 路径 | 默认 10000ms，可选指定目标包名 |
 | `/analyze [path]` | 分析 trace 文件（无参数时分析上次 `/record` 结果） | 可选 trace 文件路径 |
 
+### Perfetto UI 交互类
+
+| 指令 | 功能 |
+|------|------|
+| `/frame ts=X dur=Y` | 分析指定时间范围的帧（ts/dur 纳秒，CLI 直接分析） |
+| `/open [path]` | 启动自托管 Perfetto UI + Bridge Server + trace_processor_shell，浏览器自动打开 |
+| `/close` | 关闭 Bridge Server 和 trace_processor_shell |
+
+**Perfetto UI 交互流程**：
+1. `/open` 启动 BridgeServer（端口 9877），提供自托管 Perfetto UI 静态文件 + trace 自动加载
+2. 用户在 Perfetto UI 中拖选时间范围 → "SI Frame Analysis" 面板 → "Analyze with SI Agent"
+3. BridgeServer 转发到 `frame_analyzer` agent：查询切片 → 源码归因 → LLM 分析
+4. 实时进度推送（查询、归因工具调用、LLM 分析）→ 最终 Markdown 报告回传 UI
+
 ### Hook 配置类
 
 | 指令 | 功能 | 参数 |
@@ -270,7 +294,7 @@ you> /debug         → 打开设备端 Hook 调试配置面板
 # commands/__init__.py — command registry pattern
 
 from smartinspector.commands.device import cmd_devices, cmd_connect, cmd_status, cmd_disconnect
-from smartinspector.commands.trace import cmd_trace, cmd_record, cmd_analyze
+from smartinspector.commands.trace import cmd_trace, cmd_record, cmd_analyze, cmd_frame, cmd_open, cmd_close
 from smartinspector.commands.hook import cmd_config, cmd_hooks, cmd_hook, cmd_debug
 from smartinspector.commands.session import cmd_help, cmd_clear, cmd_summary, cmd_tokens
 from smartinspector.commands.orchestrate import cmd_full, cmd_report
@@ -284,6 +308,9 @@ SLASH_COMMANDS = {
     "/trace": cmd_trace,
     "/record": cmd_record,
     "/analyze": cmd_analyze,
+    "/frame": cmd_frame,
+    "/open": cmd_open,
+    "/close": cmd_close,
     "/config": cmd_config,
     "/hooks": cmd_hooks,
     "/hook": cmd_hook,
@@ -364,18 +391,101 @@ def handle_slash_command(user_input: str, state: dict) -> dict:
 
 **Output**: `{ attribution_data: "<json>", attribution_result: "<json>" }`
 
-### 5. Reporter (`graph/nodes/reporter/`)
+### 5. Frame Analyzer (`agents/frame_analyzer.py`)
 
-**Role**: Generate the final Markdown performance report with LLM.
+**Role**: Analyze a user-selected time range from Perfetto UI. Used in two contexts:
+- `/frame ts=X dur=Y` — CLI direct invocation
+- Perfetto UI "Analyze with SI Agent" — via BridgeServer WebSocket
+
+**Model**: Uses `SI_MODEL`, temperature=0.1
+
+**Workflow**:
+1. `query_frame_slices()` — query slices, frames, call chains overlapping [ts, ts+dur]
+2. `_run_source_attribution()` — extract SI$ slices → `_attach_block_stacks()` → `run_attribution()`
+3. LLM analysis with frame-analyzer prompt, incorporating precomputed hints + attribution results
+
+**Progress reporting**: `on_progress` callback pushes real-time status (query → slice count → attribution tool calls → LLM analysis) to CLI (`print`) and Perfetto UI (`WebSocket`).
+
+### 6. BridgeServer (`ws/bridge_server.py`)
+
+**Role**: Self-hosted Perfetto UI + WebSocket bridge for interactive frame analysis.
+
+**Components**:
+- Static file serving from `perfetto-build/ui/out/dist/`
+- `/trace.pb` endpoint for auto-loading trace in Perfetto UI
+- WebSocket `/bridge` endpoint for SI Bridge plugin communication
+- `on_progress` callback bridges sync thread pool → async WebSocket for real-time progress
+
+**Protocol** (Plugin → Server):
+| type | payload |
+|------|---------|
+| `frame_selected` | `{ts, dur}` — user selected time range |
+| `ping` | heartbeat |
+
+**Protocol** (Server → Plugin):
+| type | payload |
+|------|---------|
+| `analysis_progress` | `{step, detail}` — real-time progress updates |
+| `analysis_result` | `{analysis}` — final Markdown report |
+| `analysis_error` | `{error}` |
+| `pong` | heartbeat response |
+
+### 7. Perfetto UI Plugin (`perfetto-plugin/com.smartinspector.Bridge/`)
+
+**Role**: Perfetto UI area selection tab for triggering SI Agent analysis.
+
+**Features**:
+- Area selection tab "SI Frame Analysis" — display selected range + "Analyze" button
+- Keyboard shortcut `Ctrl+Shift+A` for quick analysis
+- Cumulative progress log (`progressLog[]`) with auto-scroll — shows query, attribution tool calls, LLM steps
+- Markdown result display panel
+- Auto-reconnect WebSocket on disconnection
+
+**Build**: `perfetto-plugin/build.sh` clones Perfetto, copies plugin, registers in `default_plugins.ts`, builds UI.
+
+### 8. Reporter (`graph/nodes/reporter/`)
+
+**Role**: Generate the final Markdown or JSON performance report with LLM.
 
 **Sub-modules**:
 - `formatter.py` — builds Markdown sections from perf JSON and attribution results
+- `json_formatter.py` — structured JSON report (summary, issues, metrics) for CI/automation
 - `generator.py` — LLM report generation with streaming and retry on failure
 - `persistence.py` — saves report to `./reports/perf_report_YYYYMMDD_HHMMSS.md`
 
-**Output**: Complete Markdown report (header tables + LLM analysis + source attribution)
+**Output**: Complete Markdown report (header tables + LLM analysis + source attribution) or JSON report (structured issues with severity)
 
-### 6. Code Explorer (`graph/nodes/explorer.py`)
+### 8.1 Startup Node (`graph/nodes/startup.py`)
+
+**Role**: Analyze cold start performance from collected trace.
+
+**Model**: None (deterministic via `StartupAnalyzer`)
+
+**Workflow**:
+1. `StartupAnalyzer(trace_path, target_process)` — locates startup timestamps in trace
+2. Phase splitting: process_start → Application.onCreate → Activity.onCreate → first doFrame
+3. Critical path extraction: longest SI$ slices during startup
+4. Bottleneck identification: slowest slice per phase with optimization suggestions
+
+**Output**: Markdown startup analysis report with phases table, critical path, and bottleneck list
+
+### 8.2 Headless Runner (`headless.py`)
+
+**Role**: Non-interactive analysis runner for CI/CD integration.
+
+**Usage**: `uv run smartinspector --ci [options]`
+
+**Workflow**:
+1. Collect trace from device or use existing trace file
+2. `PerfettoCollector.summarize()` → perf JSON
+3. `compute_hints()` → deterministic pre-computation
+4. `extract_attributable_slices()` → source attribution
+5. Optional LLM analysis (graceful degradation without API key)
+6. Generate report in Markdown or JSON format
+
+**Output**: Report written to file (`--output`) or stdout
+
+### 9. Code Explorer (`graph/nodes/explorer.py`)
 
 **Role**: Search and read source code files.
 
@@ -385,7 +495,7 @@ def handle_slash_command(user_input: str, state: dict) -> dict:
 
 **Output**: `[file_path]:[line_number]` + code snippet + analysis.
 
-### 7. Fallback (`graph/nodes/orchestrator.py`)
+### 10. Fallback (`graph/nodes/orchestrator.py`)
 
 **Role**: Friendly LLM reply for non-performance queries (greetings, Q&A).
 
@@ -416,6 +526,20 @@ PerfSummary
 │   ├── slowest_slices: list[dict]     # Top 30 slowest individual slices
 │   └── rv_instances: list[dict]       # Grouped by RV#[viewId]#[Adapter]
 │       └── methods: dict              # Per-method stats (count, total_ms, max_ms)
+├── io_slices: dict                     # IO slices (SI$net#/SI$db#/SI$img# — all threads)
+│   ├── total_count: int               # Total IO slice count
+│   └── summary: list[dict]            # Aggregated by IO type + class
+├── lock_contention: dict | None        # Monitor lock contention (stdlib)
+├── binder_txns: dict | None            # Binder transactions (stdlib)
+├── startup_metrics: dict | None        # Startup TTID/TTFD (stdlib)
+├── gc_events: dict | None              # GC events (stdlib)
+├── anrs: dict | None                   # ANR events (stdlib)
+├── slice_cpu_time: dict | None         # Per-slice CPU time (stdlib)
+├── input_latency: dict | None          # Input latency breakdown (stdlib)
+├── sched_latency: dict | None          # Scheduling latency (stdlib)
+├── oom_rss_swap: dict | None           # OOM/RSS/Swap + LMK events (stdlib)
+├── cpu_utilization: dict | None        # CPU cycles per process (stdlib)
+├── surfaceflinger_timeline: dict | None # App↔SF vsync match (stdlib)
 └── metadata: dict                      # Trace metadata + table diagnosis
 ```
 
@@ -428,8 +552,21 @@ PerfSummary
 | `collect_frame_timeline()` | `actual_frame_timeline_slice` | Frame jank from SurfaceFlinger |
 | `collect_memory()` | `heap_graph_object` + `heap_graph_class` | Java heap allocation |
 | `collect_view_slices()` | `slice` | Custom TraceHook tags + system atrace |
+| `collect_io_slices()` | `slice` | IO slices (SI$net#/SI$db#/SI$img#) from all threads |
 | `collect_threads()` | `thread` | Thread listing |
 | `collect_sys_stats()` | `sys_stats` | System-level CPU metrics |
+| `collect_lock_contention()` | `android.monitor_contention` | Monitor lock contention (blocked/blocking method, waiter count, thread state breakdown) |
+| `collect_binder_txns()` | `android.binder` | Binder transactions (AIDL name, client/server duration, sync/async, OOM score) |
+| `collect_binder_breakdown()` | `android.binder_breakdown` | Binder client/server breakdown by delay reason |
+| `collect_startup_metrics()` | `android.startup.*` | Startup list, TTID/TTFD, opinionated breakdown by phase |
+| `collect_gc_events()` | `android.garbage_collection` | GC events (type, duration, reclaimed MB, heap size, running/runnable/IO time) |
+| `collect_anrs()` | `android.anrs` | ANR events (subject, component, ANR type, duration) |
+| `collect_slice_cpu_time()` | `slices.cpu_time` | Per-slice CPU time ranking (thread_slice_cpu_time) |
+| `collect_input_latency()` | `android.input` | Input event latency breakdown (dispatch/handling/ack/total/end-to-end) |
+| `collect_sched_latency()` | `sched.latency` | Scheduling latency (runnable→running delay per interval) |
+| `collect_oom_rss_swap()` | `android.memory.process` + `android.memory.lmk` | OOM score transitions, RSS/Swap per process, LMK kill events |
+| `collect_cpu_utilization()` | `linux.cpu.utilization.process` | CPU cycles, runtime, frequency stats per process |
+| `collect_surfaceflinger_timeline()` | `android.surfaceflinger` | App↔SF frame timeline match (vsync mapping) |
 
 **Perfetto config**:
 - Default categories: sched, freq, idle, power, memreclaim, gfx, view, input, dalvik, am, wm
@@ -471,6 +608,14 @@ Application.onCreate()
 | `layout_inflate` | false | LayoutInflater: inflate | `SI$inflate#[layout_name]#[parent_class]` |
 | `view_traverse` | false | View: measure/layout/draw (非RV) | `SI$view#[class].[method]` |
 | `handler_dispatch` | false | Handler: dispatchMessage (主线程) | `SI$handler#[msg_class]` |
+
+**IO Hook 点（默认启用，全线程追踪）**：
+
+| Hook | 默认 | Tag 格式 | 说明 |
+|------|------|---------|------|
+| Network IO | true | `SI$net#[Class].execute` | OkHttp / HttpURLConnection |
+| Database IO | true | `SI$db#[Class].query#[table]` | SQLiteDatabase / Room |
+| Image Load | true | `SI$img#[Class].into` | Glide / Coil |
 
 **自定义 hook 点（extra_hooks 配置）**：
 
@@ -684,7 +829,8 @@ User: "全面分析列表滑动性能"
   │   ├─ collect_cpu_hotspots()
   │   ├─ collect_frame_timeline()
   │   ├─ collect_memory()
-  │   ├─ collect_view_slices()  ← SI$ prefix filtering, rv_instances grouping
+  │   ├─ collect_view_slices()  ← SI$ prefix filtering, rv_instances grouping, IO slices excluded
+  │   ├─ collect_io_slices()     ← SI$net#/SI$db#/SI$img# from all threads
   │   └─ collect_block_events()  ← WS 结构化 JSON + SQL atrace 合并（非覆盖）
   └─ State: perf_summary = "{...json...}", _trace_path = "/tmp/xxx.pb"
   │
@@ -764,6 +910,10 @@ orchestrator → collector → analyzer → END
 16. **Configurable limits** — Hardcoded values (tool timeout, read limits, report tokens, WS ping timeout) centralized in `config.py` with `SI_*` environment variable overrides
 17. **Thread-safe singletons** — LLM client singletons in agents use double-checked locking pattern (`threading.Lock`) for thread-safe lazy initialization
 18. **Shared path validation** — Tools share `path_utils.validate_search_path()` to prevent directory traversal attacks
+19. **IO slice separation** — IO slices (`SI$net#/SI$db#/SI$img#`) collected independently from view slices, avoiding pollution of main-thread analysis; IO hooks enabled by default for comprehensive tracing
+20. **Cold start phase splitting** — `StartupAnalyzer` identifies 4 startup phases (pre-main → Application.onCreate → Activity.onCreate → first frame) and extracts critical path + bottlenecks
+21. **Headless/CI mode** — `HeadlessRunner` provides non-interactive pipeline execution with JSON output for CI/CD integration; graceful degradation without LLM API key
+22. **JSON report format** — Structured JSON output with severity classification (P0/P1/P2), issue categorization, and source attribution, designed for automated parsing
 
 ---
 
