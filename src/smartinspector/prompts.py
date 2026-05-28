@@ -47,6 +47,78 @@ def load_skill(name: str, category: str = "dimensions") -> str:
     return content
 
 
+def load_skills_for_dimensions(perf_json: str) -> str:
+    """Load dimension skill knowledge on-demand based on actual trace data.
+
+    Scans perf JSON for dimensions that have meaningful data (non-empty,
+    non-error) and loads the corresponding skill knowledge files.
+
+    Args:
+        perf_json: PerfSummary JSON string.
+
+    Returns:
+        Concatenated skill knowledge text for dimensions with data.
+    """
+    import json
+
+    try:
+        data = json.loads(perf_json)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+    # 1. Check dimension registry data
+    dimensions_data = data.get("dimensions", {})
+    skill_names: list[str] = []
+
+    if dimensions_data:
+        try:
+            from smartinspector.collector.dimensions import DimensionRegistry
+            DimensionRegistry.discover()
+            for dim in DimensionRegistry.all():
+                dim_data = dimensions_data.get(dim.name)
+                if not dim_data:
+                    continue
+                # Skip error/empty dimension data
+                if isinstance(dim_data, dict) and dim_data.get("error"):
+                    continue
+                if dim_data in ("", None, [], {}):
+                    continue
+                skill_names.append(dim.skill_name)
+        except Exception:
+            pass
+
+    # 2. Check non-dimension fields for additional skill context
+    # Frame timeline jank → ui-jank
+    ft = data.get("frame_timeline") or {}
+    if ft.get("jank_frames", 0) > 0 or ft.get("jank_detail"):
+        skill_names.append("ui-jank")
+
+    # Startup metrics → startup
+    startup = data.get("startup_metrics") or {}
+    if startup.get("startups") or startup.get("breakdowns"):
+        skill_names.append("startup")
+
+    if not skill_names:
+        return ""
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique_skills: list[str] = []
+    for s in skill_names:
+        if s not in seen:
+            seen.add(s)
+            unique_skills.append(s)
+
+    # Load and concatenate
+    parts: list[str] = []
+    for skill_name in unique_skills:
+        content = load_skill(skill_name, category="dimensions")
+        if content:
+            parts.append(f"\n\n# Knowledge: {skill_name}\n\n{content}")
+
+    return "".join(parts)
+
+
 def load_prompt_with_skills(name: str, *skill_names: str) -> str:
     """Load a prompt file and append dimension skill knowledge.
 
