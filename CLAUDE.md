@@ -20,6 +20,16 @@ src/smartinspector/          # Main Python package (installed via hatchling)
     session.py               #   /help, /clear, /summary, /tokens
   collector/                 # Perfetto trace collection & SQL analysis
     perfetto.py              #   PerfettoCollector — 25 collect_*() methods (incl. collect_io_slices, stdlib modules)
+    dimensions/              #   Dimension registry — extensible analysis dimensions
+      __init__.py            #     DimensionRegistry, @register_dimension decorator
+      base.py                #     AnalysisDimension ABC, HintContext
+      lock_contention.py     #     futex lock contention analysis
+      sched_latency.py       #     CPU scheduling latency analysis
+      gc_events.py           #     GC event impact analysis
+      file_io.py             #     File I/O blocking analysis
+      memory_trend.py        #     Memory RSS growth trend
+      binder_ipc.py          #     Binder IPC latency analysis
+      cpu_throttling.py      #     CPU thermal throttling detection
     startup.py               #   StartupAnalyzer — cold start phase splitting & bottleneck ID
   graph/                     # LangGraph orchestration
     nodes/                   #   Graph nodes (orchestrator, collector, attributor, reporter, ...)
@@ -38,7 +48,7 @@ src/smartinspector/          # Main Python package (installed via hatchling)
   config.py                  # Runtime configuration (env vars: SI_*)
   debug_log.py               # Debug logging utility → reports/debug_*.log
   perfetto_compat.py         # macOS IPv4 fix for perfetto trace_processor
-  prompts.py                 # Prompt loader (reads prompts/*.txt)
+  prompts.py                 # Prompt loader (reads prompts/*.txt + skills/*.md)
 prompts/                     # LLM prompt text files
   attributor.txt             #   Source attribution instructions
   report-generator.txt       #   Report generation instructions
@@ -46,6 +56,10 @@ prompts/                     # LLM prompt text files
   frame-analyzer.txt         #   Frame analysis instructions
   android-expert.txt         #   Android domain knowledge
   code-explorer.txt          #   Code exploration instructions
+  skills/                    #   Skill knowledge files for dimension-aware prompting
+    SKILL.md                 #     Skill index
+    shared/                  #     Shared knowledge (SI$ tags, search strategy)
+    dimensions/              #     Per-dimension domain knowledge (gc, lock, io, etc.)
 platform/android/            # Android test app (Kotlin/Java hook layer)
 perfetto-plugin/             # SI Bridge Perfetto UI plugin source (TypeScript)
 perfetto-build/              # Forked Perfetto repo with plugin built in
@@ -288,6 +302,7 @@ uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--dura
 | UI | `frame`, `rv`, `view`, `compose`, `inflate`, `startup` | 帧率/列表/绘制/重组/布局/启动 |
 | IO | `io`, `network`, `db`, `image` | io/网络/数据库/图片 |
 | 系统 | `thread_state`, `sys`, `input` | 线程状态/系统/触摸 |
+| 维度 | `lock_contention`, `sched_latency`, `gc_events`, `file_io`, `memory_trend`, `binder_ipc`, `cpu_throttling` | 锁竞争/调度延迟/GC/文件IO/内存趋势/Binder/降频 |
 | 总览 | `overview` | 性能总览 |
 
 **前置条件**：必须先通过 `/full`、`/trace`、`/analyze` 等命令完成分析。若无数据，提示用户先采集。
@@ -407,6 +422,61 @@ Each `collect_*()` method queries Perfetto SQL tables and returns structured dat
 | `collect_surfaceflinger_timeline()` | App↔SF frame timeline match (vsync mapping) | `android.surfaceflinger` |
 
 **Note on `collect_thread_state`**: Currently uses `sched` table overlap calculation. Planned upgrade to use `__intrinsic_thread_state` table for `blocked_function`, `waker_utid`, and `io_wait` data (see `docs/thread-state-blocking-analysis-design.md`).
+
+### Dimension Registry (Extensible Dimensions)
+
+The dimension registry provides a plugin-based architecture for adding new analysis dimensions. Each dimension is self-contained with collect, hint, format, and metric logic.
+
+**Architecture**:
+
+```
+AnalysisDimension (ABC)
+  ├── name: str               # Unique identifier
+  ├── description: str        # Chinese description
+  ├── perf_summary_key: str   # JSON key in PerfSummary
+  ├── metric_triggers: list   # Natural language trigger words
+  ├── skill_name: str         # Skill knowledge file reference
+  ├── collect(tp) -> dict     # SQL query execution
+  ├── compute_hint(data, ctx) # Deterministic hint computation
+  ├── format_section(data)    # Markdown formatting for LLM
+  └── metric_filter(data)     # Metric QA data filtering
+```
+
+**Registered Dimensions** (7 built-in):
+
+| Dimension | SQL Source | Hint Trigger | Metric Trigger Words |
+|-----------|-----------|--------------|---------------------|
+| `lock_contention` | `__intrinsic_thread_state` (futex) | main >5ms, other >10ms | 锁竞争/lock/futex |
+| `sched_latency` | `sched.runnable` stdlib module | avg > 50% frame budget | 调度延迟/runnable |
+| `gc_events` | `slice` (GC/GarbageCollector) | pause >10ms or >frame budget | gc/垃圾回收 |
+| `file_io` | `__intrinsic_thread_state` (io_wait) | main thread IO >5ms | 文件io/磁盘 |
+| `memory_trend` | `process_counter_track` (mem.rss) | RSS growth >20% | 内存趋势/内存泄漏 |
+| `binder_ipc` | `__intrinsic_thread_state` (binder) | main binder wait >10ms | binder/ipc/跨进程 |
+| `cpu_throttling` | `cpu_counter_track` + `counter` | avg freq < 50% max | 降频/throttling |
+
+**Adding a New Dimension**:
+
+1. Create `src/smartinspector/collector/dimensions/<name>.py`
+2. Subclass `AnalysisDimension`, decorate with `@register_dimension`
+3. Implement `collect()` (required), `compute_hint()`, `format_section()`, `metric_filter()` (optional)
+4. Auto-discovered by `DimensionRegistry.discover()` on next pipeline run
+5. Add skill knowledge to `prompts/skills/dimensions/<skill_name>.md`
+
+**Fallback**: All dimension collect methods are wrapped in try/except in `PerfettoCollector.summarize()`. Missing `__intrinsic_thread_state` or unsupported SQL tables gracefully degrade to empty data.
+
+### Skill Knowledge System
+
+`prompts.py` provides three functions for loading prompts and skill knowledge:
+
+| Function | Usage |
+|----------|-------|
+| `load_prompt(name)` | Load `prompts/{name}.txt` |
+| `load_skill(name, category)` | Load `prompts/skills/{category}/{name}.md` (cached) |
+| `load_prompt_with_skills(name, *skills)` | Load prompt + append skill knowledge |
+
+Skill reference format:
+- `"gc-analysis"` → `prompts/skills/dimensions/gc-analysis.md`
+- `"shared:si-tag-system"` → `prompts/skills/shared/si-tag-system.md`
 
 ### SI$ Custom Tag System
 
