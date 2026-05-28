@@ -11,10 +11,10 @@ from langchain_openai import ChatOpenAI
 
 from smartinspector.config import get_llm_kwargs
 from smartinspector.debug_log import info_log
-from smartinspector.prompts import load_prompt
+from smartinspector.prompts import load_prompt, load_skills_for_dimensions
 from smartinspector.token_tracker import get_tracker
 
-_prompt = load_prompt("frame-analyzer")
+_base_prompt = load_prompt("frame-analyzer")
 _llm = None
 _llm_lock = threading.Lock()
 
@@ -111,9 +111,16 @@ def analyze_frame(trace_path: str, ts_ns: int, dur_ns: int,
         on_progress("  [frame] 调用 LLM 分析...")
     debug_log("frame", "Step 3: Calling LLM for analysis...")
     debug_log("frame", f"Step 3 input (first 2000 chars):\n{user_content[:2000]}")
+
+    # Load dimension skills on-demand based on existing perf_summary
+    dim_skills = ""
+    if existing_summary:
+        dim_skills = load_skills_for_dimensions(existing_summary)
+    system_prompt = _base_prompt + dim_skills if dim_skills else _base_prompt
+
     llm = _get_llm()
     response = llm.invoke([
-        SystemMessage(content=_prompt),
+        SystemMessage(content=system_prompt),
         HumanMessage(content=user_content),
     ])
     get_tracker().record_from_message("frame_analyzer", response)
