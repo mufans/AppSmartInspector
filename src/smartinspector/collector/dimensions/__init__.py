@@ -10,6 +10,7 @@ class DimensionRegistry:
     """分析维度注册表。支持自动发现和按名获取。"""
 
     _dimensions: dict[str, AnalysisDimension] = {}
+    _discovered: bool = False
 
     @classmethod
     def register(cls, dim: AnalysisDimension) -> None:
@@ -25,18 +26,37 @@ class DimensionRegistry:
 
     @classmethod
     def discover(cls) -> None:
-        """自动发现 dimensions/ 包下的所有维度模块。"""
+        """自动发现 dimensions/ 包下的所有维度模块。
+
+        安全重复调用：已注册的维度不会被覆盖。
+        即使 importlib 缓存了模块（clear 后重新 discover），
+        也会通过扫描模块属性确保重新注册。
+        """
         from smartinspector.collector import dimensions as pkg
 
         for _, module_name, _ in pkgutil.iter_modules(pkg.__path__):
-            importlib.import_module(
+            mod = importlib.import_module(
                 f"smartinspector.collector.dimensions.{module_name}"
             )
+            # Scan for AnalysisDimension subclasses and register if not present.
+            # This handles the case where clear() was called and modules are
+            # already cached by importlib (decorator won't re-run).
+            for attr_name in dir(mod):
+                attr = getattr(mod, attr_name)
+                if (isinstance(attr, type)
+                        and issubclass(attr, AnalysisDimension)
+                        and attr is not AnalysisDimension):
+                    instance = attr()
+                    if instance.name not in cls._dimensions:
+                        cls._dimensions[instance.name] = instance
+
+        cls._discovered = True
 
     @classmethod
     def clear(cls) -> None:
         """清空注册表（仅用于测试）。"""
         cls._dimensions.clear()
+        cls._discovered = False
 
 
 def register_dimension(cls_or_dim):
