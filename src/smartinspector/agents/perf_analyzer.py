@@ -7,10 +7,10 @@ from langchain_openai import ChatOpenAI
 
 from smartinspector.config import get_llm_kwargs
 from smartinspector.debug_log import info_log
-from smartinspector.prompts import load_prompt
+from smartinspector.prompts import load_prompt, load_skills_for_dimensions
 from smartinspector.token_tracker import get_tracker
 
-_prompt = load_prompt("perf-analyzer")
+_base_prompt = load_prompt("perf-analyzer")
 _llm = None
 _llm_lock = threading.Lock()
 
@@ -48,6 +48,10 @@ def analyze_perf(perf_json: str) -> str:
     # Compress large list fields in perf_json to reduce token usage
     compressed_json = compress_perf_json(perf_json)
 
+    # Load dimension skills on-demand based on actual trace data
+    dim_skills = load_skills_for_dimensions(perf_json)
+    system_prompt = _base_prompt + dim_skills if dim_skills else _base_prompt
+
     llm = _get_llm()
     user_content = (
         "以下是预计算的分析结论，请据此组织最终报告：\n\n"
@@ -56,7 +60,7 @@ def analyze_perf(perf_json: str) -> str:
     )
     from langchain_core.messages import HumanMessage, SystemMessage
     response = llm.invoke([
-        SystemMessage(content=_prompt),
+        SystemMessage(content=system_prompt),
         HumanMessage(content=user_content),
     ])
     get_tracker().record_from_message("perf_analyzer", response)
@@ -84,7 +88,7 @@ def analyze_perf(perf_json: str) -> str:
                 "请在分析中明确覆盖以上遗漏项。"
             )
             retry_response = llm.invoke([
-                SystemMessage(content=_prompt),
+                SystemMessage(content=system_prompt),
                 HumanMessage(content=retry_content),
             ])
             get_tracker().record_from_message("perf_analyzer_retry", retry_response)
