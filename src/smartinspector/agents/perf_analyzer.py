@@ -26,6 +26,55 @@ def _get_llm():
     return _llm
 
 
+def _build_dimension_sections(perf_json: str) -> str:
+    """Build structured dimension sections using compute_hint + format_section.
+
+    Uses the dimension registry to produce pre-computed hints and formatted
+    markdown tables, which are far more actionable for the LLM than raw JSON.
+
+    Args:
+        perf_json: Compressed perf JSON string.
+
+    Returns:
+        Concatenated markdown sections for all dimensions with data.
+    """
+    try:
+        data = json.loads(perf_json)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+
+    dimensions_data = data.get("dimensions", {})
+    if not dimensions_data:
+        return ""
+
+    from smartinspector.collector.dimensions import DimensionRegistry, HintContext
+    from smartinspector.agents.deterministic import _detect_frame_budget_ms
+
+    DimensionRegistry.discover()
+    frame_budget_ms = _detect_frame_budget_ms(data)
+    context = HintContext(
+        frame_budget_ms=frame_budget_ms,
+        target_process=data.get("metadata", {}).get("target_process", {}).get("name", ""),
+    )
+
+    parts: list[str] = []
+    for dim in DimensionRegistry.all():
+        dim_data = dimensions_data.get(dim.name)
+        if not dim_data:
+            continue
+        sections: list[str] = []
+        hint = dim.compute_hint(dim_data, context)
+        if hint:
+            sections.append(hint)
+        section = dim.format_section(dim_data)
+        if section:
+            sections.append(section)
+        if sections:
+            parts.append("\n\n".join(sections))
+
+    return "\n\n".join(parts)
+
+
 def analyze_perf(perf_json: str) -> str:
     """Run a single-shot LLM analysis on a performance summary JSON.
 
@@ -53,11 +102,23 @@ def analyze_perf(perf_json: str) -> str:
     system_prompt = _base_prompt + dim_skills if dim_skills else _base_prompt
 
     llm = _get_llm()
+
+    # Build structured dimension sections using compute_hint + format_section.
+    # This gives the LLM pre-computed severity conclusions and formatted tables,
+    # which are far more actionable than raw JSON.
+    dim_sections = _build_dimension_sections(compressed_json)
+
     user_content = (
         "以下是预计算的分析结论，请据此组织最终报告：\n\n"
         f"{hints}\n\n"
-        f"原始数据参考:\n```json\n{compressed_json[:3000]}\n```"
     )
+
+    # Insert dimension sections BEFORE raw JSON so LLM sees structured data first
+    if dim_sections:
+        user_content += f"{dim_sections}\n\n"
+
+    user_content += f"原始数据参考:\n```json\n{compressed_json[:3000]}\n```"
+
     from langchain_core.messages import HumanMessage, SystemMessage
     response = llm.invoke([
         SystemMessage(content=system_prompt),
