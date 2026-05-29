@@ -16,7 +16,7 @@ from smartinspector.graph.nodes.reporter.persistence import save_report
 
 def reporter_node(state: AgentState) -> dict:
     """Generate the final performance report using LLM with streaming output."""
-    from smartinspector.prompts import load_prompt
+    from smartinspector.prompts import load_prompt, load_skills_for_dimensions
     from smartinspector.commands.orchestrate import _build_report_header
     from smartinspector.graph.state import RouteDecision
 
@@ -26,6 +26,12 @@ def reporter_node(state: AgentState) -> dict:
     perf_analysis = state.get("perf_analysis", "")
     attribution_result = state.get("attribution_result", "")
     route = state.get("_route", "")
+
+    # Inject dimension skills into system prompt for domain knowledge
+    if perf_json:
+        dim_skills = load_skills_for_dimensions(perf_json)
+        if dim_skills:
+            report_prompt += dim_skills
 
     is_startup = route in (RouteDecision.STARTUP, RouteDecision.STARTUP.value)
 
@@ -127,4 +133,3 @@ def reporter_node(state: AgentState) -> dict:
         "attribution_data": state.get("attribution_data", ""),
         "attribution_result": attribution_result,
     }
-
