@@ -133,6 +133,8 @@ startup.bottlenecks[]      # 瓶颈分析
 | 启动阶段有 GC | critical_path 含 GC 切片 | 启动阶段大量对象分配 |
 | pre-main 过长 | pre-main > 500ms | Multidex 或 ClassLoader 问题 |
 
+---
+
 ## 严重度标准
 
 - **P0**: 冷启动 > 5s

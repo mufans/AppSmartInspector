@@ -29,7 +29,7 @@ def reporter_node(state: AgentState) -> dict:
 
     # Inject dimension skills into system prompt for domain knowledge
     if perf_json:
-        dim_skills = load_skills_for_dimensions(perf_json)
+        dim_skills = load_skills_for_dimensions(perf_json, agent_role="reporter")
         if dim_skills:
             report_prompt += dim_skills
 

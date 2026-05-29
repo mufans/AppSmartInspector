@@ -168,6 +168,8 @@ GROUP BY rss.ts
 ORDER BY rss_mb DESC LIMIT 20;
 ```
 
+---
+
 ## 严重度标准
 
 - **P0**: RSS 增长 > 50%

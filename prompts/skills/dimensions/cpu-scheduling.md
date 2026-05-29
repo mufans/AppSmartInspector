@@ -170,6 +170,8 @@ WHERE sr.runnable_count > 10
 ORDER BY avg_runnable_ms DESC LIMIT 15;
 ```
 
+---
+
 ## 严重度标准
 
 - **P0**: 平均调度延迟 > 帧预算的 50% (>8.33ms@60Hz, >4.17ms@120Hz)

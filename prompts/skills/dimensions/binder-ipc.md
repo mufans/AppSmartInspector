@@ -111,6 +111,8 @@ binder_ipc.threads[]:
 | Binder 线程 max > 100ms | 服务端处理极慢 | 优化服务端实现 |
 | 多线程 binder 等待 | IPC 是全局瓶颈 | 重新设计跨进程通信 |
 
+---
+
 ## 严重度标准
 
 - **P0**: 主线程 max_wait_ms > 帧预算 (16.67ms@60Hz, 8.33ms@120Hz)

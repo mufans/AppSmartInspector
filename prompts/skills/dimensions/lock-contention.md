@@ -140,6 +140,8 @@ GROUP BY waiter_thread, active_thread
 ORDER BY coincidences DESC LIMIT 10;
 ```
 
+---
+
 ## 严重度标准
 
 - **P0**: 主线程 max_wait_ms > 帧预算 (16.67ms@60Hz, 8.33ms@120Hz)

@@ -172,6 +172,8 @@ GROUP BY io_layer
 ORDER BY total_ms DESC;
 ```
 
+---
+
 ## 严重度标准
 
 - **P0**: 主线程 IO 阻塞 > 帧预算 (16.67ms@60Hz, 8.33ms@120Hz)

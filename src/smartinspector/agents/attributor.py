@@ -132,7 +132,7 @@ def _build_system_prompt_with_dimensions(perf_json: str) -> str:
         System prompt string with relevant dimension knowledge appended.
     """
     _, base_prompt = _get_llm()
-    dim_skills = load_skills_for_dimensions(perf_json)
+    dim_skills = load_skills_for_dimensions(perf_json, agent_role="attributor")
     if dim_skills:
         return base_prompt + dim_skills
     return base_prompt

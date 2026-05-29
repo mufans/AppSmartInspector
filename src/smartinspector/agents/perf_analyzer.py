@@ -98,7 +98,7 @@ def analyze_perf(perf_json: str) -> str:
     compressed_json = compress_perf_json(perf_json)
 
     # Load dimension skills on-demand based on actual trace data
-    dim_skills = load_skills_for_dimensions(perf_json)
+    dim_skills = load_skills_for_dimensions(perf_json, agent_role="analyzer")
     system_prompt = _base_prompt + dim_skills if dim_skills else _base_prompt
 
     llm = _get_llm()

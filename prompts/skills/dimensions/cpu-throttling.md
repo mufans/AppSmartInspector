@@ -96,6 +96,8 @@ cpu_throttling.throttled_cores[]:
 | 频率剧烈波动 | min 很低，max 很高 | 热管理频繁介入和退出 |
 | 频率持续低位 | avg 接近 min | 持续高负载导致温度居高不下 |
 
+---
+
 ## 严重度标准
 
 - **P0**: 平均频率 < 最高频率的 30% (throttle_pct > 70%)

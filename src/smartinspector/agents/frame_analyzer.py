@@ -115,7 +115,7 @@ def analyze_frame(trace_path: str, ts_ns: int, dur_ns: int,
     # Load dimension skills on-demand based on existing perf_summary
     dim_skills = ""
     if existing_summary:
-        dim_skills = load_skills_for_dimensions(existing_summary)
+        dim_skills = load_skills_for_dimensions(existing_summary, agent_role="frame_analyzer")
     system_prompt = _base_prompt + dim_skills if dim_skills else _base_prompt
 
     llm = _get_llm()
