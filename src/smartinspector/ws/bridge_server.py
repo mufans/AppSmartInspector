@@ -381,9 +381,23 @@ def start_bridge(
                 await send_progress(step, detail)
 
         # Sync callback that bridges progress from thread pool to async WS
-        def on_progress(msg: str):
+        # Accepts both single-arg (msg) and two-arg (event, data) calls
+        # from run_attribution (group_start/group_done) and frame_analyzer.
+        def on_progress(event_or_msg, data=None):
             if not send_progress:
                 return
+            # Normalize to a single display string
+            if data is not None:
+                if event_or_msg == "group_start":
+                    msg = f"  [attributor] 搜索: {data}"
+                elif event_or_msg == "group_done":
+                    results = data if isinstance(data, list) else []
+                    found = sum(1 for r in results if r.get("attributable"))
+                    msg = f"  [attributor] group done: {found}/{len(results)} found"
+                else:
+                    msg = f"  {event_or_msg}: {data}"
+            else:
+                msg = event_or_msg
             future = asyncio.run_coroutine_threadsafe(
                 send_progress("progress", msg), loop,
             )

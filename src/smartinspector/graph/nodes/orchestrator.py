@@ -37,6 +37,13 @@ Categories (pick ONE):
   系统状态/cpu频率 → metric_qa:sys
   触摸/touch → metric_qa:input
   性能怎么样/overall/summary → metric_qa:overview
+  锁竞争/lock/futex → metric_qa:lock_contention
+  调度延迟/sched_latency/runnable → metric_qa:sched_latency
+  GC/垃圾回收 → metric_qa:gc_events
+  文件io/磁盘io/file_io → metric_qa:file_io
+  内存趋势/内存泄漏趋势 → metric_qa:memory_trend
+  binder/ipc/跨进程 → metric_qa:binder_ipc
+  降频/throttling/cpu频率 → metric_qa:cpu_throttling
 - end : general Q&A, advice, or vague analysis request WITHOUT existing data (keywords: 什么是/怎么优化/如何/为什么)
 
 CRITICAL:
@@ -80,6 +87,13 @@ def orchestrator_node(state: AgentState) -> dict:
     """Pure LLM classification to decide routing."""
     messages = state.get("messages", [])
 
+    # Check if route is already pre-set (e.g., /full command, headless mode)
+    existing_route = state.get("_route", "")
+    valid_routes = {rd.value for rd in RouteDecision}
+    if existing_route and existing_route in valid_routes and existing_route != RouteDecision.END.value:
+        info_log("orchestrator", f"Pre-set route={existing_route}, skipping LLM classification")
+        return {"messages": [], "_route": existing_route, **_pass_through(state)}
+
     # Extract last user message only
     user_msg = ""
     for m in reversed(messages):
@@ -95,11 +109,6 @@ def orchestrator_node(state: AgentState) -> dict:
                 break
 
     if not user_msg:
-        # Headless/CI mode: _route already set by HeadlessRunner, pass through directly
-        existing_route = state.get("_route", "")
-        if existing_route and existing_route != RouteDecision.END.value and existing_route != RouteDecision.END:
-            info_log("orchestrator", f"Headless mode: using pre-set route={existing_route}")
-            return {"messages": [], "_route": existing_route, **_pass_through(state)}
         return {"messages": [], "_route": RouteDecision.END, **_pass_through(state)}
 
     orch_input = [

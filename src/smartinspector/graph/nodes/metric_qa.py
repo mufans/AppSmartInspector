@@ -50,6 +50,14 @@ METRIC_NAMES: dict[str, str] = {
     "sys": "系统状态",
     "input": "输入事件",
     "overview": "性能总览",
+    # Dimension registry metrics
+    "lock_contention": "锁竞争分析",
+    "sched_latency": "调度延迟分析",
+    "gc_events": "GC 事件分析",
+    "file_io": "文件 IO 阻塞分析",
+    "memory_trend": "内存增长趋势",
+    "binder_ipc": "Binder IPC 分析",
+    "cpu_throttling": "CPU 降频检测",
 }
 
 # Metric ID → perf_summary top-level JSON keys
@@ -74,6 +82,14 @@ METRIC_DATA_MAP: dict[str, list[str]] = {
     "sys": ["sys_stats"],
     "input": ["input_events"],
     "overview": [],
+    # Dimension registry metrics (data lives in dimensions sub-dict)
+    "lock_contention": ["dimensions"],
+    "sched_latency": ["dimensions"],
+    "gc_events": ["dimensions"],
+    "file_io": ["dimensions"],
+    "memory_trend": ["dimensions"],
+    "binder_ipc": ["dimensions"],
+    "cpu_throttling": ["dimensions"],
 }
 
 
@@ -144,7 +160,8 @@ def extract_metric_data(perf_json_str: str, metric_id: str) -> str:
         overview = {}
         for key in ("cpu_usage", "cpu_hotspots", "scheduling", "block_events",
                      "process_memory", "memory", "frame_timeline", "view_slices",
-                     "io_slices", "thread_state", "sys_stats", "input_events"):
+                     "io_slices", "thread_state", "sys_stats", "input_events",
+                     "dimensions"):
             if key in perf:
                 val = perf[key]
                 if isinstance(val, dict):
@@ -157,6 +174,23 @@ def extract_metric_data(perf_json_str: str, metric_id: str) -> str:
     # startup: not in perf_summary normally — extract from perf_analysis if available
     if metric_id == "startup":
         return "startup 数据不在 perf_summary 中，请参考已有的启动分析结果。"
+
+    # Dimension registry metrics: extract from dimensions sub-dict
+    if keys == ["dimensions"]:
+        dims = perf.get("dimensions", {})
+        dim_data = dims.get(metric_id)
+        if not dim_data:
+            return ""
+        # Apply dimension metric_filter if available
+        try:
+            from smartinspector.collector.dimensions import DimensionRegistry
+            DimensionRegistry.discover()
+            dim = DimensionRegistry.get(metric_id)
+            if dim:
+                dim_data = dim.metric_filter(dim_data)
+        except Exception:
+            pass
+        return json.dumps({metric_id: dim_data}, ensure_ascii=False, indent=2)
 
     keys = METRIC_DATA_MAP.get(metric_id, [])
     if not keys:

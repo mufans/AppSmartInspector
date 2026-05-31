@@ -19,7 +19,18 @@ src/smartinspector/          # Main Python package (installed via hatchling)
     device.py                #   /devices, /connect, /status, /disconnect
     session.py               #   /help, /clear, /summary, /tokens
   collector/                 # Perfetto trace collection & SQL analysis
-    perfetto.py              #   PerfettoCollector — 25 collect_*() methods (incl. collect_io_slices, stdlib modules)
+    perfetto.py              #   PerfettoCollector — 28 collect_*() methods (incl. collect_io_slices, stdlib modules)
+    memory.py                #   Heap graph analysis — lifecycle-aware leak detection, reference chains
+    dimensions/              #   Dimension registry — extensible analysis dimensions
+      __init__.py            #     DimensionRegistry, @register_dimension decorator
+      base.py                #     AnalysisDimension ABC, HintContext
+      lock_contention.py     #     futex lock contention analysis
+      sched_latency.py       #     CPU scheduling latency analysis
+      gc_events.py           #     GC event impact analysis
+      file_io.py             #     File I/O blocking analysis
+      memory_trend.py        #     Memory RSS growth trend
+      binder_ipc.py          #     Binder IPC latency analysis
+      cpu_throttling.py      #     CPU thermal throttling detection
     startup.py               #   StartupAnalyzer — cold start phase splitting & bottleneck ID
   graph/                     # LangGraph orchestration
     nodes/                   #   Graph nodes (orchestrator, collector, attributor, reporter, ...)
@@ -38,7 +49,7 @@ src/smartinspector/          # Main Python package (installed via hatchling)
   config.py                  # Runtime configuration (env vars: SI_*)
   debug_log.py               # Debug logging utility → reports/debug_*.log
   perfetto_compat.py         # macOS IPv4 fix for perfetto trace_processor
-  prompts.py                 # Prompt loader (reads prompts/*.txt)
+  prompts.py                 # Prompt loader (reads prompts/*.txt + skills/*.md)
 prompts/                     # LLM prompt text files
   attributor.txt             #   Source attribution instructions
   report-generator.txt       #   Report generation instructions
@@ -46,6 +57,10 @@ prompts/                     # LLM prompt text files
   frame-analyzer.txt         #   Frame analysis instructions
   android-expert.txt         #   Android domain knowledge
   code-explorer.txt          #   Code exploration instructions
+  skills/                    #   Skill knowledge files for dimension-aware prompting
+    SKILL.md                 #     Skill index
+    shared/                  #     Shared knowledge (SI$ tags, search strategy)
+    dimensions/              #     Per-dimension domain knowledge (gc, lock, io, etc.)
 platform/android/            # Android test app (Kotlin/Java hook layer)
 perfetto-plugin/             # SI Bridge Perfetto UI plugin source (TypeScript)
 perfetto-build/              # Forked Perfetto repo with plugin built in
@@ -161,10 +176,10 @@ def my_node(state: AgentState) -> dict:
 
 Agents are separate from graph nodes. They contain the business logic:
 
-- `agents/attributor.py` — Source code attribution (fast-path + LLM fallback)
-- `agents/deterministic.py` — Pure computation hints (no LLM): severity, call chain distribution, RV hotspot ranking, jank frame correlation, CPU hotspot identification, thread state analysis
-- `agents/frame_analyzer.py` — Frame-level analysis
-- `agents/perf_analyzer.py` — Performance analysis
+- `agents/attributor.py` — Source code attribution (fast-path + LLM fallback, per-group progress callback)
+- `agents/deterministic.py` — Pure computation hints (no LLM): severity, call chain distribution, RV hotspot ranking, jank frame correlation, CPU hotspot identification, thread state analysis, memory leak reference chains
+- `agents/frame_analyzer.py` — Frame-level analysis (reuses full analysis chain: compute_hints + format_perf_sections for dimension data)
+- `agents/perf_analyzer.py` — Performance analysis (streaming LLM output with retry fallback)
 - `agents/explorer.py` — Code exploration
 
 ### AgentState Fields
@@ -183,6 +198,8 @@ Agents are separate from graph nodes. They contain the business logic:
 | `_trace_path` | `str` | Internal: trace file path (pre-loaded trace skips device collection) |
 
 ### RouteDecision
+
+When `_route` is pre-set in state (e.g., `/full` command, headless mode), the orchestrator skips LLM classification and passes through directly.
 
 ```
 full_analysis  → collector → analyzer → attributor → reporter
@@ -247,6 +264,8 @@ uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--dura
 - `--debug`: Enable debug logging to `reports/debug_*.log`
 - `<trace.pb>`: Analyze existing trace file, skip device collection (Mode 1)
 - Without `.pb`: Pull new trace from device (Mode 2)
+- After SQL analysis, shows **instant preview** (FPS, blocking, dimension severity, P0 slices) before LLM begins
+- Auto-detects foreground app via ADB when `--target` not specified
 
 ### Other Commands
 
@@ -255,7 +274,7 @@ uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--dura
 | `/trace <package>` | Record and load a trace |
 | `/record [duration]` | Start perfetto recording on device |
 | `/analyze` | Analyze loaded trace |
-| `/frame ts=X dur=Y` | Frame-level analysis |
+| `/frame ts=X dur=Y` | Frame-level analysis (includes dimension data + non-SI$ system slice analysis) |
 | `/open` | Start Perfetto UI bridge server + browser |
 | `/close` | Stop bridge server |
 | `/report` | Re-generate report from existing analysis |
@@ -288,6 +307,7 @@ uv run smartinspector --ci [--trace trace.pb] [--target com.example.app] [--dura
 | UI | `frame`, `rv`, `view`, `compose`, `inflate`, `startup` | 帧率/列表/绘制/重组/布局/启动 |
 | IO | `io`, `network`, `db`, `image` | io/网络/数据库/图片 |
 | 系统 | `thread_state`, `sys`, `input` | 线程状态/系统/触摸 |
+| 维度 | `lock_contention`, `sched_latency`, `gc_events`, `file_io`, `memory_trend`, `binder_ipc`, `cpu_throttling` | 锁竞争/调度延迟/GC/文件IO/内存趋势/Binder/降频 |
 | 总览 | `overview` | 性能总览 |
 
 **前置条件**：必须先通过 `/full`、`/trace`、`/analyze` 等命令完成分析。若无数据，提示用户先采集。
@@ -386,11 +406,10 @@ Each `collect_*()` method queries Perfetto SQL tables and returns structured dat
 | `collect_cpu_usage()` | CPU usage per-core over time | `counter`, `cpu` |
 | `collect_sys_stats()` | System stats (memory, CPU freq) | `counter` |
 | `collect_process_memory()` | Per-process memory (RSS, anon) | `process_memory_snapshot` |
-| `collect_memory()` | Aggregated memory summary | `process_memory_snapshot` |
+| `collect_memory()` | Aggregated memory summary + lifecycle-aware heap leak detection + reference chains | `heap_graph_object`, `heap_graph_reference`, `process_memory_snapshot` |
 | `collect_threads()` | Thread list for target process | `thread`, `process` |
 | `collect_view_slices()` | View system slices (doFrame, measure, layout, draw, RV) with parent chains | `slice`, `args` |
 | `collect_io_slices()` | IO-related slices (net/db/img) from all threads | `slice` |
-| `collect_io_slices()` | IO-related slices (net/db/img) | `slice` |
 | `collect_input_events()` | Touch/input event data | `slice` |
 | `collect_block_events()` | SI$block slices merged with logcat SIBlock stack traces | `slice`, `android_logs` |
 | `collect_lock_contention()` | Monitor lock contention (blocked/blocking method, waiter count) | `android.monitor_contention` |
@@ -407,6 +426,77 @@ Each `collect_*()` method queries Perfetto SQL tables and returns structured dat
 | `collect_surfaceflinger_timeline()` | App↔SF frame timeline match (vsync mapping) | `android.surfaceflinger` |
 
 **Note on `collect_thread_state`**: Currently uses `sched` table overlap calculation. Planned upgrade to use `__intrinsic_thread_state` table for `blocked_function`, `waker_utid`, and `io_wait` data (see `docs/thread-state-blocking-analysis-design.md`).
+
+### Memory Analysis (`collector/memory.py`)
+
+`collect_heap_graph_analysis()` provides lifecycle-aware heap memory analysis:
+
+1. **Lifecycle state extraction** (`_extract_lifecycle_state`): Scans `SI$Activity.*` / `SI$Fragment.*` slices to determine which components are alive (onCreate/onStart/onResume without subsequent onDestroy) at trace end time
+2. **Heap object statistics**: Top 20 classes by total size from `heap_graph_object`
+3. **Leak suspects**: Activity/Fragment instances still in heap, filtered by lifecycle state — alive components are excluded from leak suspects
+4. **Alive components**: Components with active lifecycle — shown separately as "expected in heap"
+5. **Leak reference chains**: `heap_graph_reference` → who holds the leaked objects (owner → field → owned)
+
+Output fields in `perf_summary.memory`:
+- `heap_objects` / `heap_graph_classes`: Top classes by size
+- `alive_components`: Active-lifecycle components (expected in heap)
+- `leak_suspects`: Destroyed/still-in-heap components with state label
+- `leak_reference_chains`: Owner → field → owned reference paths
+
+### Dimension Registry (Extensible Dimensions)
+
+The dimension registry provides a plugin-based architecture for adding new analysis dimensions. Each dimension is self-contained with collect, hint, format, and metric logic.
+
+**Architecture**:
+
+```
+AnalysisDimension (ABC)
+  ├── name: str               # Unique identifier
+  ├── description: str        # Chinese description
+  ├── perf_summary_key: str   # JSON key in PerfSummary
+  ├── metric_triggers: list   # Natural language trigger words
+  ├── skill_name: str         # Skill knowledge file reference
+  ├── collect(tp) -> dict     # SQL query execution
+  ├── compute_hint(data, ctx) # Deterministic hint computation
+  ├── format_section(data)    # Markdown formatting for LLM
+  └── metric_filter(data)     # Metric QA data filtering
+```
+
+**Registered Dimensions** (7 built-in):
+
+| Dimension | SQL Source | Hint Trigger | Metric Trigger Words |
+|-----------|-----------|--------------|---------------------|
+| `lock_contention` | `__intrinsic_thread_state` (futex) | main >5ms, other >10ms | 锁竞争/lock/futex |
+| `sched_latency` | `sched.runnable` stdlib module | avg > 50% frame budget | 调度延迟/runnable |
+| `gc_events` | `slice` (GC/GarbageCollector) | pause >10ms or >frame budget | gc/垃圾回收 |
+| `file_io` | `__intrinsic_thread_state` (io_wait) | main thread IO >5ms | 文件io/磁盘 |
+| `memory_trend` | `process_counter_track` (mem.rss) | RSS growth >20% | 内存趋势/内存泄漏 |
+| `binder_ipc` | `__intrinsic_thread_state` (binder) | main binder wait >10ms | binder/ipc/跨进程 |
+| `cpu_throttling` | `cpu_counter_track` + `counter` | avg freq < 50% max | 降频/throttling |
+
+**Adding a New Dimension**:
+
+1. Create `src/smartinspector/collector/dimensions/<name>.py`
+2. Subclass `AnalysisDimension`, decorate with `@register_dimension`
+3. Implement `collect()` (required), `compute_hint()`, `format_section()`, `metric_filter()` (optional)
+4. Auto-discovered by `DimensionRegistry.discover()` on next pipeline run
+5. Add skill knowledge to `prompts/skills/dimensions/<skill_name>.md`
+
+**Fallback**: All dimension collect methods are wrapped in try/except in `PerfettoCollector.summarize()`. Missing `__intrinsic_thread_state` or unsupported SQL tables gracefully degrade to empty data.
+
+### Skill Knowledge System
+
+`prompts.py` provides three functions for loading prompts and skill knowledge:
+
+| Function | Usage |
+|----------|-------|
+| `load_prompt(name)` | Load `prompts/{name}.txt` |
+| `load_skill(name, category)` | Load `prompts/skills/{category}/{name}.md` (cached) |
+| `load_prompt_with_skills(name, *skills)` | Load prompt + append skill knowledge |
+
+Skill reference format:
+- `"gc-analysis"` → `prompts/skills/dimensions/gc-analysis.md`
+- `"shared:si-tag-system"` → `prompts/skills/shared/si-tag-system.md`
 
 ### SI$ Custom Tag System
 
@@ -426,16 +516,48 @@ Android hook layer emits custom Perfetto slices with `SI$` prefix:
 | `SI$img#...` | Image operations (collected to io_slices, IO slice attribution) | |
 | `SI$touch#...` | Touch events (excluded from thread state analysis) | |
 
+## Frame Analysis Pipeline
+
+### Data Flow
+
+```
+query_frame_slices(trace_path, ts_ns, dur_ns)     # SQL query for selected time range
+  → _build_frame_hints(frame_data, existing_summary)  # Frame-specific deterministic hints
+  → compute_hints(existing_summary)                     # Reuse full deterministic analysis
+  → format_perf_sections(existing_summary)              # Reuse dimension/thread state/frame timeline sections
+  → _run_source_attribution(frame_data)                 # SI$ slice source code attribution
+  → LLM (frame-analyzer prompt + dimension skills)      # Generate frame analysis
+```
+
+### Frame Analysis Features
+
+1. **SI$ slice analysis**: Severity classification (P0/P1/P2), call chain breakdown, jank frame correlation
+2. **Non-SI$ system slice analysis**: When no SI$ slices found, system slices are classified by category (GC, Binder, layout, draw, etc.) with severity warnings
+3. **Dimension data**: Reuses full pipeline's `compute_hints()` and `format_perf_sections()` for dimension context (lock contention, GC events, sched latency, etc.)
+4. **Source attribution**: Reuses `run_attribution()` with cache support from prior `/full` run
+5. **Progress callback**: Attributor reports per-group progress via `group_start`/`group_done` events
+
+### Attributor Progress Callback
+
+`run_attribution()` supports structured progress via two-arg `on_progress(event, data)`:
+- `("group_start", group_label)` — beginning a new search group
+- `("group_done", results_list)` — group completed with per-slice results (attributable/reason)
+
+Legacy single-arg calls (`on_progress(msg)`) still supported for backward compatibility.
+
 ## Reporter Pipeline
 
 ### Data Flow
 
 ```
 perf_summary (JSON)
-  → formatter.format_perf_sections()      # Build LLM prompt sections
-  → deterministic.compute_hints()          # Pre-computed conclusions (no LLM)
-  → LLM (report-generator prompt)         # Generate markdown report
-  → persistence.save_report()             # Write to reports/perf_report_*.md
+  → Phase 1: Data assembly (CPU-intensive)
+    → formatter.format_perf_sections()      # Build LLM prompt sections
+    → deterministic.compute_hints()          # Pre-computed conclusions (no LLM)
+    → Token estimation + truncation
+  → Phase 2: LLM generation (streamed)
+    → LLM (report-generator prompt)         # Generate markdown report
+  → persistence.save_report()               # Write to reports/perf_report_*.md
 ```
 
 ### Report Sections (Priority Order)
@@ -458,7 +580,7 @@ Sections are ordered by priority to survive truncation at `SI_REPORT_MAX_TOKENS`
 
 ### Deterministic Pre-computation
 
-`agents/deterministic.py` provides 8 analysis modules (all pure Python, no LLM):
+`agents/deterministic.py` provides 18 analysis modules (all pure Python, no LLM):
 
 1. `_classify_severity()` — P0/P1/P2 severity based on device frame budget
 2. `_compute_call_chain_distribution()` — Call chain time distribution with percentages
@@ -466,8 +588,20 @@ Sections are ordered by priority to survive truncation at `SI_REPORT_MAX_TOKENS`
 4. `_correlate_jank_frames()` — Frame ↔ Slice ↔ InputEvent three-way correlation
 5. `_identify_cpu_hotspots()` — CPU function sampling hotspot identification
 6. `_analyze_thread_state()` — Running vs Sleeping/DiskSleep classification per slice
-7. `summarize_sql_result()` — Compress raw SQL query results into statistical summary + outlier samples
-8. `compress_perf_json()` — Compress large list fields in perf JSON to reduce LLM token usage
+7. `_analyze_io_slices()` — IO slice aggregation by type (network/database/image)
+8. `_analyze_compose_slices()` — Jetpack Compose recomposition analysis
+9. `_analyze_memory()` — Memory allocation + lifecycle-aware leak detection + reference chains
+10. `_analyze_lock_contention()` — Lock contention with main-thread flagging
+11. `_analyze_binder_txns()` — Binder transaction latency ranking
+12. `_analyze_startup_metrics()` — Startup TTID/TTFD and bottleneck breakdown
+13. `_analyze_gc_events()` — GC events type/duration/reclaimed analysis
+14. `_analyze_anrs()` — ANR events with main-thread slice details
+15. `_analyze_input_latency()` — Input latency breakdown (dispatch/handling/ack)
+16. `_analyze_sched_latency()` — Scheduling latency (runnable→running delay)
+17. `_analyze_oom_rss_swap()` — OOM score transitions, RSS/Swap trends, LMK events
+18. `_compute_dimension_hints()` — Dimension registry hints (all registered dimensions)
+19. `summarize_sql_result()` — Compress raw SQL query results into statistical summary + outlier samples
+20. `compress_perf_json()` — Compress large list fields in perf JSON to reduce LLM token usage
 
 ### SQL Summarizer
 
@@ -519,6 +653,23 @@ The Android app injects trace hooks that emit `SI$` prefixed slices into Perfett
 - `TraceHook` — Base hook class, uses `android.os.Trace.beginSection()` / `endSection()`
 - `BlockMonitor` — Detects main thread blocks, posts stack traces to logcat as `SIBlock` messages
 - Hooks configured via `/config` command at runtime
+
+### Test Scenarios (UI Activities)
+
+Built-in performance scenarios for testing each analysis dimension:
+
+| Activity | Dimension | Trigger |
+|----------|-----------|---------|
+| `CpuBurnActivity` | CPU hotspot | CPU-intensive computation on main thread |
+| `HeavyDrawActivity` | View/draw | Custom View with expensive onDraw |
+| `LockContentionActivity` | lock_contention | futex lock contention between threads |
+| `GcStressActivity` | gc_events | Frequent GC via object allocation pressure |
+| `InputLatencyActivity` | input latency | Touch event dispatch delay |
+| `MemoryPressureActivity` | memory_trend | RSS growth via large allocations |
+| `SchedLatencyActivity` | sched_latency | CPU-intensive threads competing for cores |
+| `CpuThrottlingActivity` | cpu_throttling | Sustained high CPU load causing thermal throttling |
+| `FileIOActivity` | file_io | Main-thread disk I/O blocking |
+| `MemoryLeakActivity` | memory leak | Static ref, anonymous Runnable, unregistered receiver, singleton callback |
 
 ## Git Conventions
 

@@ -8,10 +8,11 @@ def format_perf_sections(perf_json: str) -> list[str]:
 
     Section ordering follows CLAUDE.md priority to survive truncation:
       1. 预计算结论 (deterministic hints)
-      2. 线程状态分析 (thread state)
-      3. 帧时间线 (frame timeline)
-      4. 自定义切片统计 (view slices summary)
-      5. IO操作分析 / Compose重组分析
+      2. 维度分析数据 (dimension registry — must be early to survive truncation)
+      3. 线程状态分析 (thread state)
+      4. 帧时间线 (frame timeline)
+      5. 自定义切片统计 (view slices summary)
+      6. IO操作分析 / Compose重组分析
     """
     user_parts: list[str] = []
 
@@ -28,8 +29,40 @@ def format_perf_sections(perf_json: str) -> list[str]:
     except Exception:
         perf_data = {}
 
+    # Dimension registry sections — high priority, right after deterministic hints
+    # Must appear early to survive truncation and ensure LLM analyzes dimensions.
+    # Each dimension section includes BOTH the compute_hint (severity classification)
+    # AND format_section (raw data table) so the reporter LLM sees severity markers
+    # directly alongside the supporting data.
+    dimensions_data = perf_data.get("dimensions", {})
+    if dimensions_data:
+        try:
+            from smartinspector.collector.dimensions import DimensionRegistry, HintContext
+            from smartinspector.agents.deterministic import _detect_frame_budget_ms
+            DimensionRegistry.discover()
+            frame_budget_ms = _detect_frame_budget_ms(perf_data)
+            context = HintContext(
+                frame_budget_ms=frame_budget_ms,
+                target_process=perf_data.get("metadata", {}).get("target_process", {}).get("name", ""),
+            )
+            for dim in DimensionRegistry.all():
+                dim_data = dimensions_data.get(dim.name)
+                if not dim_data:
+                    continue
+                parts = []
+                hint = dim.compute_hint(dim_data, context)
+                if hint:
+                    parts.append(hint)
+                section = dim.format_section(dim_data)
+                if section:
+                    parts.append(section)
+                if parts:
+                    user_parts.append("\n\n".join(parts))
+        except Exception:
+            pass
+
     # Thread state analysis — Running vs Sleeping vs DiskSleep with blocking details
-    # Priority 2: must appear before frame timeline to survive truncation
+    # Priority 3: must appear before frame timeline to survive truncation
     thread_states = perf_data.get("thread_state", [])
     if thread_states:
         ts_lines = ["## 线程状态分析\n"]
@@ -74,7 +107,7 @@ def format_perf_sections(perf_json: str) -> list[str]:
         user_parts.append("\n".join(ts_lines))
 
     # Frame timeline detail
-    # Priority 3
+    # Priority 4
     ft = perf_data.get("frame_timeline", {})
     _total_frames = ft.get("total_frames", 0) if ft else 0
     _avg_fps = ft.get("fps", 0) if ft else 0
@@ -96,7 +129,7 @@ def format_perf_sections(perf_json: str) -> list[str]:
         user_parts.append("\n".join(ft_lines))
 
     # View slices summary (top 10 only, compact)
-    # Priority 4
+    # Priority 5
     vs = perf_data.get("view_slices", {})
     if vs:
         vs_summary = vs.get("summary", [])

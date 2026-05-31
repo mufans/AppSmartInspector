@@ -286,6 +286,11 @@ def compute_hints(perf_json: str) -> str:
         _analyze_oom_rss_swap(data),
     ]
 
+    # Dimension registry hints
+    dim_hints = _compute_dimension_hints(data, frame_budget_ms)
+    if dim_hints:
+        sections.append(dim_hints)
+
     return "\n\n".join(s for s in sections if s)
 
 
@@ -775,8 +780,8 @@ def _analyze_compose_slices(data: dict) -> str:
 def _analyze_memory(data: dict) -> str:
     """Analyze heap memory allocation and detect potential leaks.
 
-    Reports top heap objects by size, leak suspects (destroyed Activities/Fragments
-    still in heap), and memory growth anomalies.
+    Reports top heap objects by size, leak suspects (filtered by lifecycle
+    state to exclude alive components), and memory growth anomalies.
     """
     memory = data.get("memory")
     if not memory:
@@ -796,16 +801,41 @@ def _analyze_memory(data: dict) -> str:
             short = name.rsplit(".", 1)[-1] if "." in name else name
             lines.append(f"    {short}: {count}个, {size_kb:.1f}KB")
 
-    # Leak suspects
+    # Alive components (Activity/Fragment with active lifecycle — expected in heap)
+    alive_components = memory.get("alive_components") or []
+    if alive_components:
+        lines.append("  存活组件 (lifecycle活跃, heap中存在属正常):")
+        for comp in alive_components[:10]:
+            name = comp.get("class_name", "?")
+            count = comp.get("obj_count", 0)
+            short = name.rsplit(".", 1)[-1] if "." in name else name
+            lines.append(f"    {short}: {count}个实例 [正常]")
+
+    # Leak suspects (destroyed but still in heap, or multiple instances)
     leak_suspects = memory.get("leak_suspects") or []
     if leak_suspects:
-        lines.append("  潜在泄漏:")
+        lines.append("  疑似泄漏:")
         for suspect in leak_suspects[:5]:
             name = suspect.get("class_name", "?")
             count = suspect.get("obj_count", 0)
             size_kb = suspect.get("total_size_kb", 0)
+            state = suspect.get("state", "unknown")
             short = name.rsplit(".", 1)[-1] if "." in name else name
-            lines.append(f"    ⚠ {short}: {count}个实例, {size_kb:.1f}KB")
+            lines.append(f"    ⚠ {short}: {count}个实例, {size_kb:.1f}KB [{state}]")
+
+    # Leak reference chains — who holds the leaked objects
+    leak_refs = memory.get("leak_reference_chains") or []
+    if leak_refs:
+        lines.append("  泄漏引用链 (谁持有了泄漏对象):")
+        for ref in leak_refs[:10]:
+            owner = ref.get("owner", "?")
+            owned = ref.get("owned", "?")
+            field = ref.get("field", "?")
+            deobfuscated = ref.get("deobfuscated", "")
+            field_display = deobfuscated if deobfuscated and deobfuscated != field else field
+            owner_short = owner.rsplit(".", 1)[-1] if "." in owner else owner
+            owned_short = owned.rsplit(".", 1)[-1] if "." in owned else owned
+            lines.append(f"    {owner_short} --[{field_display}]--> {owned_short}")
 
     # Process memory trend
     proc_mem = data.get("process_memory") or {}
@@ -1145,3 +1175,36 @@ def _analyze_oom_rss_swap(data: dict) -> str:
             lines.append(f"    {proc}: {reason}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Helper 18: Dimension registry hints (extensible dimensions)
+# ---------------------------------------------------------------------------
+
+def _compute_dimension_hints(data: dict, frame_budget_ms: float) -> str:
+    """Compute hints from all registered dimension modules."""
+    try:
+        from smartinspector.collector.dimensions import DimensionRegistry, HintContext
+        DimensionRegistry.discover()
+    except Exception:
+        return ""
+
+    dimensions_data = data.get("dimensions", {})
+    if not dimensions_data:
+        return ""
+
+    context = HintContext(
+        frame_budget_ms=frame_budget_ms,
+        target_process=data.get("metadata", {}).get("target_process", {}).get("name", ""),
+    )
+
+    hints = []
+    for dim in DimensionRegistry.all():
+        dim_data = dimensions_data.get(dim.name)
+        if not dim_data:
+            continue
+        hint = dim.compute_hint(dim_data, context)
+        if hint:
+            hints.append(hint)
+
+    return "\n\n".join(hints) if hints else ""

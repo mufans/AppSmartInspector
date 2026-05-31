@@ -169,6 +169,13 @@ def cmd_full(args: str, state: dict) -> dict:
         from smartinspector.debug_log import debug_log
         debug_log("full", "Debug logging enabled via /full --debug")
 
+    # Parse optional package_name and duration_ms from remaining tokens
+    for t in tokens:
+        if t.isdigit():
+            state["trace_duration_ms"] = int(t)
+        elif "." in t and not t.startswith("-"):
+            state["trace_target_process"] = t
+
     if skip_wait:
         state["skip_wait"] = True
 
@@ -180,6 +187,10 @@ def cmd_full(args: str, state: dict) -> dict:
     state["messages"] = state.get("messages", []) + [
         {"role": "user", "content": "请进行全面性能分析"},
     ]
+
+    # Pre-set route to skip LLM classification — /full is an explicit command,
+    # not a natural language query that needs routing ambiguity resolution.
+    state["_route"] = "full_analysis"
 
     return _stream_run(graph, state)
 

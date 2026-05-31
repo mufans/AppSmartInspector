@@ -74,5 +74,11 @@
             android:name=".ui.SchedLatencyActivity"
             android:exported="false"
             android:label="Sched Latency" />
+
+        <!-- P1: Memory leak — heap_graph_object leak_suspects + lifecycle -->
+        <activity
+            android:name=".ui.MemoryLeakActivity"
+            android:exported="false"
+            android:label="Memory Leak" />
     </application>
 </manifest>

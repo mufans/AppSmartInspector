@@ -138,6 +138,17 @@ public class SIClient extends WebSocketListener {
     public void onOpen(WebSocket webSocket, Response response) {
         connected = true;
         Log.i(TAG, "WS connected to " + serverUrl);
+        // Auto-fill target_process with own package name if empty
+        try {
+            HookConfig config = HookConfig.fromJson(HookConfigManager.getConfig());
+            if (config.targetProcess == null || config.targetProcess.isEmpty()) {
+                config.targetProcess = context.getPackageName();
+                HookConfigManager.updateFromJson(config.toJson(), false);
+                Log.i(TAG, "Auto-filled target_process: " + config.targetProcess);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to auto-fill target_process: " + e.getMessage());
+        }
         // Send current config to server on connect
         sendConfig(HookConfigManager.getConfig());
         notifyConnected();

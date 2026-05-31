@@ -26,6 +26,7 @@ import com.smartinspector.hook.ui.DetailFragment;
 import com.smartinspector.hook.ui.GcStressActivity;
 import com.smartinspector.hook.ui.InputLatencyActivity;
 import com.smartinspector.hook.ui.LockContentionActivity;
+import com.smartinspector.hook.ui.MemoryLeakActivity;
 import com.smartinspector.hook.ui.MemoryPressureActivity;
 import com.smartinspector.hook.ui.SchedLatencyActivity;
 import com.smartinspector.hook.worker.CpuBurnWorker;
@@ -133,6 +134,9 @@ public class MainActivity extends FragmentActivity {
         addScenarioCard(section, "P1", "Sched Latency",
                 "CPU-intensive threads competing for cores",
                 "#FF9800", SchedLatencyActivity.class);
+        addScenarioCard(section, "P1", "Memory Leak",
+                "Static ref, anonymous Runnable, unregistered receiver, singleton callback",
+                "#FF9800", MemoryLeakActivity.class);
 
         return section;
     }
