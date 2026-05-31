@@ -87,6 +87,13 @@ def orchestrator_node(state: AgentState) -> dict:
     """Pure LLM classification to decide routing."""
     messages = state.get("messages", [])
 
+    # Check if route is already pre-set (e.g., /full command, headless mode)
+    existing_route = state.get("_route", "")
+    valid_routes = {rd.value for rd in RouteDecision}
+    if existing_route and existing_route in valid_routes and existing_route != RouteDecision.END.value:
+        info_log("orchestrator", f"Pre-set route={existing_route}, skipping LLM classification")
+        return {"messages": [], "_route": existing_route, **_pass_through(state)}
+
     # Extract last user message only
     user_msg = ""
     for m in reversed(messages):
@@ -102,11 +109,6 @@ def orchestrator_node(state: AgentState) -> dict:
                 break
 
     if not user_msg:
-        # Headless/CI mode: _route already set by HeadlessRunner, pass through directly
-        existing_route = state.get("_route", "")
-        if existing_route and existing_route != RouteDecision.END.value and existing_route != RouteDecision.END:
-            info_log("orchestrator", f"Headless mode: using pre-set route={existing_route}")
-            return {"messages": [], "_route": existing_route, **_pass_through(state)}
         return {"messages": [], "_route": RouteDecision.END, **_pass_through(state)}
 
     orch_input = [

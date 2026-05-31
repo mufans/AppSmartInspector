@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -2500,9 +2501,38 @@ class PerfettoCollector:
             "frame_matches": matches,
         }
 
+    @staticmethod
+    def _collect_step(label: str, fn, error_val, counter: list[int]):
+        """Run a single collect step with timed progress output.
+
+        Args:
+            label: Human-readable step name for terminal output.
+            fn: Callable returning the collect result.
+            error_val: Value to return on error (e.g. {} or []). None → stays None.
+            counter: Mutable [n] to increment on each step.
+        """
+        counter[0] += 1
+        t0 = time.monotonic()
+        try:
+            result = fn()
+        except Exception as e:
+            info_log("collector", f"WARNING: {label} failed: {e}")
+            if error_val is None:
+                result = None
+            elif isinstance(error_val, list):
+                result = [str(e)]
+            else:
+                result = {"error": str(e)}
+        elapsed = time.monotonic() - t0
+        print(f"    [{counter[0]:>2}] {label:<36s} {elapsed:.1f}s", flush=True)  # noqa: LOG — user-facing progress
+        return result
+
     def summarize(self) -> PerfSummary:
         """Run all analyses and return a unified summary."""
         summary = PerfSummary()
+        _step = [0]  # mutable counter for _collect_step
+
+        print("  [collector] SQL 分析中...", flush=True)  # noqa: LOG — user-facing progress
 
         # Metadata
         tp = self._open()
@@ -2540,171 +2570,60 @@ class PerfettoCollector:
                 summary.metadata["target_process"] = resolved
                 debug_log("perfetto", f"target process resolved via {resolved['source']}: {resolved}")
 
-        # Scheduling
-        try:
-            summary.scheduling = self.collect_sched()
-        except Exception as e:
-            summary.scheduling = {"error": str(e)}
-
-        # CPU hotspots
-        try:
-            summary.cpu_hotspots = self.collect_cpu_hotspots()
-        except Exception as e:
-            summary.cpu_hotspots = [{"error": str(e)}]
-
-        # CPU usage (from sched)
-        try:
-            summary.cpu_usage = self.collect_cpu_usage()
-        except Exception as e:
-            summary.cpu_usage = {"error": str(e)}
-
-        # Frame timeline
-        try:
-            summary.frame_timeline = self.collect_frame_timeline()
-        except Exception as e:
-            summary.frame_timeline = {"error": str(e)}
-
-        # Process-level memory (RSS/PSS)
-        try:
-            summary.process_memory = self.collect_process_memory()
-        except Exception as e:
-            summary.process_memory = {"error": str(e)}
-
-        # Heap graph memory (requires target_process)
-        try:
-            summary.memory = self.collect_memory()
-        except Exception as e:
-            summary.memory = {"error": str(e)}
-
-        # View slices (doFrame, measure, layout, draw, RV events)
-        try:
-            summary.view_slices = self.collect_view_slices()
-        except Exception as e:
-            summary.view_slices = {"error": str(e)}
-
-        # Block events (SI$block# slices + SIBlock logcat stacks)
-        try:
-            summary.block_events = self.collect_block_events()
-        except Exception as e:
-            summary.block_events = [{"error": str(e)}]
-
-        # IO slices (SI$net#/SI$db#/SI$img# — all threads, not main-thread specific)
-        try:
-            summary.io_slices = self.collect_io_slices()
-        except Exception as e:
-            summary.io_slices = {"error": str(e)}
-
-        # Input events (SI$touch# — touch event correlation with jank)
-        try:
-            summary.input_events = self.collect_input_events()
-        except Exception as e:
-            summary.input_events = [{"error": str(e)}]
-
-        # Compose slices (SI$compose# — recomposition tracking)
-        try:
-            summary.compose_slices = self.collect_compose_slices()
-        except Exception as e:
-            summary.compose_slices = {"error": str(e)}
+        # Core metrics
+        summary.scheduling = self._collect_step("调度统计 (sched)", self.collect_sched, {}, _step)
+        summary.cpu_hotspots = self._collect_step("CPU 火焰图 (cpu_hotspots)", self.collect_cpu_hotspots, [], _step)
+        summary.cpu_usage = self._collect_step("CPU 占用率 (cpu_usage)", self.collect_cpu_usage, {}, _step)
+        summary.frame_timeline = self._collect_step("帧时间线 (frame_timeline)", self.collect_frame_timeline, {}, _step)
+        summary.process_memory = self._collect_step("进程内存 (process_memory)", self.collect_process_memory, {}, _step)
+        summary.memory = self._collect_step("堆内存 (memory)", self.collect_memory, {}, _step)
+        summary.view_slices = self._collect_step("视图切片 (view_slices)", self.collect_view_slices, {}, _step)
+        summary.block_events = self._collect_step("卡顿事件 (block_events)", self.collect_block_events, [], _step)
+        summary.io_slices = self._collect_step("IO 操作 (io_slices)", self.collect_io_slices, {}, _step)
+        summary.input_events = self._collect_step("输入事件 (input_events)", self.collect_input_events, [], _step)
+        summary.compose_slices = self._collect_step("Compose 重组 (compose)", self.collect_compose_slices, {}, _step)
 
         # System-level stats (CPU idle, frequency, fork rate)
-        try:
-            sys_stats = self.collect_sys_stats()
-            if sys_stats:
-                summary.sys_stats = sys_stats
-        except Exception as e:
-            debug_log("perfetto", f"sys_stats collection failed: {e}")
+        def _sys_stats():
+            return self.collect_sys_stats()
+        sys_stats = self._collect_step("系统统计 (sys_stats)", _sys_stats, None, _step)
+        if sys_stats:
+            summary.sys_stats = sys_stats
 
         # Thread state analysis (Running/S/D per SI$ slice)
-        try:
-            summary.thread_state = self.collect_thread_state()
+        summary.thread_state = self._collect_step("线程状态 (thread_state)", self.collect_thread_state, {}, _step)
+        if summary.thread_state:
             debug_log("perfetto", f"thread_state: collected {len(summary.thread_state)} entries")
-            if not summary.thread_state:
-                # Diagnose why thread_state is empty
-                try:
-                    tp = self._open()
-                    ts_count = 0
-                    for r in tp.query("SELECT COUNT(*) as c FROM thread_state"):
-                        ts_count = r.c
-                        break
-                    ts_main = 0
-                    for r in tp.query("SELECT COUNT(*) as c FROM thread_state WHERE utid IN (SELECT utid FROM thread WHERE name = 'main')"):
-                        ts_main = r.c
-                        break
-                    debug_log("perfetto", f"thread_state diagnosis: total={ts_count}, main_thread={ts_main}")
-                except Exception as e2:
-                    debug_log("perfetto", f"thread_state diagnosis failed: {e2}")
-        except Exception as e:
-            debug_log("perfetto", f"thread_state collection failed: {e}")
+        if not summary.thread_state:
+            # Diagnose why thread_state is empty
+            try:
+                tp = self._open()
+                ts_count = 0
+                for r in tp.query("SELECT COUNT(*) as c FROM thread_state"):
+                    ts_count = r.c
+                    break
+                ts_main = 0
+                for r in tp.query("SELECT COUNT(*) as c FROM thread_state WHERE utid IN (SELECT utid FROM thread WHERE name = 'main')"):
+                    ts_main = r.c
+                    break
+                debug_log("perfetto", f"thread_state diagnosis: total={ts_count}, main_thread={ts_main}")
+            except Exception as e2:
+                debug_log("perfetto", f"thread_state diagnosis failed: {e2}")
 
         # --- Stdlib modules (P0) ---
-
-        # Lock contention (android.monitor_contention)
-        try:
-            summary.lock_contention = self.collect_lock_contention()
-        except Exception as e:
-            debug_log("perfetto", f"lock_contention failed: {e}")
-
-        # Binder transactions (android.binder)
-        try:
-            summary.binder_txns = self.collect_binder_txns()
-        except Exception as e:
-            debug_log("perfetto", f"binder_txns failed: {e}")
-
-        # Startup metrics TTID/TTFD (android.startup.*)
-        try:
-            summary.startup_metrics = self.collect_startup_metrics()
-        except Exception as e:
-            debug_log("perfetto", f"startup_metrics failed: {e}")
-
-        # GC events (android.garbage_collection)
-        try:
-            summary.gc_events = self.collect_gc_events()
-        except Exception as e:
-            debug_log("perfetto", f"gc_events failed: {e}")
-
-        # ANR detection (android.anrs)
-        try:
-            summary.anrs = self.collect_anrs()
-        except Exception as e:
-            debug_log("perfetto", f"anrs failed: {e}")
+        summary.lock_contention = self._collect_step("锁竞争 (lock_contention)", self.collect_lock_contention, None, _step)
+        summary.binder_txns = self._collect_step("Binder IPC (binder_txns)", self.collect_binder_txns, None, _step)
+        summary.startup_metrics = self._collect_step("启动指标 (startup_metrics)", self.collect_startup_metrics, None, _step)
+        summary.gc_events = self._collect_step("GC 事件 (gc_events)", self.collect_gc_events, None, _step)
+        summary.anrs = self._collect_step("ANR 检测 (anrs)", self.collect_anrs, None, _step)
 
         # --- Stdlib modules (P1) ---
-
-        # Slice CPU time (slices.cpu_time)
-        try:
-            summary.slice_cpu_time = self.collect_slice_cpu_time()
-        except Exception as e:
-            debug_log("perfetto", f"slice_cpu_time failed: {e}")
-
-        # Input latency breakdown (android.input)
-        try:
-            summary.input_latency = self.collect_input_latency()
-        except Exception as e:
-            debug_log("perfetto", f"input_latency failed: {e}")
-
-        # Scheduling latency (sched.latency)
-        try:
-            summary.sched_latency = self.collect_sched_latency()
-        except Exception as e:
-            debug_log("perfetto", f"sched_latency failed: {e}")
-
-        # OOM + RSS/Swap (android.memory.process + android.memory.lmk)
-        try:
-            summary.oom_rss_swap = self.collect_oom_rss_swap()
-        except Exception as e:
-            debug_log("perfetto", f"oom_rss_swap failed: {e}")
-
-        # CPU utilization (linux.cpu.utilization)
-        try:
-            summary.cpu_utilization = self.collect_cpu_utilization()
-        except Exception as e:
-            debug_log("perfetto", f"cpu_utilization failed: {e}")
-
-        # SurfaceFlinger frame timeline (android.surfaceflinger)
-        try:
-            summary.surfaceflinger_timeline = self.collect_surfaceflinger_timeline()
-        except Exception as e:
-            debug_log("perfetto", f"surfaceflinger_timeline failed: {e}")
+        summary.slice_cpu_time = self._collect_step("切片 CPU 时间 (slice_cpu_time)", self.collect_slice_cpu_time, None, _step)
+        summary.input_latency = self._collect_step("输入延迟 (input_latency)", self.collect_input_latency, None, _step)
+        summary.sched_latency = self._collect_step("调度延迟 (sched_latency)", self.collect_sched_latency, None, _step)
+        summary.oom_rss_swap = self._collect_step("OOM/RSS/Swap (oom_rss_swap)", self.collect_oom_rss_swap, None, _step)
+        summary.cpu_utilization = self._collect_step("CPU 利用率 (cpu_utilization)", self.collect_cpu_utilization, None, _step)
+        summary.surfaceflinger_timeline = self._collect_step("SF 帧时间线 (sf_timeline)", self.collect_surfaceflinger_timeline, None, _step)
 
         # --- Dimension registry (extensible dimensions) ---
         try:
@@ -2712,17 +2631,19 @@ class PerfettoCollector:
             DimensionRegistry.discover()
             tp = self._open()
             for dim in DimensionRegistry.all():
-                try:
-                    dim_data = dim.collect(tp)
-                    if dim_data:
-                        summary.dimensions[dim.name] = dim_data
-                except Exception as e:
-                    debug_log("perfetto", f"dimension {dim.name} failed: {e}")
+                dim_data = self._collect_step(
+                    f"维度: {dim.description}",
+                    lambda d=dim, t=tp: d.collect(t),
+                    None, _step,
+                )
+                if dim_data:
+                    summary.dimensions[dim.name] = dim_data
             if summary.dimensions:
                 debug_log("perfetto", f"dimensions: collected {len(summary.dimensions)} dimensions")
         except Exception as e:
-            debug_log("perfetto", f"dimension registry discovery failed: {e}")
+            info_log("collector", f"WARNING: dimension registry discovery failed: {e}")
 
+        print(f"  [collector] 分析完成，共 {_step[0]} 项查询", flush=True)  # noqa: LOG — user-facing progress
         return summary
 
     @staticmethod
@@ -2942,14 +2863,15 @@ class PerfettoCollector:
         # --- P1-6 + P1-7: Trace collection with SELinux fallback and auto-degradation ---
         timeout_sec = duration_ms // 1000 + 30
         collection_error = None
+        duration_sec = duration_ms // 1000
+        import threading
+
+        print(f"  [collector] 录制 Perfetto trace ({duration_sec}s)...", flush=True)  # noqa: LOG — user-facing progress
 
         # Strategy 1: Config mode via stdin pipe (preferred)
         try:
             if on_record_start:
                 # Use Popen so we can invoke callback while Perfetto is recording
-                import threading
-                import time
-
                 adb_cmd = ["adb", "shell", f"perfetto -c - --txt -o {device_path}"]
                 debug_log("collector", f"Perfetto adb command: {' '.join(adb_cmd)}")
                 proc = subprocess.Popen(
@@ -3009,8 +2931,14 @@ class PerfettoCollector:
                 if cb_thread.is_alive():
                     info_log("perfetto", "WARNING: on_record_start callback timed out after 10s")
 
-                # Wait for perfetto recording to complete
-                proc.wait(timeout=timeout_sec)
+                # Wait for perfetto recording to complete with countdown
+                record_t0 = time.monotonic()
+                while proc.poll() is None:
+                    elapsed = int(time.monotonic() - record_t0)
+                    remaining = max(0, duration_sec - elapsed)
+                    print(f"\r  [collector] 录制中... {remaining}s", end="", flush=True)  # noqa: LOG — user-facing progress
+                    time.sleep(1.0)
+                print(f"\r  [collector] 录制完成 ({time.monotonic() - record_t0:.1f}s)   ", flush=True)  # noqa: LOG — user-facing progress
                 t_out.join(timeout=5)
                 t_err.join(timeout=5)
 
@@ -3025,12 +2953,32 @@ class PerfettoCollector:
             else:
                 adb_cmd = ["adb", "shell", f"perfetto -c - --txt -o {device_path}"]
                 debug_log("collector", f"Perfetto adb command: {' '.join(adb_cmd)}")
-                subprocess.run(
-                    adb_cmd,
-                    input=config_text,
-                    check=True, capture_output=True, text=True,
-                    timeout=timeout_sec,
-                )
+
+                # Run perfetto in background thread so we can show countdown
+                _run_result: list[Exception | None] = [None]
+                def _run_perfetto():
+                    try:
+                        subprocess.run(
+                            adb_cmd,
+                            input=config_text,
+                            check=True, capture_output=True, text=True,
+                            timeout=timeout_sec,
+                        )
+                    except Exception as exc:
+                        _run_result[0] = exc
+                perf_thread = threading.Thread(target=_run_perfetto, daemon=True)
+                perf_thread.start()
+
+                record_t0 = time.monotonic()
+                while perf_thread.is_alive():
+                    elapsed = int(time.monotonic() - record_t0)
+                    remaining = max(0, duration_sec - elapsed)
+                    print(f"\r  [collector] 录制中... {remaining}s", end="", flush=True)  # noqa: LOG — user-facing progress
+                    time.sleep(1.0)
+                print(f"\r  [collector] 录制完成 ({time.monotonic() - record_t0:.1f}s)   ", flush=True)  # noqa: LOG — user-facing progress
+                perf_thread.join(timeout=5)
+                if _run_result[0] is not None:
+                    raise _run_result[0]
             collection_error = None
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             err_msg = ""
@@ -3108,10 +3056,14 @@ class PerfettoCollector:
             raise RuntimeError(f"perfetto collection failed: {collection_error}")
 
         # Pull trace from device
+        print("  [collector] 拉取 trace 文件...", flush=True)  # noqa: LOG — user-facing progress
         subprocess.run(
             ["adb", "pull", device_path, output_path],
             check=True, capture_output=True, text=True,
         )
+
+        trace_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        print(f"  [collector] Trace 大小: {trace_size_mb:.1f}MB", flush=True)  # noqa: LOG — user-facing progress
 
         # Cleanup device
         subprocess.run(

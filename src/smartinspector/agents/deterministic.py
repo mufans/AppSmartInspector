@@ -780,8 +780,8 @@ def _analyze_compose_slices(data: dict) -> str:
 def _analyze_memory(data: dict) -> str:
     """Analyze heap memory allocation and detect potential leaks.
 
-    Reports top heap objects by size, leak suspects (destroyed Activities/Fragments
-    still in heap), and memory growth anomalies.
+    Reports top heap objects by size, leak suspects (filtered by lifecycle
+    state to exclude alive components), and memory growth anomalies.
     """
     memory = data.get("memory")
     if not memory:
@@ -801,16 +801,41 @@ def _analyze_memory(data: dict) -> str:
             short = name.rsplit(".", 1)[-1] if "." in name else name
             lines.append(f"    {short}: {count}个, {size_kb:.1f}KB")
 
-    # Leak suspects
+    # Alive components (Activity/Fragment with active lifecycle — expected in heap)
+    alive_components = memory.get("alive_components") or []
+    if alive_components:
+        lines.append("  存活组件 (lifecycle活跃, heap中存在属正常):")
+        for comp in alive_components[:10]:
+            name = comp.get("class_name", "?")
+            count = comp.get("obj_count", 0)
+            short = name.rsplit(".", 1)[-1] if "." in name else name
+            lines.append(f"    {short}: {count}个实例 [正常]")
+
+    # Leak suspects (destroyed but still in heap, or multiple instances)
     leak_suspects = memory.get("leak_suspects") or []
     if leak_suspects:
-        lines.append("  潜在泄漏:")
+        lines.append("  疑似泄漏:")
         for suspect in leak_suspects[:5]:
             name = suspect.get("class_name", "?")
             count = suspect.get("obj_count", 0)
             size_kb = suspect.get("total_size_kb", 0)
+            state = suspect.get("state", "unknown")
             short = name.rsplit(".", 1)[-1] if "." in name else name
-            lines.append(f"    ⚠ {short}: {count}个实例, {size_kb:.1f}KB")
+            lines.append(f"    ⚠ {short}: {count}个实例, {size_kb:.1f}KB [{state}]")
+
+    # Leak reference chains — who holds the leaked objects
+    leak_refs = memory.get("leak_reference_chains") or []
+    if leak_refs:
+        lines.append("  泄漏引用链 (谁持有了泄漏对象):")
+        for ref in leak_refs[:10]:
+            owner = ref.get("owner", "?")
+            owned = ref.get("owned", "?")
+            field = ref.get("field", "?")
+            deobfuscated = ref.get("deobfuscated", "")
+            field_display = deobfuscated if deobfuscated and deobfuscated != field else field
+            owner_short = owner.rsplit(".", 1)[-1] if "." in owner else owner
+            owned_short = owned.rsplit(".", 1)[-1] if "." in owned else owned
+            lines.append(f"    {owner_short} --[{field_display}]--> {owned_short}")
 
     # Process memory trend
     proc_mem = data.get("process_memory") or {}

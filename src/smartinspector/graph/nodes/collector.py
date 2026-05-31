@@ -225,6 +225,85 @@ def _merge_block_events(
     return merged
 
 
+def _print_instant_preview(perf_json: str) -> None:
+    """Print a concise instant preview of key findings from perf data.
+
+    Shows FPS, worst frame, main-thread blocking, CPU hotspots, and dimension
+    severity immediately after SQL analysis — before waiting for LLM.
+    Uses only lightweight field extraction, no compute_hints() to avoid
+    redundant full computation (reporter will run that later).
+    """
+    try:
+        data = json.loads(perf_json)
+    except (json.JSONDecodeError, TypeError):
+        return
+
+    findings: list[str] = []
+
+    # FPS & frame timeline
+    ft = data.get("frame_timeline") or {}
+    fps = ft.get("fps", 0)
+    total = ft.get("total_frames", 0)
+    jank = ft.get("jank_count", 0)
+    if fps > 0:
+        findings.append(f"帧率: {fps} FPS ({total} 帧, {jank} 卡顿)")
+
+    # Worst frame
+    slowest = ft.get("slowest_frames") or []
+    if slowest:
+        worst = slowest[0]
+        dur = worst.get("dur_ms", 0)
+        name = worst.get("name", "unknown")
+        findings.append(f"最慢帧: {dur:.1f}ms ({name})")
+
+    # Main-thread blocking
+    blocks = data.get("block_events") or []
+    if blocks:
+        total_dur = sum(b.get("dur_ms", 0) for b in blocks)
+        findings.append(f"主线程阻塞: {len(blocks)} 次 (共 {total_dur:.0f}ms)")
+
+    # CPU hotspots
+    hotspots = data.get("cpu_hotspots") or []
+    cpu_list = [h for h in hotspots if isinstance(h, dict) and not h.get("error")]
+    if cpu_list:
+        top = cpu_list[0]
+        fname = top.get("name", "?")
+        pct = top.get("pct", 0)
+        findings.append(f"CPU 热点: {fname} ({pct:.1f}%)")
+
+    # Dimension severity hints (lightweight — first line only)
+    dims = data.get("dimensions") or {}
+    if dims:
+        try:
+            from smartinspector.collector.dimensions import DimensionRegistry, HintContext
+            from smartinspector.agents.deterministic import _detect_frame_budget_ms
+            DimensionRegistry.discover()
+            fb = _detect_frame_budget_ms(data)
+            ctx = HintContext(frame_budget_ms=fb)
+            for dim in DimensionRegistry.all():
+                dd = dims.get(dim.name)
+                if not dd:
+                    continue
+                hint = dim.compute_hint(dd, ctx)
+                if hint:
+                    first_line = hint.split("\n")[0]
+                    findings.append(first_line)
+        except Exception:
+            pass
+
+    # P0 slices from view_slices (fast field extraction, no compute_hints)
+    vs = (data.get("view_slices") or {}).get("slowest_slices") or []
+    p0_slices = [s for s in vs if s.get("is_custom") and s.get("dur_ms", 0) > 16.67]
+    for s in sorted(p0_slices, key=lambda x: -x.get("dur_ms", 0))[:3]:
+        findings.append(f"P0: {s.get('name', '?')} ({s.get('dur_ms', 0):.1f}ms)")
+
+    if findings:
+        print("\n  ┌─ 即时快报 ─────────────────────────────", flush=True)  # noqa: LOG — user-facing progress
+        for f in findings:
+            print(f"  │ {f}", flush=True)  # noqa: LOG — user-facing progress
+        print("  └─────────────────────────────────────────", flush=True)  # noqa: LOG — user-facing progress
+
+
 def collector_node(state: AgentState) -> dict:
     """Collect and analyze a Perfetto trace.
 
@@ -325,10 +404,33 @@ def collector_node(state: AgentState) -> dict:
             else:
                 categories = None
 
-            collect_cpu_callstacks = pc.get("collectCpuCallstacks", True)
-            collect_java_heap = pc.get("collectJavaHeap", True)
+            collect_cpu_callstacks = pc.get("cpu_callstacks", True)
+            collect_java_heap = pc.get("java_heap", True)
 
             info_log("collector", f"Config: duration={duration_ms}ms, buffer={buffer_size_kb}KB")
+
+            # Auto-detect target_process from ADB if not set by user or app config.
+            # This enables heap dump (android.java_hprof) and CPU callstack sampling
+            # even when the user doesn't explicitly set --target.
+            if not target_process:
+                try:
+                    # Use adb shell with pipe inside device shell
+                    result = subprocess.run(
+                        ["adb", "shell", "dumpsys activity activities 2>/dev/null | grep mResumedActivity | head -1"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    output = result.stdout.strip()
+                    # Parse: "  mResumedActivity: ActivityRecord{... u0 com.example.app/.ActivityName ...}"
+                    if "/" in output:
+                        # Extract package before the "/"
+                        before_slash = output.split("/")[0]
+                        # Last whitespace-separated token is the package name
+                        pkg = before_slash.strip().split()[-1]
+                        if "." in pkg and not pkg.startswith("{"):
+                            target_process = pkg
+                            info_log("collector", f"Auto-detected target_process from foreground app: {target_process}")
+                except Exception:
+                    pass  # non-critical: proceed without target_process
 
             # Cold start: ensure target_process is set in state for downstream nodes
             if is_startup and cold_start_target and not target_process:
@@ -388,6 +490,9 @@ def collector_node(state: AgentState) -> dict:
         perf_json = summary.to_json()
 
         info_log("collector", f"Analysis complete ({len(perf_json)} bytes)")
+
+        # Instant preview: show key findings before LLM analysis begins
+        _print_instant_preview(perf_json)
 
         return {
             "messages": [AIMessage(content="[trace collected and analyzed]")],

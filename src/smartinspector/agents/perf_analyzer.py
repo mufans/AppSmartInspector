@@ -75,6 +75,43 @@ def _build_dimension_sections(perf_json: str) -> str:
     return "\n\n".join(parts)
 
 
+def _stream_llm(llm, messages: list) -> tuple[str, int, int]:
+    """Stream LLM response to terminal, return (full_content, input_tokens, output_tokens).
+
+    Falls back to non-streaming invoke on stream failure.
+    """
+    full_content = ""
+    input_tokens = 0
+    output_tokens = 0
+    try:
+        for chunk in llm.stream(messages):
+            token = chunk.content
+            if token:
+                print(token, end="", flush=True)  # noqa: LOG — streaming LLM tokens to user
+                full_content += token
+            um = getattr(chunk, "usage_metadata", None)
+            if um:
+                input_tokens = um.get("input_tokens", 0)
+                if um.get("output_tokens"):
+                    output_tokens = um["output_tokens"]
+    except Exception as e:
+        # Stream interrupted — fallback to invoke
+        info_log("perf_analyzer", f"WARNING: Stream interrupted ({e}), retrying...")
+        try:
+            response = llm.invoke(messages)
+            full_content = response.content
+            get_tracker().record_from_message("perf_analyzer", response)
+        except Exception as e2:
+            full_content = full_content or f"[perf_analyzer] Analysis failed: {e2}"
+            info_log("perf_analyzer", f"ERROR: Retry also failed: {e2}")
+
+    # Fallback estimate when provider doesn't send output_tokens in stream
+    if not output_tokens:
+        output_tokens = len(full_content) // 3
+
+    return full_content, input_tokens, output_tokens
+
+
 def analyze_perf(perf_json: str) -> str:
     """Run a single-shot LLM analysis on a performance summary JSON.
 
@@ -120,13 +157,14 @@ def analyze_perf(perf_json: str) -> str:
     user_content += f"原始数据参考:\n```json\n{compressed_json[:3000]}\n```"
 
     from langchain_core.messages import HumanMessage, SystemMessage
-    response = llm.invoke([
+    messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_content),
-    ])
-    get_tracker().record_from_message("perf_analyzer", response)
+    ]
 
-    result = response.content
+    print("  [analyzer] 分析性能数据...", flush=True)  # noqa: LOG — user-facing progress
+    result, input_tokens, output_tokens = _stream_llm(llm, messages)
+    get_tracker().record("perf_analyzer", {"input_tokens": input_tokens, "output_tokens": output_tokens})
 
     # Verify analysis quality
     verification = verify_analysis(result, hints)
@@ -148,11 +186,13 @@ def analyze_perf(perf_json: str) -> str:
                 f"{missing}\n\n"
                 "请在分析中明确覆盖以上遗漏项。"
             )
-            retry_response = llm.invoke([
+            print("\n  [analyzer] 补充遗漏项...", flush=True)  # noqa: LOG — user-facing progress
+            retry_messages = [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=retry_content),
-            ])
-            get_tracker().record_from_message("perf_analyzer_retry", retry_response)
-            result = retry_response.content
+            ]
+            result, retry_in, retry_out = _stream_llm(llm, retry_messages)
+            get_tracker().record("perf_analyzer_retry", {"input_tokens": retry_in, "output_tokens": retry_out})
 
+    print()  # newline after streaming output  # noqa: LOG — user-facing progress
     return result

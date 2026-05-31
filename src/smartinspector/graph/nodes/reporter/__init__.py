@@ -20,20 +20,23 @@ def reporter_node(state: AgentState) -> dict:
     from smartinspector.commands.orchestrate import _build_report_header
     from smartinspector.graph.state import RouteDecision
 
-    report_prompt = load_prompt("report-generator")
-
     perf_json = state.get("perf_summary", "")
     perf_analysis = state.get("perf_analysis", "")
     attribution_result = state.get("attribution_result", "")
     route = state.get("_route", "")
+
+    is_startup = route in (RouteDecision.STARTUP, RouteDecision.STARTUP.value)
+
+    # --- Phase 1: Data assembly (CPU-intensive, before print) ---
+    print("\n  [reporter] 组装报告数据...", flush=True)  # noqa: LOG — user-facing progress
+
+    report_prompt = load_prompt("report-generator")
 
     # Inject dimension skills into system prompt for domain knowledge
     if perf_json:
         dim_skills = load_skills_for_dimensions(perf_json, agent_role="reporter")
         if dim_skills:
             report_prompt += dim_skills
-
-    is_startup = route in (RouteDecision.STARTUP, RouteDecision.STARTUP.value)
 
     # Build user content with all available data
     # IMPORTANT: attribution section MUST come first (before header/analysis)
@@ -68,7 +71,6 @@ def reporter_node(state: AgentState) -> dict:
             "attribution_result": attribution_result,
         }
 
-    print("\n  [reporter] Generating report...", flush=True)  # noqa: LOG — user-facing progress
     if state.get("_trace_path"):
         info_log("reporter", f"Trace file: {state['_trace_path']}")
     else:
@@ -96,6 +98,9 @@ def reporter_node(state: AgentState) -> dict:
             user_content = "\n\n".join(truncated) + "\n\n[... 数据过长已截断 ...]"
             debug_log("reporter", f"TRUNCATING user_content from {len(user_content)} to ~{total} chars ({len(truncated)}/{len(sections)} sections)")
     debug_log("reporter", f"attribution section: {user_content[-1500:] if len(user_content) > 1500 else user_content}")
+
+    # --- Phase 2: LLM generation (streamed) — print RIGHT BEFORE stream ---
+    print("  [reporter] 生成报告...", flush=True)  # noqa: LOG — user-facing progress
     full_content = generate_report(report_prompt, user_content)
     debug_log("reporter", f"LLM output ({len(full_content)} chars): {full_content[:2000]}")
     debug_log("reporter", f"attribution_result JSON: {attribution_result}")

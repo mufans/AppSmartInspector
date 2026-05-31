@@ -640,6 +640,10 @@ def run_attribution(attributable: list[dict], on_progress=None,
 
     for group in groups:
         group_label = ", ".join(f"{g['class_name']}.{g['method_name']}" for g in group)
+
+        if on_progress:
+            on_progress("group_start", group_label)
+
         # Fast path: deterministic search for straightforward cases
         if _can_use_fast_path(group):
             debug_log("attributor", f"fast path: searching {group_label}")
@@ -647,23 +651,32 @@ def run_attribution(attributable: list[dict], on_progress=None,
             found_count = sum(1 for r in fast_results if r.get("reason") == "found")
             if all(r.get("reason") == "found" for r in fast_results):
                 results.extend(fast_results)
+                if on_progress:
+                    on_progress("group_done", fast_results)
                 debug_log("attributor", f"fast path: all {found_count} found for {group_label}")
                 continue
             # Partial success: merge found results, fall back to LLM for rest
             debug_log("attributor", f"fast path: {found_count}/{len(fast_results)} found, rest falls back to LLM for {group_label}")
             failed_issues = []
+            found_fast = []
             for r, issue in zip(fast_results, group):
                 if r.get("reason") == "found":
                     results.append(r)
+                    found_fast.append(r)
                 else:
                     failed_issues.append(issue)
+            llm_results = []
             if failed_issues:
                 llm_results = _search_group(failed_issues, file_cache, on_progress, perf_json)
                 results.extend(llm_results)
+            if on_progress:
+                on_progress("group_done", found_fast + llm_results)
             continue
 
         group_results = _search_group(group, file_cache, on_progress, perf_json)
         results.extend(group_results)
+        if on_progress:
+            on_progress("group_done", group_results)
 
     # Analyze fast-path results with lightweight LLM call
     fast_path_results = [r for r in results if r.get("_fast_path")]
