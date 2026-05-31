@@ -95,9 +95,33 @@ def analyze_frame(trace_path: str, ts_ns: int, dur_ns: int,
             frame_data["slices"] = slices[:20]
         frame_json = json.dumps(frame_data, indent=2, ensure_ascii=False)
 
+    # --- Reuse full analysis chain for dimension + deterministic data ---
+    full_sections: list[str] = []
+    if existing_summary:
+        try:
+            from smartinspector.agents.deterministic import compute_hints
+            full_hints = compute_hints(existing_summary)
+            if full_hints:
+                full_sections.append(f"## 全量确定性结论\n\n{full_hints}")
+
+            # Extract formatted sections (dimension data, thread state, frame timeline, etc.)
+            # Skip "## 预计算结论" — already captured via compute_hints() above
+            from smartinspector.graph.nodes.reporter.formatter import format_perf_sections
+            for sec in format_perf_sections(existing_summary):
+                if not sec.startswith("## 预计算结论"):
+                    full_sections.append(sec)
+        except Exception:
+            from smartinspector.debug_log import debug_log
+            debug_log("frame", "Failed to extract full analysis sections from existing_summary")
+
     user_content = (
-        "## 预计算结论\n\n"
+        "## 预计算结论（帧级）\n\n"
         f"{hints}\n\n"
+    )
+    # Insert full analysis sections (dimensions, thread state, etc.)
+    if full_sections:
+        user_content += "\n\n".join(full_sections) + "\n\n"
+    user_content += (
         "## 选中范围数据\n\n"
         f"```json\n{frame_json}\n```\n\n"
     )
@@ -404,7 +428,78 @@ def _build_frame_hints(frame_data: dict, existing_summary: str) -> str:
         for s in si_slices:
             s.pop("_effective_dur", None)
     else:
-        sections.append(f"[选中范围] 无 SI$ 用户代码切片 (共 {len(slices)} 个系统切片)")
+        # No SI$ slices — analyze system slices instead
+        lines = [f"[选中范围] 无 SI$ 用户代码切片 (共 {len(slices)} 个系统切片)"]
+        if slices:
+            # Classify system slices by category
+            _SYS_CATEGORIES: dict[str, str] = {
+                "GC": "GC/垃圾回收",
+                "GarbageCollector": "GC/垃圾回收",
+                "Binder": "Binder IPC",
+                "binder": "Binder IPC",
+                "layout": "布局",
+                "measure": "测量",
+                "draw": "绘制",
+                "inflate": "LayoutInflater",
+                "Choreographer": "Choreographer",
+                "doFrame": "doFrame",
+                "Traversal": "View树遍历",
+                "InputDispatcher": "输入分发",
+                "InputConsumer": "输入消费",
+                "ActivityManager": "Activity管理",
+                "ActivityThread": "Activity管理",
+                "Handler": "Handler消息",
+                "FlushContent": "磁盘IO",
+                "sqlite": "数据库",
+                "Cursor": "数据库",
+                "CloseGuard": "资源泄漏",
+            }
+
+            sorted_slices = sorted(slices, key=lambda s: s.get("dur_ms", 0), reverse=True)
+            # Classify top slices
+            classified: dict[str, list[tuple[dict, float]]] = {}
+            unclassified: list[tuple[dict, float]] = []
+            for s in sorted_slices[:20]:
+                name = s.get("name", "")
+                dur = s.get("dur_ms", 0)
+                if dur < 0.01:
+                    continue
+                matched = False
+                for key, label in _SYS_CATEGORIES.items():
+                    if key in name:
+                        if label not in classified:
+                            classified[label] = []
+                        classified[label].append((s, dur))
+                        matched = True
+                        break
+                if not matched:
+                    unclassified.append((s, dur))
+
+            lines.append("  系统切片分类:")
+            for label, items in sorted(classified.items(), key=lambda x: -sum(d for _, d in x[1])):
+                total = sum(d for _, d in items)
+                count = len(items)
+                max_name = items[0][0].get("name", "?")
+                max_dur = items[0][1]
+                lines.append(
+                    f"    {label}: {count}次, 总耗时{total:.2f}ms "
+                    f"(最大: {max_name} {max_dur:.2f}ms)"
+                )
+
+            # Top unclassified slices
+            if unclassified:
+                lines.append("  其他系统切片 (Top 5):")
+                for s, dur in unclassified[:5]:
+                    lines.append(f"    {s.get('name', '?')} ({dur:.2f}ms)")
+
+            # Severity hint based on total duration
+            total_dur = sum(s.get("dur_ms", 0) for s in sorted_slices[:10])
+            if total_dur > frame_budget_ms:
+                lines.append(
+                    f"  ⚠ 系统切片总耗时 {total_dur:.2f}ms 超过帧预算 {frame_budget_ms:.2f}ms, "
+                    "可能存在系统级性能瓶颈"
+                )
+        sections.append("\n".join(lines))
 
     # Jank frame info
     jank_frames = [f for f in frames if f.get("is_jank")]
