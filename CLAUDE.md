@@ -147,6 +147,8 @@ debug_log("collector", f"thread_state: {name} running={running_ms:.1f}ms")
 
 ## Architecture
 
+![SmartInspector Architecture](docs/architecture.svg)
+
 ### LangGraph Pipeline
 
 ```

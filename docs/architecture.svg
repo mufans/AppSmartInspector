@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="540" viewBox="0 0 1200 540">
+<style>
+  text { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; }
+  .title { font-size: 20px; font-weight: bold; fill: #1a1a2e; }
+  .layer-label { font-size: 12px; font-weight: bold; fill: #555; }
+  .mod-name { font-size: 13px; font-weight: bold; }
+  .mod-desc { font-size: 11px; fill: #666; }
+  .arrow { fill: none; stroke: #888; stroke-width: 1.5; marker-end: url(#ah); }
+  .dash { fill: none; stroke: #aaa; stroke-width: 1.2; stroke-dasharray: 5,3; marker-end: url(#ah2); }
+</style>
+<defs>
+  <marker id="ah" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+    <polygon points="0 0, 8 3, 0 6" fill="#888"/>
+  </marker>
+  <marker id="ah2" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto">
+    <polygon points="0 0, 7 2.5, 0 5" fill="#aaa"/>
+  </marker>
+</defs>
+
+<rect x="2" y="2" width="1196" height="536" rx="12" fill="#f8f9fa" stroke="#bbb" stroke-width="2"/>
+<text x="490" y="34" text-anchor="middle" class="title">SmartInspector Architecture</text>
+<rect x="20" y="50" width="930" height="72" rx="10" fill="#E8F0FE" stroke="#A8C7FA" stroke-width="1.5"/>
+<text x="32" y="65" class="layer-label">ENTRY · 入口层</text>
+<rect x="30" y="70" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="30" y="70" width="4" height="44" rx="2" fill="#3B82F6"/>
+<text x="44" y="87" class="mod-name" fill="#333">CLI 交互</text>
+<text x="44" y="104" class="mod-desc">自然语言 + Slash 命令</text>
+<rect x="260.0" y="70" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="260.0" y="70" width="4" height="44" rx="2" fill="#3B82F6"/>
+<text x="274.0" y="87" class="mod-name" fill="#333">CI / Headless</text>
+<text x="274.0" y="104" class="mod-desc">非交互式全量流水线</text>
+<rect x="490.0" y="70" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="490.0" y="70" width="4" height="44" rx="2" fill="#3B82F6"/>
+<text x="504.0" y="87" class="mod-name" fill="#333">MCP Server</text>
+<text x="504.0" y="104" class="mod-desc">23 个 MCP Tools</text>
+<rect x="720.0" y="70" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="720.0" y="70" width="4" height="44" rx="2" fill="#3B82F6"/>
+<text x="734.0" y="87" class="mod-name" fill="#333">Perfetto UI</text>
+<text x="734.0" y="104" class="mod-desc">框选帧交互分析</text>
+<rect x="420" y="132" width="140" height="36" rx="18" fill="#6366F1" stroke="#4338CA" stroke-width="2"/>
+<text x="490" y="147" text-anchor="middle" fill="#fff" font-size="12" font-weight="bold">Orchestrator</text>
+<text x="490" y="161" text-anchor="middle" fill="#ddd6fe" font-size="10">意图路由</text>
+<line x1="490" y1="122" x2="490" y2="132" class="arrow"/>
+<rect x="20" y="180" width="930" height="72" rx="10" fill="#E6F4EA" stroke="#A8DAB5" stroke-width="1.5"/>
+<text x="32" y="195" class="layer-label">PIPELINE · LangGraph 全量分析</text>
+<rect x="30" y="200" width="203.5" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="30" y="200" width="4" height="44" rx="2" fill="#0D9488"/>
+<text x="44" y="217" class="mod-name" fill="#333">Collector</text>
+<text x="44" y="234" class="mod-desc">Trace采集 + SQL</text>
+<line x1="236" y1="222" x2="262" y2="222" class="arrow"/>
+<rect x="265.5" y="200" width="203.5" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="265.5" y="200" width="4" height="44" rx="2" fill="#0D9488"/>
+<text x="279.5" y="217" class="mod-name" fill="#333">Analyzer</text>
+<text x="279.5" y="234" class="mod-desc">LLM 性能解读</text>
+<line x1="472" y1="222" x2="498" y2="222" class="arrow"/>
+<rect x="501.0" y="200" width="203.5" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="501.0" y="200" width="4" height="44" rx="2" fill="#0D9488"/>
+<text x="515.0" y="217" class="mod-name" fill="#333">Attributor</text>
+<text x="515.0" y="234" class="mod-desc">SI$ → 源码归因</text>
+<line x1="708" y1="222" x2="734" y2="222" class="arrow"/>
+<rect x="736.5" y="200" width="203.5" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="736.5" y="200" width="4" height="44" rx="2" fill="#0D9488"/>
+<text x="750.5" y="217" class="mod-name" fill="#333">Reporter</text>
+<text x="750.5" y="234" class="mod-desc">Markdown / JSON</text>
+<line x1="490" y1="168" x2="490" y2="180" class="arrow"/>
+<rect x="20" y="264" width="930" height="72" rx="10" fill="#FEF7E0" stroke="#F9E088" stroke-width="1.5"/>
+<text x="32" y="279" class="layer-label">AGENTS · Agent 层</text>
+<rect x="30" y="284" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="30" y="284" width="4" height="44" rx="2" fill="#D97706"/>
+<text x="44" y="301" class="mod-name" fill="#333">perf_analyzer</text>
+<text x="44" y="318" class="mod-desc">流式 LLM + 验证重试</text>
+<rect x="260.0" y="284" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="260.0" y="284" width="4" height="44" rx="2" fill="#D97706"/>
+<text x="274.0" y="301" class="mod-name" fill="#333">deterministic</text>
+<text x="274.0" y="318" class="mod-desc">18 模块 · 0 token</text>
+<rect x="490.0" y="284" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="490.0" y="284" width="4" height="44" rx="2" fill="#D97706"/>
+<text x="504.0" y="301" class="mod-name" fill="#333">verifier</text>
+<text x="504.0" y="318" class="mod-desc">L1+L2 质量验证</text>
+<rect x="720.0" y="284" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="720.0" y="284" width="4" height="44" rx="2" fill="#D97706"/>
+<text x="734.0" y="301" class="mod-name" fill="#333">frame_analyzer</text>
+<text x="734.0" y="318" class="mod-desc">帧级切片归因</text>
+<line x1="469" y1="222" x2="140" y2="284" class="dash"/>
+<rect x="20" y="348" width="930" height="72" rx="10" fill="#FFF3E6" stroke="#FFCC80" stroke-width="1.5"/>
+<text x="32" y="363" class="layer-label">COLLECTOR · 采集 + 维度注册</text>
+<rect x="30" y="368" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="30" y="368" width="4" height="44" rx="2" fill="#E65100"/>
+<text x="44" y="385" class="mod-name" fill="#333">PerfettoCollector</text>
+<text x="44" y="402" class="mod-desc">28+ SQL 方法</text>
+<rect x="260.0" y="368" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="260.0" y="368" width="4" height="44" rx="2" fill="#E65100"/>
+<text x="274.0" y="385" class="mod-name" fill="#333">StartupAnalyzer</text>
+<text x="274.0" y="402" class="mod-desc">冷启动阶段切分</text>
+<rect x="490.0" y="368" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="490.0" y="368" width="4" height="44" rx="2" fill="#E65100"/>
+<text x="504.0" y="385" class="mod-name" fill="#333">MemoryAnalyzer</text>
+<text x="504.0" y="402" class="mod-desc">Heap 泄漏检测</text>
+<rect x="720.0" y="368" width="220.0" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="720.0" y="368" width="4" height="44" rx="2" fill="#E65100"/>
+<text x="734.0" y="385" class="mod-name" fill="#333">DimensionRegistry</text>
+<text x="734.0" y="402" class="mod-desc">7 维度插件注册</text>
+<rect x="20" y="432" width="930" height="72" rx="10" fill="#FCE8E6" stroke="#F5A8A2" stroke-width="1.5"/>
+<text x="32" y="447" class="layer-label">ANDROID SDK · Pine AOP</text>
+<rect x="30" y="452" width="296.6666666666667" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="30" y="452" width="4" height="44" rx="2" fill="#EF4444"/>
+<text x="44" y="469" class="mod-name" fill="#333">TraceHook</text>
+<text x="44" y="486" class="mod-desc">SI$ tag 注入</text>
+<rect x="336.6666666666667" y="452" width="296.6666666666667" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="336.6666666666667" y="452" width="4" height="44" rx="2" fill="#EF4444"/>
+<text x="350.6666666666667" y="469" class="mod-name" fill="#333">BlockMonitor</text>
+<text x="350.6666666666667" y="486" class="mod-desc">主线程卡顿 ≥100ms</text>
+<rect x="643.3333333333334" y="452" width="296.6666666666667" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="643.3333333333334" y="452" width="4" height="44" rx="2" fill="#EF4444"/>
+<text x="657.3333333333334" y="469" class="mod-name" fill="#333">WebSocket</text>
+<text x="657.3333333333334" y="486" class="mod-desc">CLI ↔ App 通信</text>
+<line x1="178" y1="452" x2="140" y2="412" class="dash"/>
+<line x1="830" y1="114" x2="830" y2="284" class="dash"/>
+<rect x="960" y="50" width="220" height="454" rx="10" fill="#F3E8FD" stroke="#D6B4F8" stroke-width="1.5"/>
+<text x="972" y="66" class="layer-label">OUTPUT · 输出</text>
+<rect x="970" y="201.0" width="200" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="970" y="201.0" width="4" height="44" rx="2" fill="#7C3AED"/>
+<text x="984" y="218.0" class="mod-name" fill="#333">Markdown</text>
+<text x="984" y="235.0" class="mod-desc">可读性强的分析报告</text>
+<rect x="970" y="255.0" width="200" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="970" y="255.0" width="4" height="44" rx="2" fill="#7C3AED"/>
+<text x="984" y="272.0" class="mod-name" fill="#333">JSON</text>
+<text x="984" y="289.0" class="mod-desc">CI/CD 自动化解析</text>
+<rect x="970" y="309.0" width="200" height="44" rx="6" fill="#fff" stroke="#ddd" stroke-width="1"/>
+<rect x="970" y="309.0" width="4" height="44" rx="2" fill="#7C3AED"/>
+<text x="984" y="326.0" class="mod-name" fill="#333">reports/</text>
+<text x="984" y="343.0" class="mod-desc">文件持久化保存</text>
+<line x1="940" y1="222" x2="960" y2="277" class="arrow"/>
+</svg>
