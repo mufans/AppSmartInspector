@@ -140,22 +140,11 @@ mcp_servers:
 
 ## 架构概览
 
-```
-用户自然语言 → LangGraph Orchestrator → 路由到专用 Agent / Pipeline → 报告输出
-                    │
-        ┌───────────┼───────────────┬──────────────┐
-        ▼           ▼               ▼              ▼
-  Android Expert  Perf Analyzer  Explorer     Full Pipeline
-  (adb+Perfetto)  (LLM解读JSON)  (grep/glob)  (collector→analyzer→attributor→reporter)
-```
+<p align="center">
+  <img src="docs/architecture.svg" alt="SmartInspector 架构图" width="800">
+</p>
 
-全量分析流水线（LangGraph 图节点编排）：
-
-```
-collector (设备 trace 采集) → analyzer (LLM 性能解读) → attributor (源码归因) → reporter (生成 Markdown/JSON 报告)
-                                      ↓
-                                startup (冷启动分析，阶段切分 + 瓶颈识别)
-```
+**全量分析管线**：collector (Trace 采集 + SQL) → analyzer (LLM 性能解读) → attributor (SI$ → 源码归因) → reporter (Markdown / JSON 报告)
 
 ### Perfetto UI 交互分析
 
